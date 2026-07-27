@@ -3117,6 +3117,37 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(result.main_after, main_before)
         self.assertTrue(result.diagnostics["integration_lock_recovered"])
 
+    def test_recovered_lock_survives_refused_main_restore(self) -> None:
+        main_before = self.advance_main()
+        self.manager.acquire_main_integration(
+            task_id="TASK-01",
+            run_id="run-1",
+            metadata={"pid": 999_999_999},
+        )
+
+        def fail_after_main_change(command, **kwargs):
+            if command == "main-check":
+                (self.repo / "candidate.txt").write_text(
+                    "uncommitted operator work\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 1)
+            return subprocess.CompletedProcess(command, 0)
+
+        result = self.integrator(
+            commands=("integration-check", "main-check"),
+            executor=fail_after_main_change,
+        ).run()
+
+        self.assertEqual(result.reason, "main_verification_failed")
+        self.assertTrue(result.recovered)
+        self.assertNotEqual(result.main_after, main_before)
+        self.assertEqual(
+            result.diagnostics["main_recovery"],
+            "worktree_restore_refused",
+        )
+        self.assertTrue(result.diagnostics["integration_lock_recovered"])
+
     def test_main_verification_is_isolated_from_sibling_repository_activity(
         self,
     ) -> None:

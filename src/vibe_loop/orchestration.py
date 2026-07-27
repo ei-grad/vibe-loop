@@ -3797,7 +3797,7 @@ class Integrator:
                 main_after=current_main,
                 refreshed_head=branch_head,
                 verification=checks,
-                recovered=restored,
+                recovered=restored or recovered_lock,
                 diagnostics=diagnostics,
             )
         return self._record_completed_result(
