@@ -522,10 +522,19 @@ class AutopilotStatusTests(unittest.TestCase):
                 prompt_dialect="codex",
                 skill_ref_prefix="$",
             )
+            broken = AgentConfig(
+                command="worker --model {model} {prompt}",
+                prompt_dialect="codex",
+                skill_ref_prefix="$",
+            )
             config = dataclasses.replace(
                 loaded,
                 agent=worker,
-                agent_profiles={"worker": worker, "review": reviewer},
+                agent_profiles={
+                    "worker": worker,
+                    "review": reviewer,
+                    "broken": broken,
+                },
                 task_source=TaskSourceConfig(
                     type="command",
                     list_command="list-tasks",
@@ -553,6 +562,12 @@ class AutopilotStatusTests(unittest.TestCase):
                     agent="review",
                 ),
                 Task(
+                    task_id="TASK-BROKEN",
+                    title="Invalid route",
+                    status="Next",
+                    agent="broken",
+                ),
+                Task(
                     task_id="TASK-GOOD",
                     title="Good route",
                     status="Next",
@@ -570,12 +585,22 @@ class AutopilotStatusTests(unittest.TestCase):
 
         self.assertEqual(payload["blockers"], [])
         self.assertEqual(payload["supervisor"]["dispatch_state"], "available")
-        self.assertEqual(
-            payload["queue"]["dispatch_blockers"][0]["task_id"],
-            "TASK-BAD",
+        dispatch_blockers = {
+            blocker["task_id"]: blocker
+            for blocker in payload["queue"]["dispatch_blockers"]
+        }
+        self.assertEqual(set(dispatch_blockers), {"TASK-BAD", "TASK-BROKEN"})
+        self.assertIn(
+            "reviewer_profile must differ",
+            dispatch_blockers["TASK-BAD"]["message"],
+        )
+        self.assertIn(
+            "references {model}, but no model is resolved",
+            dispatch_blockers["TASK-BROKEN"]["message"],
         )
         self.assertIn("task dispatch blockers:", rendered)
         self.assertIn("TASK-BAD", rendered)
+        self.assertIn("TASK-BROKEN", rendered)
         self.assertIn("reviewer_profile must differ", rendered)
         self.assertNotIn("blockers: none", rendered)
 

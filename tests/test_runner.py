@@ -1957,7 +1957,10 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(by_task["TASK-GOOD"].classification, "completed")
                 self.assertEqual(failed.classification, "failed")
                 self.assertEqual(failed.exit_code, 1)
-                self.assertEqual(failed.classification_source, "agent_resolution")
+                self.assertEqual(
+                    failed.classification_source,
+                    "task_agent_contract",
+                )
                 self.assertIn("agent profile 'typo'", failed.message)
                 self.assertIn("agent resolution failed", failed_log)
 
@@ -2013,27 +2016,41 @@ class RunnerTests(unittest.TestCase):
                                 order=1,
                             ),
                             Task(
-                                task_id="TASK-GOOD",
-                                title="Good route",
+                                task_id="TASK-SLOW",
+                                title="Slow valid route",
                                 status="Next",
                                 agent="worker",
                                 order=2,
+                            ),
+                            Task(
+                                task_id="TASK-LATER",
+                                title="Later valid route",
+                                status="Next",
+                                agent="worker",
+                                order=3,
                             ),
                         ]
                     )
                     runner._source = source
                     original_run_task = runner.run_task
+                    bad_finished = threading.Event()
 
                     def run_task(task: Task) -> RunResult:
                         if task.task_id == "TASK-BAD":
-                            return original_run_task(task)
+                            try:
+                                return original_run_task(task)
+                            finally:
+                                bad_finished.set()
+                        if task.task_id == "TASK-SLOW":
+                            self.assertTrue(bad_finished.wait(timeout=1))
+                            time.sleep(0.05)
                         source.mark_done(task.task_id)
                         return RunResult(
-                            run_id="run-good",
+                            run_id=f"run-{task.task_id}",
                             task_id=task.task_id,
                             classification="completed",
                             exit_code=0,
-                            log_path=repo / "good.log",
+                            log_path=repo / f"{task.task_id}.log",
                             start_main="aaa",
                             end_main="aaa",
                         )
@@ -2049,8 +2066,12 @@ class RunnerTests(unittest.TestCase):
                         results = runner.run_until_done(jobs=jobs)
 
                 by_task = {result.task_id: result for result in results}
-                self.assertEqual(set(by_task), {"TASK-BAD", "TASK-GOOD"})
-                self.assertEqual(by_task["TASK-GOOD"].classification, "completed")
+                self.assertEqual(
+                    set(by_task),
+                    {"TASK-BAD", "TASK-SLOW", "TASK-LATER"},
+                )
+                self.assertEqual(by_task["TASK-SLOW"].classification, "completed")
+                self.assertEqual(by_task["TASK-LATER"].classification, "completed")
                 self.assertEqual(by_task["TASK-BAD"].classification, "failed")
                 self.assertEqual(
                     by_task["TASK-BAD"].classification_source,
@@ -2060,6 +2081,166 @@ class RunnerTests(unittest.TestCase):
                     "reviewer_profile must differ",
                     by_task["TASK-BAD"].message,
                 )
+
+    def test_invalid_explicit_agent_route_does_not_abort_batch(self) -> None:
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    worker = AgentConfig(
+                        command="worker {prompt}",
+                        prompt_dialect="codex",
+                        skill_ref_prefix="$",
+                    )
+                    broken = AgentConfig(
+                        command="worker --model {model} {prompt}",
+                        prompt_dialect="codex",
+                        skill_ref_prefix="$",
+                    )
+                    runner = VibeRunner(
+                        VibeConfig(
+                            repo=repo,
+                            agent=worker,
+                            agent_profiles={"worker": worker, "broken": broken},
+                        )
+                    )
+                    source = MutableTaskSource(
+                        [
+                            Task(
+                                task_id="TASK-BAD",
+                                title="Bad route",
+                                status="Next",
+                                agent="broken",
+                                order=1,
+                            ),
+                            Task(
+                                task_id="TASK-SLOW",
+                                title="Slow valid route",
+                                status="Next",
+                                agent="worker",
+                                order=2,
+                            ),
+                            Task(
+                                task_id="TASK-LATER",
+                                title="Later valid route",
+                                status="Next",
+                                agent="worker",
+                                order=3,
+                            ),
+                        ]
+                    )
+                    runner._source = source
+                    original_run_task = runner.run_task
+                    bad_finished = threading.Event()
+
+                    def run_task(task: Task) -> RunResult:
+                        if task.task_id == "TASK-BAD":
+                            try:
+                                return original_run_task(task)
+                            finally:
+                                bad_finished.set()
+                        if task.task_id == "TASK-SLOW":
+                            self.assertTrue(bad_finished.wait(timeout=1))
+                            time.sleep(0.05)
+                        source.mark_done(task.task_id)
+                        return RunResult(
+                            run_id=f"run-{task.task_id}",
+                            task_id=task.task_id,
+                            classification="completed",
+                            exit_code=0,
+                            log_path=repo / f"{task.task_id}.log",
+                            start_main="aaa",
+                            end_main="aaa",
+                        )
+
+                    runner.run_task = run_task
+                    with (
+                        patch("vibe_loop.runner.git_rev_parse", return_value="aaa"),
+                        patch(
+                            "vibe_loop.runner.verify_worker_skill_deployments",
+                            return_value=(),
+                        ),
+                    ):
+                        results = runner.run_until_done(jobs=jobs)
+
+                by_task = {result.task_id: result for result in results}
+                self.assertEqual(
+                    set(by_task),
+                    {"TASK-BAD", "TASK-SLOW", "TASK-LATER"},
+                )
+                self.assertEqual(
+                    by_task["TASK-BAD"].classification_source,
+                    "task_agent_contract",
+                )
+                self.assertIn(
+                    "references {model}, but no model is resolved",
+                    by_task["TASK-BAD"].message,
+                )
+
+    def test_task_agent_refusal_does_not_clear_parallel_limit_wall_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            source = MutableTaskSource(
+                [
+                    Task(
+                        task_id="TASK-WALL",
+                        title="Wall",
+                        status="Next",
+                        order=1,
+                    ),
+                    Task(
+                        task_id="TASK-BAD",
+                        title="Bad route",
+                        status="Next",
+                        agent="typo",
+                        order=2,
+                    ),
+                    Task(
+                        task_id="TASK-LATER",
+                        title="Later",
+                        status="Next",
+                        order=3,
+                    ),
+                ]
+            )
+            runner._source = source
+            dispatched: list[str] = []
+
+            def run_task(task: Task) -> RunResult:
+                dispatched.append(task.task_id)
+                if task.task_id == "TASK-BAD":
+                    time.sleep(0.05)
+                    return RunResult(
+                        run_id="run-bad",
+                        task_id=task.task_id,
+                        classification="failed",
+                        classification_source="task_agent_contract",
+                        exit_code=1,
+                        log_path=repo / "bad.log",
+                        start_main="aaa",
+                        end_main="aaa",
+                    )
+                return RunResult(
+                    run_id="run-wall",
+                    task_id=task.task_id,
+                    classification="limit_wall",
+                    exit_code=1,
+                    log_path=repo / "wall.log",
+                    start_main="aaa",
+                    end_main="aaa",
+                )
+
+            runner.run_task = run_task
+            results = runner.run_until_done(jobs=2, max_slices=3)
+
+        self.assertEqual(dispatched, ["TASK-WALL", "TASK-BAD"])
+        self.assertEqual(
+            {result.task_id for result in results},
+            {"TASK-WALL", "TASK-BAD"},
+        )
 
     def test_skill_verification_blocks_before_worker_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2132,6 +2313,100 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.classification_source, "skill_verification")
         self.assertIn("branch-sourced", result.message)
         self.assertIn("worker skill preflight blocked", log_text)
+
+    def test_task_agent_recovery_refusal_does_not_abort_batch(self) -> None:
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    worker = AgentConfig(
+                        command="worker {prompt}",
+                        prompt_dialect="codex",
+                        skill_ref_prefix="$",
+                    )
+                    broken = AgentConfig(
+                        command="worker --model {model} {prompt}",
+                        prompt_dialect="codex",
+                        skill_ref_prefix="$",
+                    )
+                    runner = VibeRunner(
+                        VibeConfig(
+                            repo=repo,
+                            agent=worker,
+                            agent_profiles={"worker": worker, "broken": broken},
+                        )
+                    )
+                    bad = Task(
+                        task_id="TASK-BAD",
+                        title="Bad recovery route",
+                        status="Next",
+                        agent="broken",
+                        order=1,
+                    )
+                    good = Task(
+                        task_id="TASK-GOOD",
+                        title="Good route",
+                        status="Next",
+                        order=2,
+                    )
+                    source = MutableTaskSource([bad, good])
+                    runner._source = source
+                    recovery = RecoveryContext(
+                        task_id=bad.task_id,
+                        prior_run_id="prior-run",
+                        prior_classification="unknown",
+                        branch="",
+                        worktree="",
+                        head_commit="",
+                        transcript_path="",
+                        wrapper_log="",
+                        attempt=1,
+                        max_attempts=2,
+                        workspace_claimed=False,
+                    )
+                    runner.pending_recovery_contexts = lambda: [recovery]
+                    original_run_task = runner.run_task
+
+                    def run_task(
+                        task: Task,
+                        *,
+                        recovery: RecoveryContext | None = None,
+                    ) -> RunResult:
+                        if task.task_id == bad.task_id:
+                            self.assertIsNotNone(recovery)
+                            return original_run_task(task, recovery=recovery)
+                        source.mark_done(task.task_id)
+                        return RunResult(
+                            run_id="run-good",
+                            task_id=task.task_id,
+                            classification="completed",
+                            exit_code=0,
+                            log_path=repo / "good.log",
+                            start_main="aaa",
+                            end_main="aaa",
+                        )
+
+                    runner.run_task = run_task
+                    with (
+                        patch("vibe_loop.runner.git_rev_parse", return_value="aaa"),
+                        patch(
+                            "vibe_loop.runner.verify_worker_skill_deployments",
+                            return_value=(),
+                        ),
+                    ):
+                        results = runner.run_until_done(jobs=jobs)
+
+                by_task = {result.task_id: result for result in results}
+                self.assertEqual(set(by_task), {"TASK-BAD", "TASK-GOOD"})
+                self.assertEqual(
+                    by_task["TASK-BAD"].classification_source,
+                    "task_agent_contract",
+                )
+                self.assertIn(
+                    "references {model}, but no model is resolved",
+                    by_task["TASK-BAD"].message,
+                )
+                self.assertEqual(by_task["TASK-GOOD"].classification, "completed")
 
     def test_run_until_done_serial_stops_after_max_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

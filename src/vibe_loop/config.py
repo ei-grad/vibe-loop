@@ -454,6 +454,10 @@ class AgentResolutionError(ValueError):
     pass
 
 
+class TaskAgentResolutionError(AgentResolutionError):
+    pass
+
+
 @dataclasses.dataclass(frozen=True)
 class AgentDetection:
     codex: str | None = None
@@ -1898,7 +1902,12 @@ def resolve_task_agent(config: VibeConfig, task: Any) -> AgentSelection:
         if profile is None:
             available = ", ".join(sorted(config.agent_profiles)) or "none"
             task_id = getattr(task, "task_id", "") or ""
-            raise AgentResolutionError(
+            error_type = (
+                TaskAgentResolutionError
+                if source == "task.agent"
+                else AgentResolutionError
+            )
+            raise error_type(
                 f"task {task_id!r} routes to agent profile {name!r} ({source}), "
                 f"which is not defined in [agent.profiles] (defined: {available})."
             )
@@ -2122,6 +2131,19 @@ def command_template_uses_field(command_template: str, field: str) -> bool:
         if field_name == field:
             return True
     return False
+
+
+def validate_worker_prompt_delivery(command_template: str, task: Any) -> None:
+    if not getattr(task, "has_traceability", False):
+        return
+    if command_template_uses_field(command_template, "prompt"):
+        return
+    raise AgentResolutionError(
+        "agent.command must include {prompt} for tasks with traceability "
+        "metadata; otherwise the worker prompt addendum and spec context cannot "
+        "be delivered. Set agent.command to a prompt-mode template such as "
+        "`codex exec {prompt}` or `claude -p {prompt}`."
+    )
 
 
 def resolve_agent_prompt_dialect(

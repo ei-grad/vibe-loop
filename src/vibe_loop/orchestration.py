@@ -21,6 +21,7 @@ from vibe_loop.config import (
     AgentResolutionError,
     AgentSelection,
     OrchestrationConfig,
+    TaskAgentResolutionError,
     TaskSourceConfig,
     VibeConfig,
     agent_command_provider,
@@ -28,6 +29,7 @@ from vibe_loop.config import (
     format_agent_command,
     parse_orchestration,
     resolve_task_agent,
+    validate_worker_prompt_delivery,
 )
 from vibe_loop.generated_discovery import redact_evidence_text
 from vibe_loop.locks import fencing_token_value, redact_fencing_token_diagnostic
@@ -5265,12 +5267,34 @@ def task_agent_dispatch_blocker(
         return None
     try:
         agent_selection = resolve_task_agent(config, task)
+        agent = agent_selection.config
+        command_template = agent.require_command()
+        agent.require_skill_ref_prefix()
+        validate_worker_prompt_delivery(command_template, task)
+        format_agent_command(
+            command_template,
+            prompt="",
+            model=agent.model,
+            effort=agent.effort,
+            task=task,
+            profile=agent_selection.profile,
+            task_id=task.task_id,
+            run_id="status-preflight",
+        )
     except AgentResolutionError as exc:
         return ConfigContractBlocker(
-            code="task_agent_profile_unknown",
+            code=(
+                "task_agent_profile_unknown"
+                if isinstance(exc, TaskAgentResolutionError)
+                else "task_agent_route_invalid"
+            ),
             key="task.agent",
             message=str(exc),
-            remedy="Route task.agent to a configured agent.profiles entry.",
+            remedy=(
+                "Route task.agent to a configured agent.profiles entry."
+                if isinstance(exc, TaskAgentResolutionError)
+                else "Correct or clear the explicit task.agent route."
+            ),
         )
     return next(
         (
@@ -5348,7 +5372,12 @@ class RunContractResolver:
         if blockers:
             first = blockers[0]
             if first.code.startswith("config_contract_reviewer_"):
-                raise AgentResolutionError(first.message)
+                error_type = (
+                    TaskAgentResolutionError
+                    if first.key == "task.agent"
+                    else AgentResolutionError
+                )
+                raise error_type(first.message)
             raise ValueError(first.message)
 
         probe_capability = task_source_probe_capability(self.config.task_source)
