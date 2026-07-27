@@ -57,6 +57,7 @@ RUN_CONTRACT_VERSION = 1
 RUN_CONTRACT_SOURCE_KINDS = ("config", "profile", "skill-proposal")
 WORKSPACE_BRANCH_PREFIX = "vibe-loop/"
 WORKSPACE_NAME_MAX_LENGTH = 64
+WORKSPACE_REFRESH_METHODS = frozenset({"fast_forward", "merge_commit"})
 CANDIDATE_RECORD_SOURCE_KINDS = ("worker_command", "derived")
 CANDIDATE_BASE_ANCHOR_OUTCOMES = (
     "base-unchanged",
@@ -6013,8 +6014,16 @@ class ProvisionedWorkspace:
     # base during adoption; empty otherwise.
     refreshed_from: str = ""
     refresh_base_before: str = ""
-    refresh_base_after: str = ""
     refresh_method: str = ""
+
+    def __post_init__(self) -> None:
+        if self.refreshed_from:
+            if not self.refresh_base_before:
+                raise ValueError("refreshed workspace requires its prior base")
+            if self.refresh_method not in WORKSPACE_REFRESH_METHODS:
+                raise ValueError("workspace refresh method is invalid")
+        elif self.refresh_base_before or self.refresh_method:
+            raise ValueError("unrefreshed workspace cannot have refresh provenance")
 
     def to_record_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -6030,7 +6039,6 @@ class ProvisionedWorkspace:
         if self.refreshed_from:
             payload["refreshed_from"] = self.refreshed_from
             payload["refresh_base_before"] = self.refresh_base_before
-            payload["refresh_base_after"] = self.refresh_base_after
             payload["refresh_method"] = self.refresh_method
         return payload
 
@@ -6577,6 +6585,7 @@ class WorkspaceProvisioner:
                 },
             )
         refreshed_from = ""
+        refresh_method = ""
         if (
             self._git_returncode_at(
                 worktree,
@@ -6588,7 +6597,7 @@ class WorkspaceProvisioner:
             != 0
         ):
             refreshed_from = head
-            head = self._refresh_stale_workspace(
+            head, refresh_method = self._refresh_stale_workspace(
                 worktree=worktree,
                 base_commit=base_commit,
                 owner_base=owner_base,
@@ -6640,8 +6649,7 @@ class WorkspaceProvisioner:
             dirty_fingerprint=dirty_fingerprint,
             refreshed_from=refreshed_from,
             refresh_base_before=owner_base if refreshed_from else "",
-            refresh_base_after=base_commit if refreshed_from else "",
-            refresh_method="merge" if refreshed_from else "",
+            refresh_method=refresh_method,
         )
 
     def _refresh_stale_workspace(
@@ -6652,13 +6660,14 @@ class WorkspaceProvisioner:
         owner_base: str,
         head: str,
         recovery_run_id: str,
-    ) -> str:
+    ) -> tuple[str, str]:
         """Merge the selected base into a clean stale workspace.
 
-        Returns the refreshed HEAD. A content conflict is aborted and surfaced
-        as ``workspace_refresh_conflict`` so the owned branch remains unchanged
-        for an implementation worker to resolve deliberately. Unreadable or
-        dirty state keeps using the ordinary stale-workspace deferral.
+        Returns the refreshed HEAD and whether Git fast-forwarded or created a
+        merge commit. A content conflict is aborted and surfaced as
+        ``workspace_refresh_conflict`` so the owned branch remains unchanged for
+        an implementation worker to resolve deliberately. Unreadable or dirty
+        state keeps using the ordinary stale-workspace deferral.
         """
 
         from vibe_loop.workers import WorkspaceClaimError, git_dirty_snapshot
@@ -6780,7 +6789,8 @@ class WorkspaceProvisioner:
         )
         if contains_base != 0 or contains_head != 0:
             raise defer("refresh_did_not_reach_base")
-        return refreshed_head
+        method = "fast_forward" if refreshed_head == base_commit else "merge_commit"
+        return refreshed_head, method
 
     def _existing_owned_identity(self, task_id: str) -> tuple[str, Path] | None:
         from vibe_loop.workers import build_workspace_git_context

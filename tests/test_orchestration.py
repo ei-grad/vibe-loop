@@ -7705,6 +7705,24 @@ class WorkspaceProvisionerTests(unittest.TestCase):
         self.assertTrue(rejected)
         return rejected[-1]
 
+    def test_workspace_refresh_provenance_rejects_unknown_methods(self) -> None:
+        for method in ("", "merge", "rebase"):
+            with self.subTest(method=method):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "workspace refresh method is invalid",
+                ):
+                    ProvisionedWorkspace(
+                        mode="adopted",
+                        branch="vibe-loop/task",
+                        worktree=Path("/tmp/task"),
+                        base_commit="base-after",
+                        head_commit="head-after",
+                        refreshed_from="head-before",
+                        refresh_base_before="base-before",
+                        refresh_method=method,
+                    )
+
     def test_clean_stale_workspace_is_refreshed_and_adopted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo, store, first, stale_base, current_base = self._stale_workspace(
@@ -7725,8 +7743,7 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             self.assertTrue((first.worktree / "main-change.txt").exists())
             self.assertEqual(adopted.refreshed_from, stale_base)
             self.assertEqual(adopted.refresh_base_before, stale_base)
-            self.assertEqual(adopted.refresh_base_after, current_base)
-            self.assertEqual(adopted.refresh_method, "merge")
+            self.assertEqual(adopted.refresh_method, "fast_forward")
             self.assertEqual(adopted.head_commit, current_base)
             self.assertEqual(adopted.base_commit, current_base)
             self.assertEqual(adopted.mode, "adopted")
@@ -7738,8 +7755,9 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             ]
             self.assertEqual(provisioned[-1]["refreshed_from"], stale_base)
             self.assertEqual(provisioned[-1]["refresh_base_before"], stale_base)
-            self.assertEqual(provisioned[-1]["refresh_base_after"], current_base)
-            self.assertEqual(provisioned[-1]["refresh_method"], "merge")
+            self.assertEqual(provisioned[-1]["base_commit"], current_base)
+            self.assertEqual(provisioned[-1]["refresh_method"], "fast_forward")
+            self.assertNotIn("refresh_base_after", provisioned[-1])
             preflight = [
                 record
                 for record in store.read_records()
@@ -7801,7 +7819,7 @@ class WorkspaceProvisionerTests(unittest.TestCase):
 
     def test_stale_workspace_with_unique_commits_merges_current_base(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo, store, first, _stale_base, current_base = self._stale_workspace(
+            repo, store, first, stale_base, current_base = self._stale_workspace(
                 directory
             )
             (first.worktree / "candidate.txt").write_text(
@@ -7814,9 +7832,8 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             adopted = self._adopt_stale(repo, store, current_base)
 
             self.assertEqual(adopted.refreshed_from, stale_head)
-            self.assertEqual(adopted.refresh_base_before, _stale_base)
-            self.assertEqual(adopted.refresh_base_after, current_base)
-            self.assertEqual(adopted.refresh_method, "merge")
+            self.assertEqual(adopted.refresh_base_before, stale_base)
+            self.assertEqual(adopted.refresh_method, "merge_commit")
             self.assertNotEqual(adopted.head_commit, stale_head)
             self.assertNotEqual(adopted.head_commit, current_base)
             self.assertTrue((first.worktree / "candidate.txt").exists())
