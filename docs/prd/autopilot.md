@@ -584,10 +584,12 @@ every bound name from the child environment, so a stale shell export cannot
 reach an adapter if the child's own resolution changes. Worker launch applies
 the same rule to every selector in the resolved context at the agent boundary:
 runtime-owned workers observe those names as absent, while worker-owned
-compatibility agents receive only the resolved values they need to perform the
-task-source completion transition. At the adapter boundary, configured and
-registry context remains authoritative over per-transition runtime context, so
-an inherited worker value cannot override adapter routing.
+compatibility agents receive only required values pinned in the repository's
+own `project_binding.context`, which they need to perform the task-source
+completion transition. Registry-transported context remains adapter-only and is
+absent from every worker-agent environment. At the adapter boundary, configured
+and registry context remains authoritative over per-transition runtime context,
+so an inherited worker value cannot override adapter routing.
 
 The table is optional. A command backend that already scopes its project
 explicitly in the command string has no ambiguity to close and keeps working

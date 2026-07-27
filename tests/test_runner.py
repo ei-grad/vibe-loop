@@ -8509,7 +8509,7 @@ class SessionIdInjectionTests(unittest.TestCase):
                 log_path=Path("/tmp/run.log"),
                 agent_kind="codex",
                 agent_profile="codex",
-                bound_context={selector_name: "configured-project"},
+                bound_names=(selector_name,),
             )
 
         observed = subprocess.run(

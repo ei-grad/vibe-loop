@@ -2244,8 +2244,16 @@ class VibeRunner:
             log_path=log_path,
             agent_kind=agent_kind,
             agent_profile=agent_profile,
-            bound_context=self.config.runtime_environment,
-            expose_bound_context=not runtime_owned_mode,
+            bound_names=self.config.runtime_environment,
+            exposed_context=(
+                {
+                    name: value
+                    for name, value in self.config.project_binding.context
+                    if name in self.config.project_binding.require
+                }
+                if not runtime_owned_mode
+                else None
+            ),
             disable_background_tasks=runtime_owned_mode and agent_kind == "claude",
         )
         claude_home: Path | None = None
@@ -9233,25 +9241,25 @@ def worker_command_env(
     log_path: Path,
     agent_kind: str,
     agent_profile: str,
-    bound_context: Mapping[str, str] | None = None,
-    expose_bound_context: bool = False,
+    bound_names: Sequence[str] = (),
+    exposed_context: Mapping[str, str] | None = None,
     disable_background_tasks: bool = False,
 ) -> dict[str, str]:
     """Build the agent environment without inheriting selector bindings.
 
-    Worker-owned orchestration deliberately receives resolved non-secret
+    Worker-owned orchestration deliberately receives repository-pinned required
     bindings because that compatibility mode makes the agent complete the task
-    source directly. Runtime-owned workers leave them absent because the
-    supervisor performs every adapter transition.
+    source directly. Registry context remains adapter-only, and runtime-owned
+    workers leave all bindings absent because the supervisor performs every
+    adapter transition.
     """
 
     env = os.environ.copy()
     env.pop("VIBE_LOOP_PRIMARY_REPO", None)
-    explicit_context = dict(bound_context or {})
-    for name in explicit_context:
+    explicit_context = dict(exposed_context or {})
+    for name in set(bound_names) | explicit_context.keys():
         env.pop(name, None)
-    if expose_bound_context:
-        env.update(explicit_context)
+    env.update(explicit_context)
     env.update(
         {
             "VIBE_LOOP_RUN_ID": run_id,
