@@ -1154,6 +1154,8 @@ class MarkdownPlanTests(unittest.TestCase):
             for adapter in ("probe", "activate", "reset", "transition"):
                 for task_id in task_ids:
                     with self.subTest(adapter=adapter, task_id=task_id):
+                        captured.unlink(missing_ok=True)
+                        injected.unlink(missing_ok=True)
                         source = CommandTaskSource(
                             repo,
                             TaskSourceConfig(
@@ -1181,7 +1183,7 @@ class MarkdownPlanTests(unittest.TestCase):
                         )
                         self.assertFalse(injected.exists())
 
-    def test_command_task_source_does_not_format_command_variables_directly(
+    def test_command_task_source_has_no_direct_format_or_fstring_command_assignments(
         self,
     ) -> None:
         module = ast.parse(Path(tasks_module.__file__).read_text(encoding="utf-8"))
@@ -1215,8 +1217,8 @@ class MarkdownPlanTests(unittest.TestCase):
         self.assertEqual(
             unsafe_lines,
             [],
-            "task-source command variables must use _format_command; "
-            f"unsafe construction at lines {unsafe_lines}",
+            "task-source command variables must not use direct .format() "
+            f"or f-string assignments; found at lines {unsafe_lines}",
         )
 
     def test_command_task_source_probe_and_reset_reject_unsafe_templates(
