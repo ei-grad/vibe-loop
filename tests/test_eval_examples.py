@@ -806,6 +806,8 @@ class EvalExampleTests(unittest.TestCase):
                         "--once",
                         "--min-ready",
                         "999",
+                        "--dispatch-min-ready",
+                        "999",
                     ]
                 )
             summary = json.loads(run_out.getvalue())
@@ -825,9 +827,10 @@ class EvalExampleTests(unittest.TestCase):
         self.assertTrue(summary["started"])
         self.assertEqual(len(summary["cycles"]), 1)
         cycle = summary["cycles"][0]
-        # A high --min-ready invokes native read-only planning detection. The
-        # stub returns no-plan, so the cycle never launches either a planning
-        # worker or run-until-done and never mutates the repository.
+        # A high --min-ready invokes native read-only planning detection while
+        # the explicit dispatch floor keeps this bounded fixture from launching
+        # run-until-done. The stub returns no-plan, so neither path mutates the
+        # repository.
         self.assertIn(cycle["status"], {"idle", "blocked"})
         self.assertEqual(cycle["child_log"], "")
         self.assertIn(run_code, {0, 1})
