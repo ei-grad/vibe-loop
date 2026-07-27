@@ -91,6 +91,43 @@ def save_runtime_event_cursor(path: Path, *, project: str, cursor: str) -> None:
         raise RuntimeEventAdapterError("cursor_write_error") from exc
 
 
+def bootstrap_run_journal_cursor(
+    journal: Path,
+    cursor_path: Path,
+    *,
+    project: str,
+    replace: bool = False,
+) -> str:
+    _require_scope(project=project)
+    if journal.resolve() == cursor_path.resolve():
+        raise RuntimeEventAdapterError("invalid_cursor_path")
+
+    from vibe_loop.runs import append_record_lock
+
+    try:
+        cursor_path.parent.mkdir(parents=True, exist_ok=True)
+        with append_record_lock(cursor_path):
+            if cursor_path.exists():
+                load_runtime_event_cursor(cursor_path, project=project)
+                if not replace:
+                    raise RuntimeEventAdapterError("cursor_already_exists")
+            try:
+                with append_record_lock(journal):
+                    cursor = _validated_run_journal_tail_unlocked(journal)
+                    save_runtime_event_cursor(
+                        cursor_path,
+                        project=project,
+                        cursor=cursor,
+                    )
+            except TimeoutError as exc:
+                raise RuntimeEventAdapterError("journal_read_error") from exc
+    except RuntimeEventAdapterError:
+        raise
+    except (OSError, TimeoutError) as exc:
+        raise RuntimeEventAdapterError("cursor_write_error") from exc
+    return cursor
+
+
 def poll_runtime_event_command(
     command: str,
     *,
@@ -246,6 +283,30 @@ def poll_run_journal_event(
     if offset > index:
         raise RuntimeEventAdapterError("cursor_out_of_range")
     return str(index), None
+
+
+def _validated_run_journal_tail_unlocked(journal: Path) -> str:
+    if not journal.exists():
+        return "0"
+    index = 0
+    try:
+        with journal.open("rb") as handle:
+            while True:
+                raw = handle.readline(RUNTIME_EVENT_OUTPUT_MAX_BYTES + 1)
+                if not raw:
+                    break
+                if len(raw) > RUNTIME_EVENT_OUTPUT_MAX_BYTES:
+                    raise RuntimeEventAdapterError("journal_record_too_large")
+                try:
+                    record = json.loads(raw)
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                    raise RuntimeEventAdapterError("invalid_journal") from exc
+                if not isinstance(record, dict):
+                    raise RuntimeEventAdapterError("invalid_journal")
+                index += 1
+    except OSError as exc:
+        raise RuntimeEventAdapterError("journal_read_error") from exc
+    return str(index)
 
 
 def runtime_event_from_journal_record(

@@ -10894,6 +10894,99 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertNotEqual(second["events"][0]["id"], "event-2")
         self.assertNotEqual(first["events"][0]["id"], second["events"][0]["id"])
 
+    def test_wait_helper_tail_bootstrap_transitions_to_normal_polling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            journal = root / "runs.jsonl"
+            cursor = root / "cursor.json"
+            journal.write_text(
+                json.dumps(
+                    {
+                        "record_type": "operator_action_required",
+                        "event_id": "historical",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            runtime_arguments = (
+                "--runtime-event-journal",
+                str(journal),
+                "--runtime-event-cursor",
+                str(cursor),
+                "--runtime-event-project",
+                "alpha",
+                "--json",
+            )
+            bootstrap_code, bootstrap_out = self._wait_helper(
+                "--deadline",
+                "2000-01-01T00:00:00Z",
+                *runtime_arguments,
+                "--runtime-event-start-at-tail",
+            )
+            with journal.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "record_type": "operator_action_required",
+                            "event_id": "live",
+                        }
+                    )
+                    + "\n"
+                )
+            poll_code, poll_out = self._wait_helper(
+                "--deadline",
+                "2030-01-01T00:00:00Z",
+                *runtime_arguments,
+            )
+
+        bootstrap = json.loads(bootstrap_out)
+        poll = json.loads(poll_out)
+        self.assertEqual(bootstrap_code, 0)
+        self.assertEqual(bootstrap["wake_reason"], "deadline")
+        self.assertEqual(poll_code, 0)
+        self.assertEqual(poll["wake_reason"], "runtime_event")
+        self.assertEqual(poll["events"][0]["kind"], "operator_action_required")
+
+    def test_wait_helper_tail_bootstrap_requires_explicit_cursor_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            journal = root / "runs.jsonl"
+            cursor = root / "cursor.json"
+            journal.write_text("{}\n", encoding="utf-8")
+            cli_module.save_runtime_event_cursor(
+                cursor,
+                project="alpha",
+                cursor="0",
+            )
+            arguments = (
+                "--deadline",
+                "2000-01-01T00:00:00Z",
+                "--runtime-event-journal",
+                str(journal),
+                "--runtime-event-cursor",
+                str(cursor),
+                "--runtime-event-project",
+                "alpha",
+                "--runtime-event-start-at-tail",
+                "--json",
+            )
+            refused_code, refused_out = self._wait_helper(*arguments)
+            replaced_code, replaced_out = self._wait_helper(
+                *arguments,
+                "--runtime-event-replace-cursor",
+            )
+
+        refused = json.loads(refused_out)
+        self.assertEqual(refused_code, 1)
+        self.assertEqual(refused["wake_reason"], "adapter_error")
+        self.assertEqual(
+            refused["events"][0]["category"],
+            "cursor_already_exists",
+        )
+        self.assertEqual(replaced_code, 0)
+        self.assertEqual(json.loads(replaced_out)["wake_reason"], "deadline")
+
     def test_wait_helper_runtime_adapter_error_is_safe_json(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             cursor = Path(directory) / "cursor.json"

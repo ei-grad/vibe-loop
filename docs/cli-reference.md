@@ -280,7 +280,8 @@ vibe-loop wait-helper --cycle-schedule 1800 --json
 vibe-loop wait-helper --pid 12345 \
   --runtime-event-journal .vibe-loop/runs.jsonl \
   --runtime-event-cursor .vibe-loop/wait-runtime.cursor \
-  --runtime-event-project my-project --json
+  --runtime-event-project my-project \
+  --runtime-event-start-at-tail --json
 ```
 
 - `--pid PID` is repeatable. The default `--mode any` wakes on the first exit;
@@ -297,6 +298,10 @@ vibe-loop wait-helper --pid 12345 \
   `--runtime-event-project PROJECT`; optional `--runtime-event-run-id` and
   `--runtime-event-task-id` narrow the scope. `--runtime-event-timeout SECONDS`
   defaults to `5`.
+- `--runtime-event-start-at-tail` initializes a missing journal cursor at the
+  validated current record boundary before waiting. The default remains replay
+  from the beginning. An existing cursor is never changed unless
+  `--runtime-event-replace-cursor` is also supplied explicitly.
 - `--json` emits the structured result. `wake_reason` is `pid`,
   `all_complete`, `deadline`, `message`, `runtime_event`, or `adapter_error`.
 

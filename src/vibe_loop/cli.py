@@ -102,6 +102,7 @@ from vibe_loop.orchestration import (
 from vibe_loop.runner import VibeRunner
 from vibe_loop.runtime_events import (
     RuntimeEventAdapterError,
+    bootstrap_run_journal_cursor,
     load_runtime_event_cursor,
     poll_run_journal_event,
     poll_runtime_event_command,
@@ -571,6 +572,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=5.0,
         metavar="SECONDS",
         help="Maximum duration of one runtime-event adapter poll (default: 5)",
+    )
+    wait_helper.add_argument(
+        "--runtime-event-start-at-tail",
+        action="store_true",
+        help="Initialize a new journal cursor at its validated current tail",
+    )
+    wait_helper.add_argument(
+        "--runtime-event-replace-cursor",
+        action="store_true",
+        help="Replace an existing cursor when starting a journal at its tail",
     )
     wait_helper.add_argument("--mode", choices=("any", "all"), default="any")
     wait_helper.add_argument("--json", action="store_true")
@@ -1913,12 +1924,26 @@ def dispatch_wait_helper(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.runtime_event_start_at_tail and args.runtime_event_journal is None:
+        print(
+            "--runtime-event-start-at-tail requires --runtime-event-journal",
+            file=sys.stderr,
+        )
+        return 2
+    if args.runtime_event_replace_cursor and not args.runtime_event_start_at_tail:
+        print(
+            "--runtime-event-replace-cursor requires --runtime-event-start-at-tail",
+            file=sys.stderr,
+        )
+        return 2
     if not runtime_event_enabled and any(
         (
             args.runtime_event_cursor is not None,
             bool(args.runtime_event_project),
             bool(args.runtime_event_run_id),
             bool(args.runtime_event_task_id),
+            args.runtime_event_start_at_tail,
+            args.runtime_event_replace_cursor,
         )
     ):
         print(
@@ -1950,6 +1975,32 @@ def dispatch_wait_helper(args: argparse.Namespace) -> int:
     if runtime_event_enabled:
         assert args.runtime_event_cursor is not None
         runtime_cursor: str | None = None
+        try:
+            if args.runtime_event_start_at_tail:
+                assert args.runtime_event_journal is not None
+                runtime_cursor = bootstrap_run_journal_cursor(
+                    args.runtime_event_journal,
+                    args.runtime_event_cursor,
+                    project=args.runtime_event_project,
+                    replace=args.runtime_event_replace_cursor,
+                )
+        except RuntimeEventAdapterError as exc:
+            result = WaitResult(
+                wake_reason="adapter_error",
+                events=(
+                    {
+                        "kind": "runtime_event_adapter_error",
+                        "category": exc.category,
+                    },
+                ),
+                session_ref=session_ref,
+            )
+            payload = result.to_json(at=utc_now_iso())
+            if args.json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(" ".join(f"{key}={value}" for key, value in payload.items()))
+            return 1
 
         def poll_runtime_event() -> dict[str, object] | None:
             nonlocal runtime_cursor
