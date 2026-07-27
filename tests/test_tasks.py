@@ -1136,6 +1136,48 @@ class MarkdownPlanTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "may only use"):
                         source.reset("TASK-42")
 
+    def test_windows_command_task_source_adapters_fail_closed_on_unsafe_ids(
+        self,
+    ) -> None:
+        unsafe_task_ids = (
+            'TASK" & calc & "X',
+            "TASK%USERPROFILE%",
+            "TASK!delayed!",
+            "TASK\ncommand",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="list-tasks",
+                    probe_command="probe {task_id}",
+                    activate_command="activate {task_id} {run_id}",
+                    complete_command="complete {task_id} {run_id}",
+                    reset_command="reset {task_id}",
+                    park_command="park {task_id} {run_id}",
+                ),
+            )
+            with mock.patch("vibe_loop.config.sys.platform", "win32"):
+                with mock.patch("vibe_loop.tasks.subprocess.run") as run:
+                    for task_id in unsafe_task_ids:
+                        with self.subTest(task_id=task_id):
+                            adapter_calls = (
+                                lambda: source.probe(task_id),
+                                lambda: source.activate(task_id, "run-1"),
+                                lambda: source.activate("TASK-1", task_id),
+                                lambda: source.complete(task_id, "run-1"),
+                                lambda: source.complete("TASK-1", task_id),
+                                lambda: source.reset(task_id),
+                                lambda: source.park(task_id, "run-1"),
+                                lambda: source.park("TASK-1", task_id),
+                            )
+                            for call in adapter_calls:
+                                with self.assertRaisesRegex(ValueError, "cmd.exe"):
+                                    call()
+                    run.assert_not_called()
+
     def test_command_task_source_activate_returns_confirmed_task(self) -> None:
         captured: dict[str, object] = {}
 

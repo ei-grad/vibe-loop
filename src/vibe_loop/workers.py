@@ -2496,6 +2496,7 @@ class TaskSourceSettlementRecovery:
             return format_shell_command_template(
                 template,
                 {"task_id": task_id, "run_id": ""},
+                windows_shell_fields=("task_id", "run_id"),
             )
         except ValueError:
             return ""

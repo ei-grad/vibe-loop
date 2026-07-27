@@ -527,6 +527,11 @@ class AutopilotStatusTests(unittest.TestCase):
                 prompt_dialect="codex",
                 skill_ref_prefix="$",
             )
+            malformed = AgentConfig(
+                command="worker {prompt!r}",
+                prompt_dialect="codex",
+                skill_ref_prefix="$",
+            )
             config = dataclasses.replace(
                 loaded,
                 agent=worker,
@@ -534,6 +539,7 @@ class AutopilotStatusTests(unittest.TestCase):
                     "worker": worker,
                     "review": reviewer,
                     "broken": broken,
+                    "malformed": malformed,
                 },
                 task_source=TaskSourceConfig(
                     type="command",
@@ -573,6 +579,12 @@ class AutopilotStatusTests(unittest.TestCase):
                     status="Next",
                     agent="worker",
                 ),
+                Task(
+                    task_id="TASK-MALFORMED",
+                    title="Malformed route",
+                    status="Next",
+                    agent="malformed",
+                ),
             ]
 
             with mock.patch(
@@ -589,7 +601,10 @@ class AutopilotStatusTests(unittest.TestCase):
             blocker["task_id"]: blocker
             for blocker in payload["queue"]["dispatch_blockers"]
         }
-        self.assertEqual(set(dispatch_blockers), {"TASK-BAD", "TASK-BROKEN"})
+        self.assertEqual(
+            set(dispatch_blockers),
+            {"TASK-BAD", "TASK-BROKEN", "TASK-MALFORMED"},
+        )
         self.assertIn(
             "reviewer_profile must differ",
             dispatch_blockers["TASK-BAD"]["message"],
@@ -598,9 +613,14 @@ class AutopilotStatusTests(unittest.TestCase):
             "references {model}, but no model is resolved",
             dispatch_blockers["TASK-BROKEN"]["message"],
         )
+        self.assertIn(
+            "may not use conversion or formatting",
+            dispatch_blockers["TASK-MALFORMED"]["message"],
+        )
         self.assertIn("task dispatch blockers:", rendered)
         self.assertIn("TASK-BAD", rendered)
         self.assertIn("TASK-BROKEN", rendered)
+        self.assertIn("TASK-MALFORMED", rendered)
         self.assertIn("reviewer_profile must differ", rendered)
         self.assertNotIn("blockers: none", rendered)
 

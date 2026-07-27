@@ -7974,6 +7974,34 @@ class AgentCommandModelTests(unittest.TestCase):
             f"{shell_quote('inspect repo')}",
         )
 
+    def test_format_agent_command_preserves_windows_trailing_backslash(self) -> None:
+        with patch("vibe_loop.config.sys.platform", "win32"):
+            command = format_agent_command(
+                "worker --task {task_id} --run {run_id} {prompt}",
+                prompt="inspect repo",
+                model=None,
+                task_id="TASK-1\\",
+                run_id="run-1",
+            )
+
+        self.assertEqual(
+            command,
+            'worker --task "TASK-1\\\\" --run "run-1" "inspect repo"',
+        )
+
+    def test_format_agent_command_rejects_unsafe_windows_nonprompt_value(
+        self,
+    ) -> None:
+        with patch("vibe_loop.config.sys.platform", "win32"):
+            with self.assertRaisesRegex(ValueError, "cmd.exe"):
+                format_agent_command(
+                    "worker --task {task_id} --run {run_id} {prompt}",
+                    prompt='prompt may contain "quotes"',
+                    model=None,
+                    task_id='TASK" & calc & "X',
+                    run_id="run-1",
+                )
+
     def test_format_agent_command_rejects_unsafe_template_fields(self) -> None:
         templates = (
             "worker {unsupported}",

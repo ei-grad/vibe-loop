@@ -997,7 +997,13 @@ def format_agent_command(
         "run_id": run_id,
         "task_id": task_id,
     }
-    return format_shell_command_template(template, values)
+    return format_shell_command_template(
+        template,
+        values,
+        windows_shell_fields=tuple(
+            field for field in values if field not in {"prompt", "prompt_path"}
+        ),
+    )
 
 
 def execute_agent_command(

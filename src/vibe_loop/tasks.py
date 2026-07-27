@@ -2441,12 +2441,17 @@ class CommandTaskSource:
         **values: str,
     ) -> str:
         try:
-            return format_shell_command_template(command_template, values)
+            return format_shell_command_template(
+                command_template,
+                values,
+                windows_shell_fields=tuple(values),
+            )
         except ValueError as exc:
             allowed = " and ".join(f"{{{field}}}" for field in values)
             raise ValueError(
                 f"task_source.{adapter} may only use {allowed} template fields "
-                "without conversions or format specifications"
+                "without conversions or format specifications; "
+                f"{exc}"
             ) from exc
 
     def _runtime_context(

@@ -22,19 +22,39 @@ from vibe_loop.telemetry import PHASES as USAGE_PHASES
 
 def shell_quote(s: str) -> str:
     if sys.platform == "win32":
-        quoted = subprocess.list2cmdline([s])
-        # list2cmdline leaves metacharacter-only values such as ``a&b``
-        # unquoted because they are valid CreateProcess arguments. They are not
-        # safe when the configured template requires cmd.exe for operators.
-        if not quoted.startswith('"'):
-            quoted = f'"{quoted}"'
-        return quoted
+        return quote_windows_argv(s)
     return shlex.quote(s)
+
+
+def quote_windows_argv(value: str) -> str:
+    """Quote one value for CommandLineToArgvW, including trailing backslashes."""
+
+    result = ['"']
+    backslashes = 0
+    for character in value:
+        if character == "\\":
+            backslashes += 1
+            continue
+        if character == '"':
+            result.append("\\" * (backslashes * 2 + 1))
+            result.append('"')
+        else:
+            result.append("\\" * backslashes)
+            result.append(character)
+        backslashes = 0
+    result.append("\\" * (backslashes * 2))
+    result.append('"')
+    return "".join(result)
+
+
+WINDOWS_CMD_UNSAFE_VALUE_CHARS = frozenset({'"', "%", "!", "\r", "\n", "\x00"})
 
 
 def format_shell_command_template(
     command_template: str,
     values: Mapping[str, str],
+    *,
+    windows_shell_fields: Sequence[str] = (),
 ) -> str:
     """Substitute exact shell-quoted fields into an operator-authored template."""
 
@@ -52,6 +72,14 @@ def format_shell_command_template(
                 f"shell command template field {field_name!r} may not use "
                 "conversion or formatting"
             )
+    if sys.platform == "win32":
+        for field_name in windows_shell_fields:
+            value = values[field_name]
+            if any(character in WINDOWS_CMD_UNSAFE_VALUE_CHARS for character in value):
+                raise ValueError(
+                    f"shell command template field {field_name!r} contains a "
+                    "character that cmd.exe cannot safely interpolate"
+                )
     quoted_values = {name: shell_quote(value) for name, value in values.items()}
     return command_template.format(**quoted_values)
 
@@ -2136,14 +2164,16 @@ def format_agent_command(
             f"{task_context}agent profile {profile_name!r} command template "
             f"references {{effort}}, but no effort is resolved; set {effort_setting}."
         )
+    values = {
+        "prompt": prompt,
+        "model": model or "",
+        "effort": effort or "",
+        **format_fields,
+    }
     return format_shell_command_template(
         command_template,
-        {
-            "prompt": prompt,
-            "model": model or "",
-            "effort": effort or "",
-            **format_fields,
-        },
+        values,
+        windows_shell_fields=("model", "effort", *format_fields),
     )
 
 

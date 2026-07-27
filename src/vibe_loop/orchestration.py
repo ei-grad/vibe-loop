@@ -4957,6 +4957,7 @@ class TaskSourceSettler:
             return format_shell_command_template(
                 template,
                 {"task_id": self.task_id, "run_id": self.run_id},
+                windows_shell_fields=("task_id", "run_id"),
             )
         except ValueError:
             return ""
@@ -5401,7 +5402,7 @@ def task_agent_dispatch_blocker(
             task_id=task.task_id,
             run_id="status-preflight",
         )
-    except AgentResolutionError as exc:
+    except (AgentResolutionError, ValueError) as exc:
         return ConfigContractBlocker(
             code=(
                 "task_agent_profile_unknown"

@@ -85,10 +85,12 @@ authoritative executable templates. `command` receives `{prompt}`, `{model}`,
 `{task_id}`, and `{run_id}`; `selection_command` receives `{prompt}` and
 `{model}`/`{effort}`. Every substituted value is shell-quoted, and templates
 fail closed before launch on unknown fields, conversions, format
-specifications, malformed syntax, or unresolved route values. When first-class `effort` is
-configured, an explicit command must use `{effort}` and cannot also embed a
-native effort flag; templates that omit `{effort}` remain unchanged only when
-no first-class effort is configured. An exact explicit `codex review {prompt}`
+specifications, malformed syntax, or unresolved route values. Windows
+non-prompt values also fail closed when `cmd.exe` cannot represent them without
+quote or environment-expansion ambiguity. When first-class `effort` is configured,
+an explicit command must use `{effort}` and cannot also embed a native effort
+flag; templates that omit `{effort}` remain unchanged only when no first-class
+effort is configured. An exact explicit `codex review {prompt}`
 reviewer command cannot receive first-class `model` or `effort`: project config
 cannot bind `model_provider`, while the exact command has no supported
 effective-route metadata surface. Run-contract resolution rejects that
