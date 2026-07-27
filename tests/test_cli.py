@@ -7241,9 +7241,9 @@ class CliTests(unittest.TestCase):
             record_types,
             [
                 "lock_acquired",
+                "attempt_circuit_attempt",
                 "run_contract_resolved",
                 "stage_transition",
-                "attempt_circuit_attempt",
                 "stage_transition",
                 "stage_transition",
                 "lock_released",
@@ -7360,9 +7360,9 @@ class CliTests(unittest.TestCase):
                     record_types,
                     [
                         "lock_acquired",
+                        "attempt_circuit_attempt",
                         "run_contract_resolved",
                         "stage_transition",
-                        "attempt_circuit_attempt",
                         "stage_transition",
                         "stage_transition",
                         "lock_released",
