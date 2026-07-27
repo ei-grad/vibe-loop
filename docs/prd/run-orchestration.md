@@ -259,10 +259,11 @@ preserved approved candidate branch and commit; a generic conflict reason alone
 is insufficient. The runtime never performs semantic conflict resolution
 itself.
 
-A failed `git merge --ff-only` records bounded, redacted Git stderr. If the
-current mainline remains an ancestor of the candidate after the failed command,
-the reason is `main_fast_forward_environment_failed`; otherwise it is
-`main_fast_forward_failed`, indicating that the refs diverged.
+A failed `git merge --ff-only` records bounded, redacted Git output including
+stderr. The reason is `main_fast_forward_failed` only when successful ancestry
+probes confirm that neither ref contains the other. If either ref contains the
+other or the ancestry relationship cannot be read, the reason is
+`main_fast_forward_environment_failed`.
 
 Main verification runs the exact target commit in a temporary standalone clone
 whose refs and worktree registry are independent of the live primary

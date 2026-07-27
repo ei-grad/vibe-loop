@@ -3769,10 +3769,9 @@ class Integrator:
             )
             if merge_main.returncode != 0:
                 main_after = self._rev_parse(self.repo, self.main_branch)
-                reason = (
-                    "main_fast_forward_environment_failed"
-                    if self._is_ancestor(main_after, branch_head)
-                    else "main_fast_forward_failed"
+                reason = self._fast_forward_failure_reason(
+                    main_after=main_after,
+                    branch_head=branch_head,
                 )
                 return self._record_failure(
                     reason,
@@ -3783,7 +3782,6 @@ class Integrator:
                     verification=integration_checks,
                     diagnostics={
                         "git_output": self._bounded_git_output(merge_main),
-                        "git_stderr": self._bounded_git_stream(merge_main.stderr),
                     },
                     recovered=recovered_lock,
                 )
@@ -4522,16 +4520,33 @@ class Integrator:
         return [line for line in result.stdout.splitlines() if line]
 
     def _is_ancestor(self, ancestor: str, descendant: str) -> bool:
-        return (
-            self._git(
-                self.repo,
-                "merge-base",
-                "--is-ancestor",
-                ancestor,
-                descendant,
-            ).returncode
-            == 0
+        return self._ancestry_relation(ancestor, descendant) is True
+
+    def _fast_forward_failure_reason(
+        self,
+        *,
+        main_after: str,
+        branch_head: str,
+    ) -> str:
+        main_precedes_candidate = self._ancestry_relation(main_after, branch_head)
+        candidate_precedes_main = self._ancestry_relation(branch_head, main_after)
+        if main_precedes_candidate is False and candidate_precedes_main is False:
+            return "main_fast_forward_failed"
+        return "main_fast_forward_environment_failed"
+
+    def _ancestry_relation(self, ancestor: str, descendant: str) -> bool | None:
+        result = self._git(
+            self.repo,
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
         )
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        return None
 
     def _rev_parse(self, worktree: Path, ref: str) -> str:
         result = self._git(worktree, "rev-parse", "--verify", f"{ref}^{{commit}}")

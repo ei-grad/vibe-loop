@@ -3352,16 +3352,16 @@ class RuntimeIntegrationTests(unittest.TestCase):
 
         self.assertEqual(result.status, "blocked")
         self.assertEqual(result.reason, "main_fast_forward_environment_failed")
-        stderr = str(result.diagnostics["git_stderr"])
-        self.assertIn(diagnostic, stderr)
-        self.assertIn("postgres://user:<redacted>@database/app", stderr)
-        self.assertNotIn(secret, stderr)
+        git_output = str(result.diagnostics["git_output"])
+        self.assertIn(diagnostic, git_output)
+        self.assertIn("postgres://user:<redacted>@database/app", git_output)
+        self.assertNotIn(secret, git_output)
         self.assertNotIn(
             "x" * (tasks_module.TASK_SOURCE_ERROR_LINE_LIMIT + 1),
-            stderr,
+            git_output,
         )
         self.assertLessEqual(
-            len(stderr),
+            len(git_output),
             tasks_module.TASK_SOURCE_ERROR_STREAM_LIMIT,
         )
 
@@ -3388,7 +3388,86 @@ class RuntimeIntegrationTests(unittest.TestCase):
 
         self.assertEqual(result.status, "blocked")
         self.assertEqual(result.reason, "main_fast_forward_failed")
-        self.assertIn("Not possible to fast-forward", result.diagnostics["git_stderr"])
+        self.assertTrue(result.diagnostics["git_output"])
+
+    def test_fast_forward_failure_after_candidate_lands_is_environmental(
+        self,
+    ) -> None:
+        integrator = self.integrator()
+        original_git = integrator._git
+
+        def land_candidate_before_reporting_failure(worktree, *args):
+            if worktree == self.repo and args[:2] == ("merge", "--ff-only"):
+                merged = original_git(worktree, *args)
+                self.assertEqual(merged.returncode, 0)
+                (self.repo / "concurrent.txt").write_text(
+                    "concurrent\n",
+                    encoding="utf-8",
+                )
+                git(self.repo, "add", "concurrent.txt")
+                git(self.repo, "commit", "-m", "concurrent main advance")
+                return subprocess.CompletedProcess(
+                    ["git", *args],
+                    128,
+                    "",
+                    "simulated post-merge failure",
+                )
+            return original_git(worktree, *args)
+
+        with patch.object(
+            integrator,
+            "_git",
+            side_effect=land_candidate_before_reporting_failure,
+        ):
+            result = integrator.run()
+
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.reason, "main_fast_forward_environment_failed")
+        self.assertEqual(
+            result.diagnostics["git_output"], "simulated post-merge failure"
+        )
+
+    def test_fast_forward_ancestry_probe_error_is_environmental(self) -> None:
+        integrator = self.integrator()
+        original_git = integrator._git
+        fast_forward_failed = False
+
+        def fail_fast_forward_and_ancestry_probe(worktree, *args):
+            nonlocal fast_forward_failed
+            if worktree == self.repo and args[:2] == ("merge", "--ff-only"):
+                fast_forward_failed = True
+                return subprocess.CompletedProcess(
+                    ["git", *args],
+                    128,
+                    "",
+                    "simulated fast-forward failure",
+                )
+            if (
+                fast_forward_failed
+                and worktree == self.repo
+                and args[:2] == ("merge-base", "--is-ancestor")
+            ):
+                return subprocess.CompletedProcess(
+                    ["git", *args],
+                    128,
+                    "",
+                    "simulated ancestry probe failure",
+                )
+            return original_git(worktree, *args)
+
+        with patch.object(
+            integrator,
+            "_git",
+            side_effect=fail_fast_forward_and_ancestry_probe,
+        ):
+            result = integrator.run()
+
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.reason, "main_fast_forward_environment_failed")
+        self.assertEqual(
+            result.diagnostics["git_output"],
+            "simulated fast-forward failure",
+        )
 
     def test_jobs_two_integration_windows_are_serialized(self) -> None:
         second_worktree = Path(self.directory.name) / "second-worktree"
