@@ -8412,6 +8412,73 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             # must already see the settled outcome, not infer one afterwards.
             self.assertEqual(lock_manager.outcome_at_release("T-1"), "completed")
 
+    def test_completed_report_is_reclassified_when_main_is_not_upstream(
+        self,
+    ) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _source = self._build_runner(
+                directory, [task], {"T-1": done}
+            )
+            remote = runner.config.repo / ".remote.git"
+            with (runner.config.repo / ".git" / "info" / "exclude").open(
+                "a",
+                encoding="utf-8",
+            ) as exclude:
+                exclude.write("/.remote.git/\n")
+            subprocess.run(
+                ["git", "init", "--bare", str(remote)],
+                cwd=runner.config.repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "remote", "add", "origin", str(remote)],
+                cwd=runner.config.repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "push", "-u", "origin", "main"],
+                cwd=runner.config.repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            (runner.config.repo / "candidate.txt").write_text(
+                "candidate\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "add", "candidate.txt"],
+                cwd=runner.config.repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "candidate"],
+                cwd=runner.config.repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            runner.config = dataclasses.replace(
+                runner.config,
+                autopilot=dataclasses.replace(
+                    runner.config.autopilot,
+                    require_upstream_sync=True,
+                ),
+            )
+
+            result = self._run_task(
+                runner, task, self._reporting_worker(runner, "completed")
+            )
+
+        self.assertEqual(result.classification, "blocked")
+        self.assertEqual(result.classification_source, "upstream_ahead")
+        self.assertIn('"relation": "ahead"', result.message)
+        self.assertEqual(lock_manager.outcome_at_release("T-1"), "blocked")
+
     def test_claude_worker_clean_exit_without_report_is_recorded_failed(self) -> None:
         task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
         active = dataclasses.replace(task, status="Active")
@@ -9502,9 +9569,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 if record.get("record_type") == "integration_result"
                 and record.get("status") == "completed"
             )
-            main_text = (runner.config.repo / "README.md").read_text(
-                encoding="utf-8"
-            )
+            main_text = (runner.config.repo / "README.md").read_text(encoding="utf-8")
 
         self.assertEqual(result.classification, "completed")
         self.assertEqual(source.status, "done")

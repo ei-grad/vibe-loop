@@ -2589,6 +2589,54 @@ class AutopilotRunTests(unittest.TestCase):
         ]
         self.assertEqual(cycle_records[-1]["actions"][0], "cleaned_stale_locks:1")
 
+    def test_upstream_fence_survives_stale_lock_status_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            configured_repo(
+                repo,
+                [("TASK-01", "Active", "", "ready retry")],
+                extra_toml="[autopilot]\nrequire_upstream_sync = true\n",
+            )
+            remote = repo.parent / "remote.git"
+            run(repo.parent, "git", "init", "--bare", str(remote))
+            run(repo, "git", "remote", "add", "origin", str(remote))
+            run(repo, "git", "push", "-u", "origin", "main")
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo, config.state_path / "locks", config.locks
+            )
+            active = ActiveRunState.new(
+                task_id="STALE-01",
+                run_id="run-stale",
+                log_path=config.state_path / "runs" / "run-stale.log",
+                base_main=git_text(repo, "rev-parse", "HEAD"),
+                command="codex",
+            ).with_worker_pid(987654321)
+            manager.acquire(
+                "STALE-01",
+                "run-stale",
+                metadata=active.to_lock_metadata(),
+            )
+            launcher, calls = self._recording_launcher()
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=launcher,
+                process_exists=lambda pid: False,
+            )
+
+        self.assertEqual(len(calls), 1)
+        cycle = summary.cycles[0]
+        self.assertEqual(cycle.status, "completed")
+        self.assertIn("cleaned_stale_locks:1", cycle.actions)
+        self.assertIn("upstream_sync:equal", cycle.actions)
+        self.assertNotIn("upstream_sync:stale_ref", cycle.blockers)
+        self.assertFalse(
+            any(blocker.startswith("active_unlocked_") for blocker in cycle.blockers)
+        )
+
     @unittest.skipUnless(sys.platform == "linux", "birth identity requires Linux")
     def test_does_not_clean_worker_lock_before_pid_is_observed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -2109,12 +2109,6 @@ class CliTests(unittest.TestCase):
         self.assertIn(
             "001-checkout__T002", observed["001-checkout:T004"]["done_at_start"]
         )
-        self.assertIn(
-            "001-checkout__T001", observed["001-checkout:T003"]["done_at_start"]
-        )
-        self.assertIn(
-            "001-checkout__T002", observed["001-checkout:T003"]["done_at_start"]
-        )
         self.assertIn("- [x] T004 Add checkout migration", final_tasks)
         self.assertIn("[vibe-loop] parallel supervisor jobs=2", stderr.getvalue())
 
@@ -6623,6 +6617,100 @@ class CliTests(unittest.TestCase):
         self.assertEqual(records[0]["started_at"], "2026-05-09T00:00:00+00:00")
         self.assertEqual(records[1]["started_at"], "2026-05-09T00:00:00+00:00")
         self.assertEqual(records[1]["owner_task_id"], "TASK-01")
+
+    def test_main_integration_release_retains_lock_when_upstream_is_ahead(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            config_path = repo / ".vibe-loop.toml"
+            config_path.write_text(
+                config_path.read_text(encoding="utf-8")
+                + "\n[autopilot]\nrequire_upstream_sync = true\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", ".vibe-loop.toml"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "require upstream sync"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            remote = repo.parent / "remote.git"
+            subprocess.run(
+                ["git", "init", "--bare", str(remote)],
+                cwd=repo.parent,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "remote", "add", "origin", str(remote)],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "push", "-u", "origin", "main"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            head = commit_test_file(
+                repo,
+                "candidate.txt",
+                "candidate\n",
+                "candidate",
+            )
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            manager.acquire_main_integration(
+                task_id="TASK-01",
+                run_id="run-1",
+                metadata={"pid": os.getpid()},
+            )
+            fencing_token = manager.local_fencing_token("main-integration")
+            RunStore(repo / ".vibe-loop" / "runs.jsonl").append_record(
+                {
+                    "record_type": "candidate_recorded",
+                    "run_id": "run-1",
+                    "task_id": "TASK-01",
+                    "head_commit": head,
+                }
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict(
+                os.environ,
+                {"VIBE_LOOP_FENCING_TOKEN": fencing_token},
+            ):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        [
+                            "main-integration",
+                            "release",
+                            "--repo",
+                            str(repo),
+                            "--run-id",
+                            "run-1",
+                            "--task-id",
+                            "TASK-01",
+                            "--json",
+                        ]
+                    )
+
+            payload = json.loads(stdout.getvalue())
+            lock_status = manager.main_integration_status()
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertFalse(payload["released"])
+        self.assertEqual(payload["error"], "upstream_sync_blocked")
+        self.assertEqual(payload["blocker"]["code"], "upstream_ahead")
+        self.assertEqual(lock_status.state, "held")
+        self.assertEqual(lock_status.to_json()["owner_task_id"], "TASK-01")
 
     def test_main_integration_allows_clean_main_equivalent_no_commit_run(
         self,

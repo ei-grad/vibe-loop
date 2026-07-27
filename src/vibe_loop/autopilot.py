@@ -1568,13 +1568,15 @@ def active_unlocked_task_blockers(
         if task_id in locked_task_ids:
             continue
         latest_run_id = latest_run_ids.get(task_id, "")
+        if not latest_run_id:
+            continue
         classification = classifications.get((task_id, latest_run_id), "")
+        if classification and classification != "completed":
+            continue
         code = (
-            "active_unlocked_without_terminal_classification"
-            if not classification
-            else "active_unlocked_task_completion_unsettled"
+            "active_unlocked_task_completion_unsettled"
             if classification == "completed"
-            else "active_unlocked_task_settlement_unsettled"
+            else "active_unlocked_without_terminal_classification"
         )
         blockers.append(f"{code}:{task_id}")
     for task_id, run_id in latest_run_ids.items():
@@ -6066,31 +6068,6 @@ def execute_autopilot_cycle(
     status = collect_project_status(config, process_exists=process_exists)
     runnable = status.queue.runnable
     actions: list[str] = []
-    if config.autopilot.require_upstream_sync:
-        upstream = check_upstream_sync(
-            config.repo,
-            config.main_branch,
-            required=True,
-            refresh=True,
-        )
-        retained_blockers = tuple(
-            blocker
-            for blocker in status.blockers
-            if not blocker.startswith("upstream_sync:")
-        )
-        if upstream.satisfied:
-            status = dataclasses.replace(status, blockers=retained_blockers)
-            actions.append("upstream_sync:equal")
-        else:
-            assert upstream.blocker is not None
-            status = dataclasses.replace(
-                status,
-                blockers=(
-                    *retained_blockers,
-                    f"upstream_sync:{upstream.blocker.code}",
-                ),
-            )
-            actions.append(f"upstream_sync:{upstream.blocker.code}")
     child_pid: int | None = None
     child_log: Path | None = None
     cleanup_errors = 0
@@ -6144,6 +6121,32 @@ def execute_autopilot_cycle(
             actions.append(f"stale_lock_cleanup_errors:{cleanup_errors}")
         status = collect_project_status(config, process_exists=process_exists)
         runnable = status.queue.runnable
+
+    if config.autopilot.require_upstream_sync:
+        upstream = check_upstream_sync(
+            config.repo,
+            config.main_branch,
+            required=True,
+            refresh=True,
+        )
+        retained_blockers = tuple(
+            blocker
+            for blocker in status.blockers
+            if not blocker.startswith("upstream_sync:")
+        )
+        if upstream.satisfied:
+            status = dataclasses.replace(status, blockers=retained_blockers)
+            actions.append("upstream_sync:equal")
+        else:
+            assert upstream.blocker is not None
+            status = dataclasses.replace(
+                status,
+                blockers=(
+                    *retained_blockers,
+                    f"upstream_sync:{upstream.blocker.code}",
+                ),
+            )
+            actions.append(f"upstream_sync:{upstream.blocker.code}")
 
     disposition = worktree_disposition_runner(
         config,

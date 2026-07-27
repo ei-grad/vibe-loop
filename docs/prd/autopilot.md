@@ -1025,7 +1025,9 @@ The check reports a bounded typed blocker containing the Git relation, ahead
 and behind counts, reviewed-commit containment, freshness, and the unmet
 lifecycle prerequisite. Missing upstream configuration, fetch failure, stale
 local-only observations, ahead, behind, and divergence remain distinct
-outcomes. With the policy disabled, existing local-completion behavior is
+outcomes. The fetch is noninteractive and time-bounded so unavailable
+credentials or a stalled remote produce `fetch_failed` instead of stopping the
+supervisor. With the policy disabled, existing local-completion behavior is
 unchanged.
 
 The runtime evaluates this fence before recording successful integration
@@ -1037,8 +1039,10 @@ fresh retry must re-evaluate the fence before it may release or dispatch again.
 
 Autopilot must also refuse unrelated dispatch while the authoritative task
 source contains an active task with no corresponding task lock and no durable
-terminal run classification. Selection resumes only after both that lifecycle
-state and the upstream fence are settled.
+terminal run classification. An active task with no prior run remains ordinarily
+runnable, and a failed or blocked terminal run remains retryable. Selection
+resumes only after both an abandoned in-progress lifecycle state and the
+upstream fence are settled.
 
 ## PRD-AUT-016 Provider Usage Run Telemetry
 

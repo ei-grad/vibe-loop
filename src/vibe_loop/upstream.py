@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import subprocess
 from pathlib import Path
+
+
+UPSTREAM_FETCH_TIMEOUT_SECONDS = 30.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -98,7 +102,15 @@ def check_upstream_sync(
                 fresh=False,
                 unmet_prerequisite=unmet_prerequisite,
             )
-        _output, fetch_error = _git(repo, "fetch", "--quiet", "--", remote)
+        _output, fetch_error = _git(
+            repo,
+            "fetch",
+            "--quiet",
+            "--",
+            remote,
+            timeout=UPSTREAM_FETCH_TIMEOUT_SECONDS,
+            suppress_terminal_prompt=True,
+        )
         if fetch_error:
             return _blocked(
                 code="fetch_failed",
@@ -246,7 +258,16 @@ def _blocked(
     )
 
 
-def _git(repo: Path, *args: str) -> tuple[str, str]:
+def _git(
+    repo: Path,
+    *args: str,
+    timeout: float | None = None,
+    suppress_terminal_prompt: bool = False,
+) -> tuple[str, str]:
+    env = None
+    if suppress_terminal_prompt:
+        env = os.environ.copy()
+        env["GIT_TERMINAL_PROMPT"] = "0"
     try:
         result = subprocess.run(
             ["git", *args],
@@ -257,8 +278,10 @@ def _git(repo: Path, *args: str) -> tuple[str, str]:
             text=True,
             encoding="utf-8",
             errors="replace",
+            timeout=timeout,
+            env=env,
         )
-    except OSError as exc:
+    except (OSError, subprocess.TimeoutExpired) as exc:
         return "", type(exc).__name__
     if result.returncode != 0:
         return "", f"git_exit_{result.returncode}"

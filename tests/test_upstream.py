@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from vibe_loop.autopilot import TaskQueueStatus, active_unlocked_task_blockers
 from vibe_loop.config import parse_autopilot
@@ -12,7 +13,7 @@ from vibe_loop.runs import (
     RUN_RECORD_TYPE,
     RUN_STARTED_RECORD_TYPE,
 )
-from vibe_loop.upstream import check_upstream_sync
+from vibe_loop.upstream import UPSTREAM_FETCH_TIMEOUT_SECONDS, check_upstream_sync
 
 
 class UpstreamSyncTests(unittest.TestCase):
@@ -185,6 +186,28 @@ class UpstreamSyncTests(unittest.TestCase):
 
         self.assertEqual(status.blocker.code if status.blocker else "", "fetch_failed")
 
+    def test_fetch_timeout_is_noninteractive_and_typed_as_failure(self) -> None:
+        real_run = subprocess.run
+        fetch_call: dict[str, object] = {}
+
+        def timeout_fetch(command, **kwargs):
+            if command[1] == "fetch":
+                fetch_call.update(kwargs)
+                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+            return real_run(command, **kwargs)
+
+        with patch("vibe_loop.upstream.subprocess.run", side_effect=timeout_fetch):
+            status = check_upstream_sync(
+                self.repo,
+                "main",
+                required=True,
+                refresh=True,
+            )
+
+        self.assertEqual(status.blocker.code if status.blocker else "", "fetch_failed")
+        self.assertEqual(fetch_call["timeout"], UPSTREAM_FETCH_TIMEOUT_SECONDS)
+        self.assertEqual(fetch_call["env"]["GIT_TERMINAL_PROMPT"], "0")
+
     def test_policy_config_is_typed_and_defaults_disabled(self) -> None:
         self.assertFalse(parse_autopilot({}).require_upstream_sync)
         self.assertTrue(
@@ -215,6 +238,29 @@ class UpstreamSyncTests(unittest.TestCase):
 
 
 class ActiveUnlockedFenceTests(unittest.TestCase):
+    def test_runnable_active_task_without_prior_run_is_not_blocked(self) -> None:
+        queue = TaskQueueStatus(source_tasks=({"id": "TASK-1", "status": "active"},))
+
+        self.assertEqual(active_unlocked_task_blockers(queue, (), ()), [])
+
+    def test_terminal_noncompletion_allows_retry(self) -> None:
+        queue = TaskQueueStatus(source_tasks=({"id": "TASK-1", "status": "active"},))
+
+        for classification in ("failed", "blocked"):
+            with self.subTest(classification=classification):
+                records = (
+                    {
+                        "record_type": RUN_RECORD_TYPE,
+                        "task_id": "TASK-1",
+                        "run_id": "current",
+                        "classification": classification,
+                    },
+                )
+                self.assertEqual(
+                    active_unlocked_task_blockers(queue, (), records),
+                    [],
+                )
+
     def test_new_unclassified_run_is_not_masked_by_prior_result(self) -> None:
         queue = TaskQueueStatus(source_tasks=({"id": "TASK-1", "status": "active"},))
         records = (
