@@ -337,7 +337,9 @@ role/purpose, actual resolved provider/model/effort provenance, canonical
 normalized usage. It excludes review prose. Integration requires `clean`
 evidence for the exact candidate. Missing or stale evidence cannot authorize
 integration, and any `findings` or `blocked` verdict permanently fences that
-candidate fingerprint; remediation must produce a new fingerprint.
+candidate fingerprint; remediation must produce a new fingerprint. Malformed,
+unavailable, and other retry-attempt diagnostics retain engine verdict `error`
+without a control verdict and cannot overrule a later parsed verdict.
 
 The reviewer route is resolved from the selected profile and command
 configuration before launch and compared with the frozen run contract. A
@@ -355,6 +357,11 @@ mandatory. A `work_blocked` record becomes an actionable steward wake only for
 `needs_decision`, `authorization`, or `non_retryable_policy`. Transient
 dependency, gate, and provider progress remains observational, while verified
 provider quota/account-wall events retain their existing typed authority.
+Native stream projection currently emits `provider_error`, which is
+observational. When a review control fence rejects an unchanged or otherwise
+ineligible candidate, the supervisor emits a bounded
+`work_blocked/non_retryable_policy` record with the stable fence reason and
+records a blocked stage failure before returning control.
 
 Records must be additive — unknown types are ignored on read, consistent with
 the existing invalid JSON line tolerance. Each record carries `schema_version`,

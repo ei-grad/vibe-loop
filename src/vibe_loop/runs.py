@@ -4,6 +4,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 from contextlib import contextmanager
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Mapping
 
 from vibe_loop.activity import (
+    ACTIONABLE_WORK_BLOCKED_REASON_CLASSES,
     ACTIVITY_CHECKPOINT_RECORD_TYPE,
     ACTIVITY_RECORD_TYPES,
     AGENT_COMPLETED_RECORD_TYPE,
@@ -850,6 +852,38 @@ class RunLifecycleEvent:
             run_id=run_id,
             task_id=task_id,
             payload=emission.to_payload(provider=provider, usage=usage),
+        )
+
+    @classmethod
+    def work_blocked(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        reason_class: str,
+        detail_code: str = "",
+        candidate_fingerprint: str = "",
+    ) -> RunLifecycleEvent:
+        if reason_class not in ACTIONABLE_WORK_BLOCKED_REASON_CLASSES:
+            raise ValueError("unsupported actionable work-blocked reason class")
+        payload: dict[str, object] = {
+            "role": "supervisor",
+            "purpose": "integration_control",
+            "reason_class": reason_class,
+        }
+        if detail_code:
+            if re.fullmatch(r"[a-z][a-z0-9_:-]{0,159}", detail_code) is None:
+                raise ValueError("invalid work-blocked detail code")
+            payload["detail_code"] = detail_code
+        if candidate_fingerprint:
+            if re.fullmatch(r"sha256:[0-9a-f]{64}", candidate_fingerprint) is None:
+                raise ValueError("invalid work-blocked candidate fingerprint")
+            payload["candidate_fingerprint"] = candidate_fingerprint
+        return cls(
+            record_type=WORK_BLOCKED_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
         )
 
     @classmethod

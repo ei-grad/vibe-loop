@@ -90,7 +90,10 @@ non-prompt values also fail closed when `cmd.exe` cannot represent them without
 quote or environment-expansion ambiguity. When first-class `effort` is configured,
 an explicit command must use `{effort}` and cannot also embed a native effort
 flag; templates that omit `{effort}` remain unchanged only when no first-class
-effort is configured. An exact explicit `codex review {prompt}`
+effort is configured. When a first-class `model` is configured for an explicit
+reviewer command, that command must use `{model}` and cannot also embed a native
+model flag; an explicit reviewer template may omit `{model}` only when no
+first-class reviewer model is configured. An exact explicit `codex review {prompt}`
 reviewer command cannot receive first-class `model` or `effort`: project config
 cannot bind `model_provider`, while the exact command has no supported
 effective-route metadata surface. Run-contract resolution rejects that

@@ -55,6 +55,7 @@ from vibe_loop.orchestration import (
     IntegrationResult,
     ProvisionedWorkspace,
     ReviewConcurrencyBudget,
+    ReviewControlFenceError,
     ReviewOutputMalformed,
     ReviewRouter,
     RunLifecycleStateMachine,
@@ -9737,6 +9738,31 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
         self.assertEqual(lock_manager.outcome_at_release("T-1"), "blocked")
         self.assertEqual(candidate["head_commit"], "b" * 40)
         self.assertEqual(gate["exit_class"], "passed")
+
+    def test_review_control_fence_parks_with_stable_classification(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+
+            with patch.object(
+                runner,
+                "execute_runtime_owned_lifecycle",
+                side_effect=ReviewControlFenceError("review_verdict_findings"),
+            ):
+                result = self._run_task(
+                    runner,
+                    task,
+                    self._reporting_worker(runner, "completed"),
+                )
+
+        self.assertEqual(result.classification, "blocked")
+        self.assertEqual(
+            result.classification_source,
+            "review_verdict_findings",
+        )
+        self.assertEqual(source.status, "on-hold")
+        self.assertEqual(lock_manager.outcome_at_release("T-1"), "blocked")
 
     def test_runtime_owned_completion_without_integration_parks_as_blocked(
         self,

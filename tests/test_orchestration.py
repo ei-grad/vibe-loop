@@ -4944,7 +4944,7 @@ class ReviewRouterTests(unittest.TestCase):
         self.assertNotIn("evidence", verdict)
 
     def test_provider_qualified_model_is_preserved_in_review_route(self) -> None:
-        model = "openrouter/anthropic/claude-3.7"
+        model = "vertex/anthropic/claude-opus-4-1@20250805"
         reviewer = dataclasses.replace(self.agent("codex"), model=model)
         router = ReviewRouter(
             reviewer=reviewer,
@@ -4976,6 +4976,106 @@ class ReviewRouterTests(unittest.TestCase):
         self.assertEqual(started["route"]["model"], model)
         self.assertEqual(verdict["route"]["model"], model)
 
+    def test_unset_model_remains_null_in_review_route(self) -> None:
+        reviewer = dataclasses.replace(
+            self.agent("codex"),
+            model=None,
+            model_source="default:none",
+            command="codex review --effort {effort} {prompt}",
+        )
+        router = ReviewRouter(
+            reviewer=reviewer,
+            reviewer_profile="review",
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            worktree=self.repo,
+            policy_references=("REVIEW.md",),
+            max_initial_passes=1,
+            max_closure_passes=0,
+            concurrency=ReviewConcurrencyBudget(1),
+            executor=lambda command, **_kwargs: subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps({"verdict": "approve", "findings": []}),
+            ),
+        )
+
+        router.review(self.gates)
+
+        routes = [
+            record["route"]
+            for record in self.store.read_records()
+            if record["record_type"] in {"review_started", "review_verdict"}
+        ]
+        self.assertEqual([route["model"] for route in routes], [None, None])
+
+    def test_retryable_malformed_attempt_does_not_fence_clean_verdict(self) -> None:
+        transitions: list[dict[str, object]] = []
+        machine = RunLifecycleStateMachine(
+            lambda transition: transitions.append(transition.to_payload())
+        )
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            machine.transition(stage, reason="setup")
+        outputs = iter(
+            (
+                "not json",
+                json.dumps({"verdict": "approve", "findings": []}),
+            )
+        )
+
+        router = ReviewRouter(
+            reviewer=self.agent("codex"),
+            reviewer_profile="review",
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            worktree=self.repo,
+            policy_references=("REVIEW.md",),
+            max_initial_passes=1,
+            max_closure_passes=0,
+            concurrency=ReviewConcurrencyBudget(1),
+            stage_machine=machine,
+            executor=lambda command, **_kwargs: subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=next(outputs),
+            ),
+        )
+
+        result = router.review(self.gates)
+
+        self.assertTrue(result.approved)
+        self.assertEqual(machine.stage, RunStage.INTEGRATION)
+        verdicts = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_verdict"
+        ]
+        self.assertEqual(
+            [
+                (
+                    record["verdict"],
+                    record.get("control_verdict"),
+                    record["output_classification"],
+                )
+                for record in verdicts
+            ],
+            [("error", None, "malformed"), ("clean", "clean", "parsed")],
+        )
+        self.assertFalse(
+            any(
+                record["record_type"] == "work_blocked"
+                for record in self.store.read_records()
+            )
+        )
+
     def test_candidate_review_fence_rejects_stale_and_adverse_verdicts(self) -> None:
         current = self.candidate.fingerprint
         stale = "sha256:" + "d" * 64
@@ -4989,6 +5089,20 @@ class ReviewRouterTests(unittest.TestCase):
 
         require_candidate_review_clear(
             [clean],
+            run_id="run-1",
+            task_id="TASK-01",
+            candidate_fingerprint=current,
+        )
+        require_candidate_review_clear(
+            [
+                {
+                    **clean,
+                    "control_verdict": "blocked",
+                    "engine_verdict": "error",
+                    "output_classification": "unavailable",
+                },
+                clean,
+            ],
             run_id="run-1",
             task_id="TASK-01",
             candidate_fingerprint=current,
@@ -5111,7 +5225,23 @@ class ReviewRouterTests(unittest.TestCase):
             raised.exception.reason_class,
             "review_verdict_findings",
         )
-        self.assertEqual(machine.stage, RunStage.CLOSURE)
+        self.assertEqual(machine.stage, RunStage.CLASSIFICATION)
+        blocked = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "work_blocked"
+        )
+        self.assertEqual(blocked["reason_class"], "non_retryable_policy")
+        self.assertEqual(blocked["detail_code"], "review_verdict_findings")
+        self.assertEqual(
+            blocked["candidate_fingerprint"],
+            self.candidate.fingerprint,
+        )
+        self.assertEqual(transitions[-1]["failure"], "blocked")
+        self.assertEqual(
+            transitions[-1]["reason"],
+            "review_control_fence:review_verdict_findings",
+        )
         self.assertNotIn(
             "integration",
             [
@@ -6463,6 +6593,18 @@ class ReviewRouterTests(unittest.TestCase):
 
     def test_expired_claude_session_records_fallback_before_retry(self) -> None:
         commands: list[str] = []
+        transitions: list[dict[str, object]] = []
+        machine = RunLifecycleStateMachine(
+            lambda transition: transitions.append(transition.to_payload())
+        )
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            machine.transition(stage, reason="setup")
         session_ids = iter(("old-session", "fresh-session"))
         outputs = iter(
             (
@@ -6519,14 +6661,21 @@ class ReviewRouterTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, returncode, stdout=output)
 
         router = self.router("claude", execute)
+        router.stage_machine = machine
         router.session_id_factory = lambda: next(session_ids)
         router.review(self.gates)
+        machine.transition(RunStage.CANDIDATE, reason="remediated")
+        machine.transition(RunStage.GATES, reason="regated")
+        closure_gates = self.gates_for(
+            dataclasses.replace(self.candidate, head_commit="1" * 40)
+        )
         result = router.review(
-            self.gates_for(dataclasses.replace(self.candidate, head_commit="1" * 40)),
+            closure_gates,
             pass_kind="closure:1",
         )
 
         self.assertTrue(result.approved)
+        self.assertEqual(machine.stage, RunStage.INTEGRATION)
         self.assertIn("--resume old-session", commands[1])
         self.assertIn("--session-id fresh-session", commands[2])
         fallback = next(
@@ -6536,6 +6685,12 @@ class ReviewRouterTests(unittest.TestCase):
         )
         self.assertEqual(fallback["reason"], "session_expired")
         self.assertEqual(fallback["prior_session_id"], "old-session")
+        require_candidate_review_clear(
+            self.store.read_records(),
+            run_id="run-1",
+            task_id="TASK-01",
+            candidate_fingerprint=closure_gates.candidate.fingerprint,
+        )
 
     def test_unfinished_review_wait_never_relaunches(self) -> None:
         self.store.append_lifecycle_event(

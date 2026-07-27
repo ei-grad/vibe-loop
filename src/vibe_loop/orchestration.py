@@ -69,6 +69,7 @@ CANDIDATE_BASE_ANCHOR_OUTCOMES = (
 GATE_EXIT_CLASSES = ("passed", "failed", "candidate_changed", "execution_error")
 REVIEW_VERDICTS = ("approve", "findings", "error")
 REVIEW_CONTROL_VERDICTS = ("clean", "findings", "blocked")
+REVIEW_DIAGNOSTIC_OUTPUT_CLASSIFICATIONS = frozenset({"malformed", "unavailable"})
 REVIEW_RETRY_CLASSIFICATIONS = ("ok", "transient", "limit_wall", "timeout", "fatal")
 MALFORMED_REVIEW_OUTPUT_MAX_CHARS = 4096
 # ``redact_evidence_text`` is superlinear in line length, so reviewer stdout is
@@ -2843,6 +2844,8 @@ class ReviewRouter:
             prior_reviewer_session_id=context.prior_session_id,
         )
         payload = self._result_payload(result, request, route)
+        payload["verdict"] = "error"
+        payload.pop("control_verdict", None)
         payload["output_classification"] = output_classification
         if nested_usage:
             payload["nested_usage"] = dict(nested_usage)
@@ -3045,12 +3048,23 @@ class ReviewRouter:
             return
         eligible_for_integration = result.approved and not self.ledger.open()
         if eligible_for_integration:
-            require_candidate_review_clear(
-                self.run_store.read_records(),
-                run_id=self.run_id,
-                task_id=self.task_id,
-                candidate_fingerprint=candidate_fingerprint,
-            )
+            try:
+                require_candidate_review_clear(
+                    self.run_store.read_records(),
+                    run_id=self.run_id,
+                    task_id=self.task_id,
+                    candidate_fingerprint=candidate_fingerprint,
+                )
+            except ReviewControlFenceError as exc:
+                record_review_control_fence(
+                    self.run_store,
+                    self.stage_machine,
+                    run_id=self.run_id,
+                    task_id=self.task_id,
+                    candidate_fingerprint=candidate_fingerprint,
+                    reason_class=exc.reason_class,
+                )
+                raise
         destination = (
             RunStage.INTEGRATION if eligible_for_integration else RunStage.REMEDIATION
         )
@@ -7032,6 +7046,12 @@ def require_candidate_review_clear(
                 "findings": "findings",
                 "error": "blocked",
             }.get(record.get("verdict"))
+        if (
+            control_verdict == "blocked"
+            and record.get("output_classification")
+            in REVIEW_DIAGNOSTIC_OUTPUT_CLASSIFICATIONS
+        ):
+            continue
         if control_verdict in {"findings", "blocked"}:
             raise ReviewControlFenceError(f"review_verdict_{control_verdict}")
         if control_verdict == "clean":
@@ -7042,6 +7062,7 @@ def require_candidate_review_clear(
 
 def _review_route_projection(route: Mapping[str, object]) -> dict[str, object]:
     provider = route.get("provider")
+    model = route.get("model")
     effort = route.get("effort")
     return {
         "role": "reviewer" if route.get("role") == "reviewer" else "unknown",
@@ -7052,7 +7073,7 @@ def _review_route_projection(route: Mapping[str, object]) -> dict[str, object]:
         ),
         "profile": _bounded_route_reference(route.get("profile")),
         "provider": provider if provider in {"claude", "codex"} else "unknown",
-        "model": _bounded_route_reference(route.get("model")),
+        "model": None if model is None else _bounded_route_reference(model),
         "effort": (
             effort if effort in {"minimal", "low", "medium", "high", "xhigh"} else None
         ),
@@ -7066,7 +7087,7 @@ def _bounded_route_reference(value: object) -> str:
     if (
         isinstance(value, str)
         and len(value.encode("utf-8")) <= 160
-        and re.fullmatch(r"[A-Za-z0-9_.:/\[\]-]*", value)
+        and re.fullmatch(r"[A-Za-z0-9_.:/@+\[\]-]*", value)
         and not any(
             marker in value.casefold()
             for marker in (
@@ -7082,6 +7103,45 @@ def _bounded_route_reference(value: object) -> str:
     ):
         return value
     return "unknown"
+
+
+def record_review_control_fence(
+    run_store: object,
+    stage_machine: RunLifecycleStateMachine | None,
+    *,
+    run_id: str,
+    task_id: str,
+    candidate_fingerprint: str,
+    reason_class: str,
+) -> None:
+    from vibe_loop.runs import RunLifecycleEvent
+
+    already_recorded = any(
+        record.get("record_type") == "work_blocked"
+        and record.get("run_id") == run_id
+        and record.get("task_id") == task_id
+        and record.get("candidate_fingerprint") == candidate_fingerprint
+        and record.get("detail_code") == reason_class
+        for record in run_store.read_records()
+    )
+    if not already_recorded:
+        run_store.append_lifecycle_event(
+            RunLifecycleEvent.work_blocked(
+                run_id=run_id,
+                task_id=task_id,
+                reason_class="non_retryable_policy",
+                detail_code=reason_class,
+                candidate_fingerprint=candidate_fingerprint,
+            )
+        )
+    if stage_machine is not None and stage_machine.stage not in {
+        RunStage.CLASSIFICATION,
+        RunStage.FINALIZATION,
+    }:
+        stage_machine.fail(
+            StageFailure.BLOCKED,
+            reason=f"review_control_fence:{reason_class}",
+        )
 
 
 def sha256_digest(value: object) -> str:

@@ -23,7 +23,7 @@ from vibe_loop.runtime_events import (
     save_runtime_event_cursor,
     validate_runtime_event_envelope,
 )
-from vibe_loop.runs import RunStore
+from vibe_loop.runs import RunLifecycleEvent, RunStore
 
 
 def append_records(path: Path, *records: dict[str, object]) -> None:
@@ -111,6 +111,65 @@ def test_journal_record_allowlisting(
         "run_id": opaque_runtime_identifier("run-1"),
         "task_id": opaque_runtime_identifier("task-1"),
     }
+
+
+def test_supervisor_work_blocked_factory_produces_actionable_record() -> None:
+    record = RunLifecycleEvent.work_blocked(
+        run_id="run-1",
+        task_id="task-1",
+        reason_class="non_retryable_policy",
+        detail_code="review_verdict_findings",
+        candidate_fingerprint="sha256:" + "a" * 64,
+    ).to_record()
+
+    event = runtime_event_from_journal_record(
+        record,
+        project="alpha",
+        record_index=4,
+    )
+
+    assert record["role"] == "supervisor"
+    assert record["purpose"] == "integration_control"
+    assert record["detail_code"] == "review_verdict_findings"
+    assert event is not None
+    assert event["kind"] == "operator_action_required"
+
+
+@pytest.mark.parametrize(
+    "reason_class",
+    ["provider_error", "transient_dependency", "invented"],
+)
+def test_supervisor_work_blocked_factory_rejects_non_actionable_reason(
+    reason_class: str,
+) -> None:
+    with pytest.raises(ValueError, match="reason class"):
+        RunLifecycleEvent.work_blocked(
+            run_id="run-1",
+            task_id="task-1",
+            reason_class=reason_class,
+        )
+
+
+@pytest.mark.parametrize(
+    ("detail_code", "candidate_fingerprint"),
+    [
+        ("contains spaces", ""),
+        ("x" * 161, ""),
+        ("review_verdict_findings", "sha256:not-a-digest"),
+    ],
+)
+def test_supervisor_work_blocked_factory_bounds_control_metadata(
+    detail_code: str,
+    candidate_fingerprint: str,
+) -> None:
+    with pytest.raises(ValueError, match="work-blocked"):
+        RunLifecycleEvent.work_blocked(
+            run_id="run-1",
+            task_id="task-1",
+            reason_class="non_retryable_policy",
+            detail_code=detail_code,
+            candidate_fingerprint=candidate_fingerprint,
+        )
 
 
 @pytest.mark.parametrize(

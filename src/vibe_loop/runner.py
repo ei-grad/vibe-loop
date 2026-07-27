@@ -87,6 +87,7 @@ from vibe_loop.orchestration import (
     ReviewBudgetExhausted,
     ReviewClosureUnavailable,
     ReviewConcurrencyBudget,
+    ReviewControlFenceError,
     ReviewExecutionError,
     ReviewFinding,
     ReviewLimitWallError,
@@ -109,6 +110,7 @@ from vibe_loop.orchestration import (
     inject_claude_session,
     inject_provider_continuation,
     plan_session_continuation,
+    record_review_control_fence,
     require_candidate_review_clear,
     run_configured_command,
     settlement_intent,
@@ -3306,6 +3308,13 @@ class VibeRunner:
                         detail=str(exc),
                     )
                     message = str(exc)
+                except ReviewControlFenceError as exc:
+                    classification = ClassificationResult(
+                        "blocked",
+                        exc.reason_class,
+                        detail=str(exc),
+                    )
+                    message = str(exc)
                 except TaskSourceCompletionError as exc:
                     classification = ClassificationResult(
                         "blocked",
@@ -3989,12 +3998,23 @@ class VibeRunner:
                 prior_findings=open_findings,
             )
 
-        require_candidate_review_clear(
-            self.run_store.read_records(),
-            run_id=run_id,
-            task_id=task.task_id,
-            candidate_fingerprint=gate_summary.candidate.fingerprint,
-        )
+        try:
+            require_candidate_review_clear(
+                self.run_store.read_records(),
+                run_id=run_id,
+                task_id=task.task_id,
+                candidate_fingerprint=gate_summary.candidate.fingerprint,
+            )
+        except ReviewControlFenceError as exc:
+            record_review_control_fence(
+                self.run_store,
+                stage_machine,
+                run_id=run_id,
+                task_id=task.task_id,
+                candidate_fingerprint=gate_summary.candidate.fingerprint,
+                reason_class=exc.reason_class,
+            )
+            raise
         integration = contract.get("integration")
         if not isinstance(integration, Mapping) or not integration.get("enabled"):
             stage_machine.fail(

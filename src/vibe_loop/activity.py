@@ -15,6 +15,13 @@ ACTIVITY_CHECKPOINT_RECORD_TYPE = "activity_checkpoint"
 GATE_RESULT_RECORD_TYPE = "gate_result"
 WORK_BLOCKED_RECORD_TYPE = "work_blocked"
 AGENT_COMPLETED_RECORD_TYPE = "agent_completed"
+ACTIONABLE_WORK_BLOCKED_REASON_CLASSES = frozenset(
+    {
+        "needs_decision",
+        "authorization",
+        "non_retryable_policy",
+    }
+)
 ACTIVITY_RECORD_TYPES = frozenset(
     {
         AGENT_STARTED_RECORD_TYPE,
