@@ -40,6 +40,8 @@ from vibe_loop.tasks import (
     BLOCKED_FAMILY_STATUSES,
     Task,
     TaskSource,
+    bound_error_stream_for_redaction,
+    bounded_error_stream,
     task_source_completion_capability,
     task_source_error_diagnostics,
     task_source_probe_capability,
@@ -3296,6 +3298,7 @@ INTEGRATION_FAILURE_REASONS = (
     "merge_failed",
     "integration_verification_failed",
     "main_worktree_unavailable",
+    "main_fast_forward_environment_failed",
     "main_fast_forward_failed",
     "main_verification_failed",
     "integration_ancestry_unproven",
@@ -3765,14 +3768,23 @@ class Integrator:
                 branch_head,
             )
             if merge_main.returncode != 0:
+                main_after = self._rev_parse(self.repo, self.main_branch)
+                reason = (
+                    "main_fast_forward_environment_failed"
+                    if self._is_ancestor(main_after, branch_head)
+                    else "main_fast_forward_failed"
+                )
                 return self._record_failure(
-                    "main_fast_forward_failed",
+                    reason,
                     status="blocked",
                     main_before=main_before,
-                    main_after=self._rev_parse(self.repo, self.main_branch),
+                    main_after=main_after,
                     refreshed_head=branch_head,
                     verification=integration_checks,
-                    diagnostics={"git_output": self._bounded_git_output(merge_main)},
+                    diagnostics={
+                        "git_output": self._bounded_git_output(merge_main),
+                        "git_stderr": self._bounded_git_stream(merge_main.stderr),
+                    },
                     recovered=recovered_lock,
                 )
         main_after = self._rev_parse(self.repo, self.main_branch)
@@ -4533,7 +4545,14 @@ class Integrator:
 
     @staticmethod
     def _bounded_git_output(result: subprocess.CompletedProcess[str]) -> str:
-        return (result.stdout + result.stderr).strip()[:2000]
+        return Integrator._bounded_git_stream(result.stdout + result.stderr)
+
+    @staticmethod
+    def _bounded_git_stream(value: str) -> str:
+        bounded = bound_error_stream_for_redaction(value)
+        redacted = redact_evidence_text(bounded)
+        redacted = redact_fencing_token_diagnostic(redacted, {})
+        return bounded_error_stream(redacted)
 
     @staticmethod
     def _git(worktree: Path, *args: str) -> subprocess.CompletedProcess[str]:

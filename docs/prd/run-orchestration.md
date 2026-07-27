@@ -259,6 +259,11 @@ preserved approved candidate branch and commit; a generic conflict reason alone
 is insufficient. The runtime never performs semantic conflict resolution
 itself.
 
+A failed `git merge --ff-only` records bounded, redacted Git stderr. If the
+current mainline remains an ancestor of the candidate after the failed command,
+the reason is `main_fast_forward_environment_failed`; otherwise it is
+`main_fast_forward_failed`, indicating that the refs diverged.
+
 Main verification runs the exact target commit in a temporary standalone clone
 whose refs and worktree registry are independent of the live primary
 repository. The clone reuses local Git objects and links ignored local
