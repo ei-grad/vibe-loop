@@ -85,6 +85,93 @@ For session linkage, provider usage, and compatibility recovery, see
 
 ## Autopilot Commands
 
+### `vibe-loop autopilot status`
+
+Collect a read-only project snapshot without launching workers or changing
+state:
+
+```bash
+vibe-loop autopilot status --repo . --json
+```
+
+- `--repo PATH` selects the repository.
+- `--json` emits the structured `ProjectStatus` payload; without it, the
+  command renders a human-readable summary.
+
+The payload includes queue counts, runnable tasks, active workers, stale locks,
+workspace and git diagnostics, the main-integration lock, supervisor state,
+blockers, project binding, and the last cycle. Status and inconsistency
+semantics are defined by
+[PRD-AUT-001](prd/autopilot.md#prd-aut-001-reusable-status-core).
+
+### `vibe-loop autopilot run`
+
+Run the foreground supervisor:
+
+```bash
+vibe-loop autopilot run --repo . --once
+vibe-loop autopilot run --repo . --interval 60 --max-cycles 10 --jobs 2
+```
+
+- `--repo PATH` selects the repository.
+- `--jobs N` sets child worker concurrency and overrides `[autopilot].jobs`;
+  the default is `1`.
+- `--interval SECONDS` enables persistent cycles. Positive values must be at
+  least `60`; zero or omission selects drain mode.
+- `--once` runs one cycle and exits.
+- `--max-cycles N` caps cycles; `0` means unlimited.
+- `--ask-agent`, `--continue-on-failure`, `--max-slices N`, and
+  `--max-tasks N` are forwarded to each `run-until-done` child.
+- `--min-ready N` requires a positive runnable depth before child launch and
+  overrides `[autopilot].min_ready`; the default is `1`.
+- `--worktree-disposition report-only|reap` overrides the configured policy;
+  the default is `report-only`.
+
+The bare `vibe-loop autopilot` command is a shorthand for `autopilot run`.
+Foreground supervision, scheduling, recovery, and disposition behavior are
+defined by [PRD-AUT-004](prd/autopilot.md#prd-aut-004-child-supervisor),
+[PRD-AUT-006](prd/autopilot.md#prd-aut-006-non-destructive-recovery-boundary),
+and [PRD-AUT-010](prd/autopilot.md#prd-aut-010-native-worktree-disposition-health-step).
+
+### `vibe-loop autopilot start`
+
+Start and verify a detached POSIX supervisor:
+
+```bash
+vibe-loop autopilot start --repo . --interval 60 --jobs 2 --json
+```
+
+`start` accepts the same cycle and child options as `autopilot run`, plus
+`--json`. Structured output contains the supervisor run ID, PID, process-group
+ID, session ID, and log path. The command returns only after verifying the
+process and matching singleton lock. It is not a boot service; the detached
+lifecycle and platform boundary are defined by
+[PRD-AUT-004](prd/autopilot.md#prd-aut-004-child-supervisor).
+
+### `vibe-loop autopilot stop`
+
+Stop a verified detached supervisor, or explicitly recover its stale singleton
+lock:
+
+```bash
+vibe-loop autopilot stop --repo . --timeout 10 --json
+vibe-loop autopilot stop --repo . --recover-stale \
+  --run-id SUPERVISOR-RUN-ID --json
+```
+
+- `--repo PATH` selects the repository.
+- `--timeout SECONDS` bounds the stop; the default is `10`.
+- `--recover-stale` selects the absent-owner recovery path instead of signaling
+  a live supervisor.
+- `--run-id ID` supplies the exact recorded supervisor run required for stale
+  recovery.
+- `--json` emits the structured stop result.
+
+The live stop path is Linux-only and never escalates to `SIGKILL`. Success
+requires both the verified process tree and singleton lock to be absent.
+Identity, drain, fencing, and recovery behavior are defined by
+[PRD-AUT-004](prd/autopilot.md#prd-aut-004-child-supervisor).
+
 ### `vibe-loop autopilot reload`
 
 Request an acknowledged configuration reload from the running detached
@@ -106,6 +193,34 @@ remains queued and the supervisor will still process it at its next cycle
 boundary. Refused, invalid, or unverifiable requests exit nonzero.
 Reload-safe settings and atomic refusal behavior are defined by
 [Supervisor Configuration Lifetime](prd/autopilot.md#prd-aut-002b-supervisor-configuration-lifetime).
+
+### `vibe-loop autopilot projects`
+
+Manage the optional multi-project registry:
+
+```bash
+vibe-loop autopilot projects register --repo . --name my-project \
+  --context LOOPYARD_PROJECT=vibe-loop --json
+vibe-loop autopilot projects list --json
+vibe-loop autopilot projects inspect my-project --json
+vibe-loop autopilot projects remove my-project --json
+vibe-loop autopilot projects status --json
+```
+
+- `register` accepts `--repo PATH`, `--name NAME`, repeatable
+  `--context NAME=VALUE`, and the common registry and JSON options.
+- `list` prints registered repositories.
+- `inspect PROJECT` selects one entry by name or path.
+- `remove PROJECT` removes one entry by name or path.
+- `status` returns an aggregate status entry for every registered repository.
+- `--registry PATH` selects the JSON registry; the default is
+  `~/.vibe-loop/projects.json`.
+- `--json` requests structured output for each subcommand.
+
+Registry selector validation, literal adapter delivery, and redaction are
+defined by [PRD-AUT-007](prd/autopilot.md#prd-aut-007-multi-project-shape);
+binding resolution is defined by
+[PRD-AUT-020](prd/autopilot.md#prd-aut-020-command-backend-project-binding).
 
 ### `vibe-loop runs summary`
 
@@ -151,6 +266,43 @@ vibe-loop attempt-circuit reset TASK-ID --repo . --json
 - `TASK-ID` identifies the task whose breaker is reset.
 - `--repo PATH` selects the repository.
 - `--json` emits structured output.
+
+## Wait Commands
+
+### `vibe-loop wait-helper`
+
+Wait for process completion, a wall-clock boundary, a direct message, or an
+actionable runtime event:
+
+```bash
+vibe-loop wait-helper --pid 12345 --json
+vibe-loop wait-helper --cycle-schedule 1800 --json
+vibe-loop wait-helper --pid 12345 \
+  --runtime-event-journal .vibe-loop/runs.jsonl \
+  --runtime-event-cursor .vibe-loop/wait-runtime.cursor \
+  --runtime-event-project my-project --json
+```
+
+- `--pid PID` is repeatable. The default `--mode any` wakes on the first exit;
+  `--mode all` waits for every PID.
+- `--deadline TIME` accepts an ISO-8601 UTC deadline.
+- `--cycle-schedule [SECONDS]` wakes at the next UTC boundary. When no deadline
+  or schedule is supplied, the default boundary is 1800 seconds.
+- `--interval SECONDS` sets the process poll interval; the default is `5`.
+- `--message-command COMMAND` enables the trusted direct-message adapter.
+  `--session-ref REF` selects its recipient, falling back to
+  `VIBE_LOOP_RUN_ID`; `--message-timeout SECONDS` defaults to `5`.
+- `--runtime-event-command COMMAND` or `--runtime-event-journal PATH` selects
+  one typed runtime-event source. It requires `--runtime-event-cursor PATH` and
+  `--runtime-event-project PROJECT`; optional `--runtime-event-run-id` and
+  `--runtime-event-task-id` narrow the scope. `--runtime-event-timeout SECONDS`
+  defaults to `5`.
+- `--json` emits the structured result. `wake_reason` is `pid`,
+  `all_complete`, `deadline`, `message`, `runtime_event`, or `adapter_error`.
+
+The trusted-adapter schemas, redaction limits, durable cursor, and wake
+precedence are defined by
+[PRD-AUT-015](prd/autopilot.md#prd-aut-015-direct-user-message-wake).
 
 ## Worker Lifecycle Commands
 

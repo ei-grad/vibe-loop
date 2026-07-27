@@ -5,6 +5,24 @@ skills or their eval harness. The GitHub release workflow builds and publishes
 artifacts; this checklist records the skill-readiness evidence that should exist
 before the workflow is used for TestPyPI or PyPI.
 
+## Versioning And Repository Hooks
+
+Use `make bump-patch`, `make bump-minor`, or `make bump-major` to update the
+project and lockfile versions through `uv`. `make tag` creates `v<version>` from
+`uv version --short`; pass `VERSION=...` to validate and tag an explicit
+version. Tagging requires a clean worktree. The pre-push hook rejects a pushed
+`v*` tag unless the tag, `pyproject.toml`, and the `vibe-loop` entry in
+`uv.lock` have the same version.
+
+`make install-hooks` installs the repository's pre-commit, pre-push,
+prepare-commit-msg, and commit-msg hooks. The pre-commit hook runs the
+documentation gates for Markdown changes plus `ruff check` and
+`ruff format --check`. For commits made by a vibe-loop worker, the commit-msg
+hook adds `Plan-Item`, `Run-Id`, and `Agent-Kind` trailers when available; the
+prepare-commit-msg hook preserves that provenance path when `--no-verify`
+bypasses commit-msg. Installation refuses to overwrite unmanaged hooks except
+for a compatible existing provenance hook.
+
 ## Bundled Skill Gate
 
 Run the local release gate from a clean repository state:

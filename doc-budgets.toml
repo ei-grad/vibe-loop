@@ -4,14 +4,14 @@ estimate = "bytes/4"
 [[budget]]
 paths = ["README.md"]
 target = 2000
-baseline = 11456
+baseline = 2000
 deadline = "2026-10-31"
 
 [[budget]]
 paths = ["*.md"]
 kind = "aggregate"
 target = 8000
-baseline = 15518
+baseline = 8000
 deadline = "2026-10-31"
 
 [structure]
@@ -19,4 +19,3 @@ warn = 4000
 hard = 12000
 
 [structure.baselines]
-"README.md" = 28021

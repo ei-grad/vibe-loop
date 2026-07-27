@@ -42,6 +42,25 @@ component for every state mutation and external process launch.
 Related implementation IDs: `ORC-03` (`orc-lifecycle-state-machine`),
 `ORC-09` (`orc-task-provenance-completion`, task-source settlement).
 
+### Task Locks
+
+`PRD-WRK-002` owns task-lock contents and worker/run inspection.
+`PRD-WRK-006` and `PRD-WRK-008` own workspace claims and their read-only
+diagnostics. This PRD consumes those mechanisms as lifecycle fences; it does
+not define a second lock format.
+
+### `main-integration.lock`
+
+`PRD-WRK-007` owns the advisory integration-lock contract. `PRD-ORC-007`
+defines the runtime-owned integration work performed while that lock is held.
+
+### `runs.jsonl`
+
+`PRD-WRK-009` owns the append-only event schema, redaction boundary, diagnostic
+projection, and project-history handoff. `PRD-CLI-006` owns placement under the
+configured untracked `state_dir`. This PRD requires journal-ahead lifecycle
+transitions but does not make the journal authoritative for task status.
+
 ## PRD-ORC-002 Resolved Run Contract
 
 Each supervised run must resolve a versioned run contract after task-lock
