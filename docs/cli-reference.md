@@ -101,10 +101,13 @@ vibe-loop autopilot status --repo . --json
 The payload includes queue counts, runnable tasks, active workers, stale locks,
 workspace and git diagnostics, the main-integration lock, supervisor state,
 blockers, project binding, the last cycle, and `disk_headroom` with its live
-filesystem reading, thresholds, verdict, and blocker evidence. Human-readable
-output prints the same disk-headroom verdict, mount, free bytes, and warning and
-hard-stop thresholds immediately after the repository line. Status and
-inconsistency semantics are defined by
+filesystem reading, thresholds, verdict, and blocker evidence. It also includes
+the latest `worktree_disposition` journal record, including each worktree's
+`keep_guardrails` and outcome. Human-readable output prints the same
+disk-headroom verdict, mount, free bytes, and warning and hard-stop thresholds
+immediately after the repository line, followed later by the latest
+per-worktree disposition evidence and reason. Status and inconsistency semantics
+are defined by
 [PRD-AUT-001](prd/autopilot.md#prd-aut-001-reusable-status-core).
 
 ### `vibe-loop autopilot run`

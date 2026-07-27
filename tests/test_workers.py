@@ -3252,6 +3252,7 @@ def make_disposition_evidence(
     ownership_error: str = "",
     terminal_status: str = "completed",
     terminal_commit: str = "deadbee",
+    terminal_commit_contained: bool | None = None,
 ) -> WorktreeDispositionEvidence:
     return WorktreeDispositionEvidence(
         path=path,
@@ -3272,6 +3273,11 @@ def make_disposition_evidence(
         ownership_error=ownership_error,
         terminal_status=terminal_status,
         terminal_commit=terminal_commit,
+        terminal_commit_contained=(
+            terminal_commit == head_commit
+            if terminal_commit_contained is None
+            else terminal_commit_contained
+        ),
     )
 
 
@@ -3403,6 +3409,87 @@ class WorktreeDispositionEvidenceTests(unittest.TestCase):
         self.assertTrue(orphan_evidence.remote_main_contained)
         self.assertEqual(orphan_evidence.terminal_status, "completed")
         self.assertTrue(orphan_evidence.reapable)
+
+    def test_reaps_declared_candidate_behind_integration_merge(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            init_git_repo(repo)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+
+            worktree = base / "integrated"
+            branch = "worker/INTEGRATED"
+            git(repo, "worktree", "add", "-b", branch, str(worktree), "main")
+            (worktree / "feature.txt").write_text("done\n", encoding="utf-8")
+            git(worktree, "add", "feature.txt")
+            git(worktree, "commit", "-m", "candidate")
+            candidate = git(worktree, "rev-parse", "HEAD").stdout.strip()
+
+            (repo / "main.txt").write_text("advanced\n", encoding="utf-8")
+            git(repo, "add", "main.txt")
+            git(repo, "commit", "-m", "advance main")
+            git(worktree, "merge", "main", "-m", "integrate main")
+            integrated_head = git(worktree, "rev-parse", "HEAD").stdout.strip()
+            git(repo, "merge", "--ff-only", branch)
+            git(repo, "update-ref", "refs/remotes/origin/main", "main")
+
+            run_store.append_record(
+                WorkspaceClaim(
+                    task_id="INTEGRATED",
+                    run_id="run-integrated",
+                    branch=branch,
+                    worktree=worktree,
+                    base_commit=candidate,
+                    head_commit=candidate,
+                    current_branch=branch,
+                    dirty=False,
+                    dirty_summary=(),
+                ).to_json()
+            )
+            run_store.append_report(
+                WorkerReport(
+                    task_id="INTEGRATED",
+                    run_id="run-integrated",
+                    status="completed",
+                    commit=candidate,
+                )
+            )
+
+            evidence = collect_worktree_disposition_evidence(
+                manager,
+                run_store,
+                repo=repo,
+                main_branch="main",
+                current_host="test-host",
+                process_exists=lambda _pid: False,
+            )
+
+        item = {entry.path: entry for entry in evidence}[worktree.resolve()]
+        self.assertNotEqual(candidate, integrated_head)
+        self.assertEqual(item.head_commit, integrated_head)
+        self.assertEqual(item.terminal_commit, candidate)
+        self.assertTrue(item.terminal_commit_contained)
+        self.assertNotIn(KEEP_TERMINAL_COMMIT_MISMATCH, item.keep_guardrails)
+        self.assertTrue(item.reapable)
+        effects = FakeWorktreeSideEffects()
+        outcomes = execute_worktree_disposition(
+            [item],
+            [
+                WorktreeDispositionDecision(
+                    worktree=worktree,
+                    action="reap",
+                    reason="completed candidate is contained by the integrated head",
+                )
+            ],
+            remove_worktree=effects.remove_worktree,
+            delete_branch=effects.delete_branch,
+        )
+        self.assertEqual(outcomes[0].applied, "reaped")
+        self.assertEqual(effects.removed, [worktree.resolve()])
+        self.assertEqual(effects.deleted, [branch])
 
     def test_evidence_preserves_crash_windows_before_completed_remote_success(
         self,

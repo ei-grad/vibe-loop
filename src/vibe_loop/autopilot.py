@@ -418,6 +418,7 @@ class ProjectStatus:
     agent: dict[str, object] = dataclasses.field(default_factory=dict)
     disk_headroom: dict[str, object] = dataclasses.field(default_factory=dict)
     worktree_disposition_policy: str = "report-only"
+    worktree_disposition: dict[str, object] = dataclasses.field(default_factory=dict)
     workspace_diagnostics: tuple[dict[str, object], ...] = ()
     supervisor: SupervisorStatus = dataclasses.field(default_factory=SupervisorStatus)
     blockers: tuple[str, ...] = ()
@@ -457,6 +458,7 @@ class ProjectStatus:
             "agent": self.agent,
             "disk_headroom": self.disk_headroom,
             "worktree_disposition_policy": self.worktree_disposition_policy,
+            "worktree_disposition": self.worktree_disposition,
             "workspace_diagnostics": [
                 dict(diagnostic) for diagnostic in self.workspace_diagnostics
             ],
@@ -577,6 +579,7 @@ def collect_project_status(
             agent=config.agent.to_json(),
             disk_headroom=disk_headroom,
             worktree_disposition_policy=config.autopilot.worktree_disposition,
+            worktree_disposition=latest_worktree_disposition(run_store),
             # Supervisor liveness is only observable through the lock adapter,
             # which is exactly what must not be queried here. Report it as
             # unknown rather than letting the "idle" default read as a checked
@@ -754,6 +757,7 @@ def collect_project_status(
         agent=agent,
         disk_headroom=disk_headroom,
         worktree_disposition_policy=config.autopilot.worktree_disposition,
+        worktree_disposition=latest_worktree_disposition(run_store),
         workspace_diagnostics=workspace_diagnostics,
         supervisor=supervisor,
         blockers=tuple(blockers),
@@ -1701,6 +1705,13 @@ def latest_cycle_summary(run_store: RunStore) -> CycleSummary | None:
             record=record,
         )
     return None
+
+
+def latest_worktree_disposition(run_store: RunStore) -> dict[str, object]:
+    for record in reversed(run_store.read_records()):
+        if record.get("record_type") == AUTOPILOT_WORKTREE_REAP_RECORD_TYPE:
+            return dict(record)
+    return {}
 
 
 def recent_cycle_summaries(

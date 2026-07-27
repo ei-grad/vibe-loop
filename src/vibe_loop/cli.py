@@ -1893,6 +1893,44 @@ def render_autopilot_status(status: ProjectStatus) -> str:
                 )
             )
     lines.append(f"worktree disposition: {status.worktree_disposition_policy}")
+    disposition = status.worktree_disposition
+    if disposition:
+        lines.append(
+            "latest worktree disposition: "
+            f"cycle={disposition.get('cycle_id') or 'unknown'} "
+            f"status={disposition.get('status') or 'unknown'} "
+            f"candidates={disposition.get('candidates', 0)} "
+            f"reaped={disposition.get('reaped', 0)} "
+            f"errors={disposition.get('errors', 0)}"
+        )
+        raw_outcomes = disposition.get("outcomes")
+        outcomes = raw_outcomes if isinstance(raw_outcomes, list) else []
+        outcome_by_path = {
+            str(outcome.get("worktree") or ""): outcome
+            for outcome in outcomes
+            if isinstance(outcome, Mapping)
+        }
+        raw_evidence = disposition.get("evidence")
+        evidence = raw_evidence if isinstance(raw_evidence, list) else []
+        for item in evidence:
+            if not isinstance(item, Mapping):
+                continue
+            path = str(item.get("path") or "unknown")
+            raw_guardrails = item.get("keep_guardrails")
+            guardrails = (
+                ", ".join(str(reason) for reason in raw_guardrails)
+                if isinstance(raw_guardrails, list) and raw_guardrails
+                else "none"
+            )
+            outcome = outcome_by_path.get(path, {})
+            applied = str(outcome.get("applied") or "unrecorded")
+            reason = str(outcome.get("reason") or "")
+            lines.append(
+                f"  - {path}: "
+                f"reapable={str(bool(item.get('reapable'))).lower()} "
+                f"guardrails={guardrails} outcome={applied}"
+                + (f" reason={reason}" if reason else "")
+            )
     if supervisor.log is not None:
         lines.append(f"log: {supervisor.log}")
     project_blockers = tuple(

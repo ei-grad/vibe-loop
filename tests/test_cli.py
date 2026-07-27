@@ -40,6 +40,7 @@ from vibe_loop.processes import read_process_node
 from vibe_loop.runs import (
     AUTOPILOT_CHILD_STARTED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+    AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
     WORKER_PROCESS_STARTED_RECORD_TYPE,
     RunLifecycleEvent,
     RunResult,
@@ -9390,6 +9391,79 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertEqual(payload["queue"]["runnable"], 3)
         self.assertEqual(payload["supervisor"]["state"], "idle")
         self.assertIsNone(payload["last_cycle"])
+
+    def test_status_exposes_latest_worktree_disposition_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            worktree = repo.parent / "completed-worktree"
+            run_store.append_record(
+                {
+                    "schema_version": 1,
+                    "record_type": AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
+                    "occurred_at": "2026-07-27T16:00:00+00:00",
+                    "repo": str(repo),
+                    "cycle_id": "cycle-1",
+                    "policy": "reap",
+                    "status": "ok",
+                    "candidates": 1,
+                    "reaped": 0,
+                    "kept": 1,
+                    "refused": 0,
+                    "errors": 0,
+                    "agent_invoked": True,
+                    "agent_error": "",
+                    "evidence": [
+                        {
+                            "path": str(worktree),
+                            "branch": "worker/completed",
+                            "reapable": True,
+                            "keep_guardrails": [],
+                        }
+                    ],
+                    "outcomes": [
+                        {
+                            "worktree": str(worktree),
+                            "branch": "worker/completed",
+                            "requested": "keep",
+                            "applied": "kept",
+                            "reason": "operator retained candidate",
+                            "guardrails": [],
+                            "actions": [],
+                        }
+                    ],
+                }
+            )
+
+            text_stdout = StringIO()
+            with redirect_stdout(text_stdout), redirect_stderr(StringIO()):
+                text_exit = main(["autopilot", "status", "--repo", str(repo)])
+            json_stdout = StringIO()
+            with redirect_stdout(json_stdout), redirect_stderr(StringIO()):
+                json_exit = main(["autopilot", "status", "--repo", str(repo), "--json"])
+
+        self.assertEqual(text_exit, 0)
+        self.assertEqual(json_exit, 0)
+        output = text_stdout.getvalue()
+        self.assertIn(
+            "latest worktree disposition: cycle=cycle-1 status=ok "
+            "candidates=1 reaped=0 errors=0",
+            output,
+        )
+        self.assertIn(
+            f"  - {worktree}: reapable=true guardrails=none "
+            "outcome=kept reason=operator retained candidate",
+            output,
+        )
+        payload = json.loads(json_stdout.getvalue())
+        disposition = payload["worktree_disposition"]
+        self.assertEqual(disposition["cycle_id"], "cycle-1")
+        self.assertEqual(disposition["evidence"][0]["keep_guardrails"], [])
+        self.assertEqual(
+            disposition["outcomes"][0]["reason"],
+            "operator retained candidate",
+        )
 
     def test_status_does_not_start_worker_or_record_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
