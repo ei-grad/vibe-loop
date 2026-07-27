@@ -37,6 +37,7 @@ from vibe_loop.orchestration import (
     CandidateCollectionError,
     CandidateCollector,
     CandidateReanchorRetryExhausted,
+    CandidateScopePolicy,
     GateExecutionError,
     GateRemediationExhausted,
     GateResult,
@@ -1538,6 +1539,19 @@ class RuntimeGateTests(unittest.TestCase):
             task_id="TASK-01",
         )
 
+    def collector_with_scope(
+        self, scope_policy: CandidateScopePolicy
+    ) -> CandidateCollector:
+        return CandidateCollector(
+            worktree=self.repo,
+            branch="worker/task-01",
+            base_main=self.base,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            scope_policy=scope_policy,
+        )
+
     def test_candidate_declaration_and_derivation_are_validated_and_recorded(
         self,
     ) -> None:
@@ -1563,6 +1577,78 @@ class RuntimeGateTests(unittest.TestCase):
             CandidateCollectionError, "does not match the claimed workspace"
         ):
             self.collector.collect_declared(head_commit=self.base)
+
+    def test_candidate_scope_accepts_changed_path_within_declared_domain(self) -> None:
+        collector = self.collector_with_scope(
+            CandidateScopePolicy(
+                known=True,
+                paths=("tracked.txt",),
+            )
+        )
+
+        candidate = collector.collect_declared(head_commit=self.head)
+
+        self.assertEqual(candidate.changed_paths, ("tracked.txt",))
+
+    def test_candidate_scope_names_drift_and_reports_comparison(self) -> None:
+        collector = self.collector_with_scope(
+            CandidateScopePolicy(
+                known=True,
+                resources=("resource:database",),
+                paths=("src",),
+            )
+        )
+
+        with self.assertRaises(CandidateCollectionError) as raised:
+            collector.collect_declared(head_commit=self.head)
+
+        self.assertEqual(raised.exception.code, "candidate_scope_drift")
+        self.assertEqual(
+            raised.exception.details,
+            {
+                "declared_domains": {
+                    "resources": ["resource:database"],
+                    "paths": ["src"],
+                },
+                "changed_paths": ["tracked.txt"],
+                "unmatched_paths": ["tracked.txt"],
+            },
+        )
+
+    def test_candidate_scope_without_domains_is_explicitly_unenforceable(
+        self,
+    ) -> None:
+        collector = self.collector_with_scope(
+            CandidateScopePolicy(known=False),
+        )
+
+        with self.assertRaises(CandidateCollectionError) as raised:
+            collector.collect_derived()
+
+        self.assertEqual(raised.exception.code, "candidate_scope_unenforceable")
+        self.assertEqual(raised.exception.details["reason"], "conflict_domains_unknown")
+        self.assertEqual(raised.exception.details["changed_paths"], ["tracked.txt"])
+        self.assertEqual(raised.exception.details["unmatched_paths"], ["tracked.txt"])
+
+    def test_candidate_scope_with_resource_domains_only_is_unenforceable(
+        self,
+    ) -> None:
+        collector = self.collector_with_scope(
+            CandidateScopePolicy(
+                known=True,
+                resources=("resource:database",),
+            )
+        )
+
+        with self.assertRaises(CandidateCollectionError) as raised:
+            collector.collect_derived()
+
+        self.assertEqual(raised.exception.code, "candidate_scope_unenforceable")
+        self.assertEqual(raised.exception.details["reason"], "non_path_domains_only")
+        self.assertEqual(
+            raised.exception.details["declared_domains"],
+            {"resources": ["resource:database"], "paths": []},
+        )
 
     def test_candidate_declaration_resolves_revisions_before_comparing(self) -> None:
         for revision in ("HEAD", self.head[:8], self.head):

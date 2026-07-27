@@ -84,6 +84,7 @@ from vibe_loop.orchestration import (
     CandidateCollector,
     CandidateRecord,
     CandidateReanchorRetryExhausted,
+    CandidateScopePolicy,
     GateExecutionError,
     GateRunner,
     GateRunSummary,
@@ -3092,6 +3093,11 @@ class VibeRunner:
                         run_store=self.run_store,
                         run_id=run_id,
                         task_id=task.task_id,
+                        scope_policy=CandidateScopePolicy(
+                            known=task.conflict_domains_known,
+                            resources=task.resources,
+                            paths=task.paths,
+                        ),
                     )
                     candidate = collector.latest_recorded()
                     if candidate is None:
@@ -3462,8 +3468,30 @@ class VibeRunner:
                         detail=str(exc),
                     )
                     message = str(exc)
+                except CandidateCollectionError as exc:
+                    scope_finding = exc.code in {
+                        "candidate_scope_drift",
+                        "candidate_scope_unenforceable",
+                    }
+                    detail = (
+                        json.dumps(
+                            {
+                                "finding": exc.code,
+                                "message": str(exc),
+                                **exc.details,
+                            },
+                            sort_keys=True,
+                        )
+                        if scope_finding
+                        else str(exc)
+                    )
+                    classification = ClassificationResult(
+                        "failed",
+                        exc.code if scope_finding else "runtime_stage_failed",
+                        detail=detail,
+                    )
+                    message = detail
                 except (
-                    CandidateCollectionError,
                     GateExecutionError,
                     ReviewExecutionError,
                     RuntimeError,
@@ -4030,6 +4058,11 @@ class VibeRunner:
             run_store=self.run_store,
             run_id=run_id,
             task_id=task.task_id,
+            scope_policy=CandidateScopePolicy(
+                known=task.conflict_domains_known,
+                resources=task.resources,
+                paths=task.paths,
+            ),
         )
         if stage_machine.stage is RunStage.IMPLEMENTING:
             stage_machine.transition(

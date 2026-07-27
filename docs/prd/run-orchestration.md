@@ -142,6 +142,14 @@ recorded as typed evidence referencing the gate's configuration key, exit
 class, duration, and log. Gate failure routes to bounded remediation, not to
 silent completion; gate evidence is part of the review request.
 
+Before recording either a worker-declared or runtime-derived candidate, the
+runtime compares every changed path with the task's declared path conflict
+domains. A candidate with unmatched paths is rejected with a named scope-drift
+finding that records the declared resource and path domains, all changed paths,
+and the unmatched paths. Unknown or empty conflict domains, including a domain
+set containing only non-path resources, reject the declaration with an explicit
+scope-unenforceable signal carrying the same comparison inputs.
+
 The candidate's base is the commit its workspace was provisioned from, which
 for an adopted workspace is legitimately older than `main` at run start. When
 that base is behind the integration branch, the runtime may re-anchor the
@@ -156,7 +164,9 @@ gate evidence against a settled base at all.
 
 Acceptance must cover gate execution and evidence records, candidate
 declaration and derivation, remediation budget enforcement on gate failure,
-and refusal to enter review without a recorded candidate and passing gates.
+refusal to enter review without a recorded candidate and passing gates,
+in-scope and drifted candidate paths, missing path domains, and resource-only
+domains.
 
 Related implementation IDs: `ORC-05` (`orc-runtime-gates`).
 

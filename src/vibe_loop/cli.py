@@ -98,6 +98,7 @@ from vibe_loop.locks import integration_lock_waitable
 from vibe_loop.orchestration import (
     CandidateCollectionError,
     CandidateCollector,
+    CandidateScopePolicy,
     config_contract_blockers,
 )
 from vibe_loop.runner import VibeRunner
@@ -2497,6 +2498,11 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
                 run_store=run_store,
                 run_id=run_id,
                 task_id=task_id,
+                scope_policy=CandidateScopePolicy(
+                    known=active.conflict_domains_known,
+                    resources=active.resources,
+                    paths=active.paths,
+                ),
             )
             recorded = collector.collect_declared(
                 head_commit=args.head,

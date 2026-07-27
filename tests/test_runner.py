@@ -50,6 +50,7 @@ from vibe_loop.locks import (
 )
 from vibe_loop.processes import ProcessNode, process_birth_identity, read_process_node
 from vibe_loop.orchestration import (
+    CandidateCollectionError,
     CandidateRecord,
     CandidateReanchorRetryExhausted,
     GateResult,
@@ -10248,6 +10249,48 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
         )
         self.assertEqual(source.status, "on-hold")
 
+    def test_candidate_scope_drift_preserves_named_finding_and_comparison(
+        self,
+    ) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        details = {
+            "declared_domains": {
+                "resources": ["resource:database"],
+                "paths": ["src"],
+            },
+            "changed_paths": ["docs/drift.md"],
+            "unmatched_paths": ["docs/drift.md"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {})
+            self._enable_runtime_owned_task_source(runner, task)
+
+            with patch.object(
+                runner,
+                "execute_runtime_owned_lifecycle",
+                side_effect=CandidateCollectionError(
+                    "candidate_scope_drift",
+                    "candidate changed paths fall outside declared domains",
+                    details=details,
+                ),
+            ):
+                result = self._run_task(
+                    runner,
+                    task,
+                    self._reporting_worker(runner, "completed"),
+                )
+
+        self.assertEqual(result.classification, "failed")
+        self.assertEqual(result.classification_source, "candidate_scope_drift")
+        self.assertEqual(
+            json.loads(result.message),
+            {
+                "finding": "candidate_scope_drift",
+                "message": "candidate changed paths fall outside declared domains",
+                **details,
+            },
+        )
+
     def test_adopted_workspace_older_than_main_reanchors_before_gates(self) -> None:
         """An adopted workspace base is older than `main` by design.
 
@@ -10269,7 +10312,14 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 text=True,
             ).stdout.strip()
 
-        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        task = Task(
+            task_id="T-1",
+            title="Task",
+            status="ready",
+            agent="worker",
+            paths=("candidate.txt",),
+            conflict_domains_known=True,
+        )
         observed_candidates: list[CandidateRecord] = []
         with tempfile.TemporaryDirectory() as directory:
             runner, _, _ = self._build_runner(directory, [task], {})
@@ -10520,7 +10570,14 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
     def test_runtime_owned_run_executes_candidate_gates_review_and_integration(
         self,
     ) -> None:
-        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        task = Task(
+            task_id="T-1",
+            title="Task",
+            status="ready",
+            agent="worker",
+            paths=("candidate.txt",),
+            conflict_domains_known=True,
+        )
         with tempfile.TemporaryDirectory() as directory:
             runner, _, _ = self._build_runner(directory, [task], {})
             reviewer = runner.config.repo / "reviewer.py"
@@ -10693,7 +10750,14 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
     def test_runtime_owned_conflict_returns_to_implementer_in_same_run(
         self,
     ) -> None:
-        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        task = Task(
+            task_id="T-1",
+            title="Task",
+            status="ready",
+            agent="worker",
+            paths=("README.md",),
+            conflict_domains_known=True,
+        )
         with tempfile.TemporaryDirectory() as directory:
             runner, _, _ = self._build_runner(directory, [task], {})
             reviewer = runner.config.repo / "reviewer.py"

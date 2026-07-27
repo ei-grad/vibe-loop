@@ -5571,6 +5571,8 @@ class CliTests(unittest.TestCase):
                         "host": socket.gethostname(),
                         "started_at": "2026-07-21T00:00:00+00:00",
                         "base_main": base,
+                        "paths": ["candidate.txt"],
+                        "conflict_domains_known": True,
                         "fencing_token": fencing_token,
                     }
                 ),

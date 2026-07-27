@@ -638,6 +638,66 @@ class CandidateRecord:
         return candidate
 
 
+@dataclasses.dataclass(frozen=True)
+class CandidateScopePolicy:
+    known: bool
+    resources: tuple[str, ...] = ()
+    paths: tuple[str, ...] = ()
+
+    def validate(self, candidate: CandidateRecord) -> None:
+        details: dict[str, object] = {
+            "declared_domains": {
+                "resources": list(self.resources),
+                "paths": list(self.paths),
+            },
+            "changed_paths": list(candidate.changed_paths),
+            "unmatched_paths": list(candidate.changed_paths),
+        }
+        if not self.known:
+            details["reason"] = "conflict_domains_unknown"
+            raise CandidateCollectionError(
+                "candidate_scope_unenforceable",
+                "candidate scope is unenforceable because conflict domains "
+                "were not declared",
+                details=details,
+            )
+        if not self.paths:
+            details["reason"] = (
+                "non_path_domains_only" if self.resources else "no_declared_domains"
+            )
+            raise CandidateCollectionError(
+                "candidate_scope_unenforceable",
+                "candidate scope is unenforceable because no path domains "
+                "were declared",
+                details=details,
+            )
+        unmatched_paths = tuple(
+            changed_path
+            for changed_path in candidate.changed_paths
+            if not any(
+                path_domain_contains_changed_path(domain, changed_path)
+                for domain in self.paths
+            )
+        )
+        if unmatched_paths:
+            details["unmatched_paths"] = list(unmatched_paths)
+            raise CandidateCollectionError(
+                "candidate_scope_drift",
+                "candidate changed paths fall outside the task's declared path domains",
+                details=details,
+            )
+
+
+def path_domain_contains_changed_path(domain: str, changed_path: str) -> bool:
+    normalized_domain = domain.removeprefix("./").rstrip("/")
+    normalized_path = changed_path.removeprefix("./").rstrip("/")
+    return (
+        normalized_domain in {"", "."}
+        or normalized_path == normalized_domain
+        or normalized_path.startswith(f"{normalized_domain}/")
+    )
+
+
 class CandidateCollector:
     def __init__(
         self,
@@ -648,6 +708,7 @@ class CandidateCollector:
         run_store: object,
         run_id: str,
         task_id: str,
+        scope_policy: CandidateScopePolicy | None = None,
     ) -> None:
         self.worktree = worktree.resolve()
         self.branch = branch
@@ -655,9 +716,11 @@ class CandidateCollector:
         self.run_store = run_store
         self.run_id = run_id
         self.task_id = task_id
+        self.scope_policy = scope_policy
 
     def collect_derived(self) -> CandidateRecord:
         candidate = self.snapshot(source="derived")
+        self.validate_scope(candidate)
         self._record(candidate)
         return candidate
 
@@ -700,8 +763,13 @@ class CandidateCollector:
                 "candidate declaration does not match the claimed workspace",
                 details={"mismatched_fields": sorted(mismatches)},
             )
+        self.validate_scope(candidate)
         self._record(candidate)
         return candidate
+
+    def validate_scope(self, candidate: CandidateRecord) -> None:
+        if self.scope_policy is not None:
+            self.scope_policy.validate(candidate)
 
     def _resolve_declared_revision(self, field: str, revision: str) -> str:
         """Resolve a worker-declared revision inside the claimed workspace.
@@ -851,6 +919,7 @@ class CandidateCollector:
                 "candidate_changed",
                 "candidate no longer matches the claimed workspace",
             )
+        self.validate_scope(candidate)
         if not self.is_recorded(candidate):
             self._record(candidate)
 
@@ -860,6 +929,7 @@ class CandidateCollector:
                 "candidate_changed",
                 "candidate no longer matches the claimed workspace",
             )
+        self.validate_scope(candidate)
         self._record(candidate)
 
     def latest_recorded(self) -> CandidateRecord | None:
