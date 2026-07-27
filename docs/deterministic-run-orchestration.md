@@ -435,14 +435,32 @@ Malformed output gets one bounded deterministic re-ask that names the specific
 parse violation, then the run parks as blocked rather than failing generically.
 Candidate and passed gate evidence retention is not new here: the worktree-keep
 guardrail already keeps them for any unsuccessful terminal status. What this
-path adds is the classification and the diagnosability — each malformed attempt
-records a bounded, secret-redacted output tail and a distinct
-`output_classification = "malformed"`; a schema-valid reviewer error uses
-`output_classification = "parsed"` instead. Reviewer stdout is capped per line
-and windowed to a bounded tail *before* redaction, because the evidence
-redactor is superlinear in line length and an unbounded prose answer would
-otherwise stall the run while holding the task lock; redaction still runs
-before the final truncation so no unredacted fragment is stored.
+path adds is the classification and the diagnosability. Every review verdict
+records exactly one `output_classification`:
+
+- `parsed`: the runtime parsed a schema- and contract-valid review result,
+  including a reviewer-reported error;
+- `malformed`: the reviewer output was unusable under the review protocol,
+  whether because JSON could not be read, the schema was invalid, or a readable
+  result violated a verdict, finding-ledger, session, continuation, or retry
+  contract;
+- `unavailable`: no review result was available to parse, including launch
+  errors, non-zero reviewer exits, provider walls, and nested delegation
+  violations.
+
+Each malformed attempt records a bounded, secret-redacted output tail. Reviewer
+stdout is capped per line and windowed to a bounded tail *before* redaction,
+because the evidence redactor is superlinear in line length and an unbounded
+prose answer would otherwise stall the run while holding the task lock.
+Many maximum-length lines can still make the fixed-size redaction window take
+several seconds, but the cost is bounded by the window rather than total output
+size. Redaction still runs before the final truncation so no unredacted fragment
+is stored.
+
+`blocked:review_output_malformed` does not consume the cross-run implementation
+attempt circuit breaker. The breaker measures evidence that implementation is
+stuck; reviewer syntax, schema, and protocol failures are review-route failures,
+not implementation attempts.
 
 Delivery mechanism: reviewer commands are configured templates like agent
 commands today; the runtime passes the request via file/stdin and requires

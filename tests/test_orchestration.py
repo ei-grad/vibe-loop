@@ -5483,6 +5483,7 @@ class ReviewRouterTests(unittest.TestCase):
         with self.assertRaises(ReviewBudgetExhausted):
             router.review(remediated_gates)
         self.assertEqual(machine.stage, RunStage.CLASSIFICATION)
+        self.assertEqual(transitions[-1]["failure"], "blocked")
         self.assertIn("review_budget_exhausted", transitions[-1]["reason"])
         self.assertEqual(
             [record["record_type"] for record in self.store.read_records()],

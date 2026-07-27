@@ -2140,7 +2140,12 @@ class ReviewRouter:
             raise
         self._append_event(
             "review_verdict",
-            self._result_payload(result, request, route),
+            self._result_payload(
+                result,
+                request,
+                route,
+                output_classification="parsed",
+            ),
         )
         if result.verdict == "error":
             self._fail_stage_for_result(result.retry_classification)
@@ -2394,7 +2399,9 @@ class ReviewRouter:
         # break that, since the run child's env is copied from ``os.environ``.)
         # And ReviewRequest/CandidateRecord/GateResult payloads carry no token
         # field, so the prompt cannot hand it over either. Hence no exact-value
-        # redaction is threaded here.
+        # redaction is threaded here. ``redact_evidence_text`` currently catches
+        # every supported token label first; the dedicated scrubber is retained
+        # as defense in depth if either redactor's label rules later diverge.
         redacted = redact_fencing_token_diagnostic(redacted, {})
         truncated = (
             bounded != output or len(redacted) > MALFORMED_REVIEW_OUTPUT_MAX_CHARS
@@ -2623,7 +2630,7 @@ class ReviewRouter:
             exhausted_limit = limit if isinstance(limit, int) else 0
             if self.stage_machine is not None:
                 self.stage_machine.fail(
-                    StageFailure.STAGE_FAILED,
+                    StageFailure.BLOCKED,
                     reason=(
                         f"review_budget_exhausted:{request.family}:"
                         f"limit={exhausted_limit}"
@@ -2861,10 +2868,14 @@ class ReviewRouter:
             reviewer_provenance=self._reviewer_provenance(request, context),
             prior_reviewer_session_id=context.prior_session_id,
         )
-        payload = self._result_payload(result, request, route)
+        payload = self._result_payload(
+            result,
+            request,
+            route,
+            output_classification=output_classification,
+        )
         payload["verdict"] = "error"
         payload.pop("control_verdict", None)
-        payload["output_classification"] = output_classification
         if nested_usage:
             payload["nested_usage"] = dict(nested_usage)
         if policy_violation:
@@ -2883,6 +2894,8 @@ class ReviewRouter:
         result: ReviewResult,
         request: ReviewRequest,
         route: Mapping[str, object],
+        *,
+        output_classification: str,
     ) -> dict[str, object]:
         control_verdict = {
             "approve": "clean",
@@ -2904,7 +2917,7 @@ class ReviewRouter:
             "verdict": control_verdict,
             "engine_verdict": result.verdict,
             "control_verdict": control_verdict,
-            "output_classification": "parsed",
+            "output_classification": output_classification,
             "findings_count": len(result.findings),
             "severity_counts": severity_counts,
             "session_id": result.session_id,

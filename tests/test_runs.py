@@ -43,12 +43,35 @@ from vibe_loop.runs import (
     RunResult,
     RunStore,
     WorkerReport,
+    attempt_circuit_blocker_class,
     derive_run_lifecycle,
     record_status,
 )
 
 
 class RunStoreTests(unittest.TestCase):
+    def test_malformed_review_output_does_not_count_as_implementation_attempt(
+        self,
+    ) -> None:
+        self.assertEqual(
+            attempt_circuit_blocker_class(
+                {
+                    "classification": "blocked",
+                    "classification_source": "review_output_malformed",
+                }
+            ),
+            "",
+        )
+        self.assertEqual(
+            attempt_circuit_blocker_class(
+                {
+                    "classification": "blocked",
+                    "classification_source": "reviewer_verdict",
+                }
+            ),
+            "blocked:reviewer_verdict",
+        )
+
     def test_integration_provenance_status_exposes_outcome(self) -> None:
         record = RunLifecycleEvent.integration_provenance(
             run_id="run-1",
