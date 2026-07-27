@@ -7724,6 +7724,9 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             )
             self.assertTrue((first.worktree / "main-change.txt").exists())
             self.assertEqual(adopted.refreshed_from, stale_base)
+            self.assertEqual(adopted.refresh_base_before, stale_base)
+            self.assertEqual(adopted.refresh_base_after, current_base)
+            self.assertEqual(adopted.refresh_method, "merge")
             self.assertEqual(adopted.head_commit, current_base)
             self.assertEqual(adopted.base_commit, current_base)
             self.assertEqual(adopted.mode, "adopted")
@@ -7734,6 +7737,9 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                 if record.get("record_type") == "workspace_provisioned"
             ]
             self.assertEqual(provisioned[-1]["refreshed_from"], stale_base)
+            self.assertEqual(provisioned[-1]["refresh_base_before"], stale_base)
+            self.assertEqual(provisioned[-1]["refresh_base_after"], current_base)
+            self.assertEqual(provisioned[-1]["refresh_method"], "merge")
             preflight = [
                 record
                 for record in store.read_records()
@@ -7808,6 +7814,9 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             adopted = self._adopt_stale(repo, store, current_base)
 
             self.assertEqual(adopted.refreshed_from, stale_head)
+            self.assertEqual(adopted.refresh_base_before, _stale_base)
+            self.assertEqual(adopted.refresh_base_after, current_base)
+            self.assertEqual(adopted.refresh_method, "merge")
             self.assertNotEqual(adopted.head_commit, stale_head)
             self.assertNotEqual(adopted.head_commit, current_base)
             self.assertTrue((first.worktree / "candidate.txt").exists())

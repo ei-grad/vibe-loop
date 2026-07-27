@@ -6012,6 +6012,9 @@ class ProvisionedWorkspace:
     # Pre-refresh HEAD when a clean stale workspace was merged with the selected
     # base during adoption; empty otherwise.
     refreshed_from: str = ""
+    refresh_base_before: str = ""
+    refresh_base_after: str = ""
+    refresh_method: str = ""
 
     def to_record_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -6026,6 +6029,9 @@ class ProvisionedWorkspace:
             payload["owner_run_id"] = self.owner_run_id
         if self.refreshed_from:
             payload["refreshed_from"] = self.refreshed_from
+            payload["refresh_base_before"] = self.refresh_base_before
+            payload["refresh_base_after"] = self.refresh_base_after
+            payload["refresh_method"] = self.refresh_method
         return payload
 
 
@@ -6633,6 +6639,9 @@ class WorkspaceProvisioner:
             dirty_snapshot=tuple(dirty),
             dirty_fingerprint=dirty_fingerprint,
             refreshed_from=refreshed_from,
+            refresh_base_before=owner_base if refreshed_from else "",
+            refresh_base_after=base_commit if refreshed_from else "",
+            refresh_method="merge" if refreshed_from else "",
         )
 
     def _refresh_stale_workspace(
