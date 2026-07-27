@@ -373,7 +373,10 @@ vibe-loop worker candidate --repo "$VIBE_LOOP_REPO" \
 - `--head REF` is required.
 - `--base-main REF` can supply the recorded base.
 - `--changed-path PATH` can be repeated to declare changed paths.
-- `--json` emits structured output.
+- `--json` emits the candidate and its structured `scope_assessment`.
+- Plain-text success output appends
+  `scope_signal=candidate_scope_unenforceable` when no path domains can enforce
+  the comparison.
 
 Candidate validation and runtime-gate behavior are defined by
 [PRD-ORC-004](prd/run-orchestration.md#prd-orc-004-runtime-gates-and-candidate-stabilization).

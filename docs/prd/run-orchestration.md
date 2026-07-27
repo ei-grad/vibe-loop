@@ -142,13 +142,17 @@ recorded as typed evidence referencing the gate's configuration key, exit
 class, duration, and log. Gate failure routes to bounded remediation, not to
 silent completion; gate evidence is part of the review request.
 
+Conflict-domain fields remain optional in the
+[normalized task contract](task-discovery.md#prd-tsk-001-normalized-task-model).
 Before recording either a worker-declared or runtime-derived candidate, the
-runtime compares every changed path with the task's declared path conflict
-domains. A candidate with unmatched paths is rejected with a named scope-drift
-finding that records the declared resource and path domains, all changed paths,
-and the unmatched paths. Unknown or empty conflict domains, including a domain
-set containing only non-path resources, reject the declaration with an explicit
-scope-unenforceable signal carrying the same comparison inputs.
+runtime compares every changed path with any declared path conflict domains and
+records a typed scope assessment containing the declared resource and path
+domains, all changed paths, and the unmatched paths. A candidate with unmatched
+paths is rejected with a named scope-drift finding. Unknown or empty conflict
+domains, including a domain set containing only non-path resources, instead
+record a named scope-unenforceable assessment and allow the candidate to
+proceed; absence cannot silently pass as an enforced scope check or turn an
+optional task-source field into a late runtime requirement.
 
 The candidate's base is the commit its workspace was provisioned from, which
 for an adopted workspace is legitimately older than `main` at run start. When

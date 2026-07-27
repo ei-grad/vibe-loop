@@ -229,9 +229,11 @@ class CandidateCollectionError(RuntimeError):
         message: str,
         *,
         details: Mapping[str, object] | None = None,
+        carryover_findings: Sequence[Mapping[str, object]] = (),
     ) -> None:
         self.code = code
         self.details = dict(details or {})
+        self.carryover_findings = tuple(dict(finding) for finding in carryover_findings)
         super().__init__(message)
 
 
@@ -639,12 +641,29 @@ class CandidateRecord:
 
 
 @dataclasses.dataclass(frozen=True)
+class CandidateScopeAssessment:
+    outcome: str
+    finding: str
+    reason: str
+    details: Mapping[str, object]
+
+    def to_payload(self, candidate: CandidateRecord) -> dict[str, object]:
+        return {
+            "candidate_fingerprint": candidate.fingerprint,
+            "outcome": self.outcome,
+            "finding": self.finding,
+            "reason": self.reason,
+            **self.details,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class CandidateScopePolicy:
     known: bool
     resources: tuple[str, ...] = ()
     paths: tuple[str, ...] = ()
 
-    def validate(self, candidate: CandidateRecord) -> None:
+    def assess(self, candidate: CandidateRecord) -> CandidateScopeAssessment:
         details: dict[str, object] = {
             "declared_domains": {
                 "resources": list(self.resources),
@@ -654,21 +673,19 @@ class CandidateScopePolicy:
             "unmatched_paths": list(candidate.changed_paths),
         }
         if not self.known:
-            details["reason"] = "conflict_domains_unknown"
-            raise CandidateCollectionError(
-                "candidate_scope_unenforceable",
-                "candidate scope is unenforceable because conflict domains "
-                "were not declared",
+            return CandidateScopeAssessment(
+                outcome="unenforceable",
+                finding="candidate_scope_unenforceable",
+                reason="conflict_domains_unknown",
                 details=details,
             )
         if not self.paths:
-            details["reason"] = (
-                "non_path_domains_only" if self.resources else "no_declared_domains"
-            )
-            raise CandidateCollectionError(
-                "candidate_scope_unenforceable",
-                "candidate scope is unenforceable because no path domains "
-                "were declared",
+            return CandidateScopeAssessment(
+                outcome="unenforceable",
+                finding="candidate_scope_unenforceable",
+                reason=(
+                    "non_path_domains_only" if self.resources else "no_declared_domains"
+                ),
                 details=details,
             )
         unmatched_paths = tuple(
@@ -681,11 +698,19 @@ class CandidateScopePolicy:
         )
         if unmatched_paths:
             details["unmatched_paths"] = list(unmatched_paths)
-            raise CandidateCollectionError(
-                "candidate_scope_drift",
-                "candidate changed paths fall outside the task's declared path domains",
+            return CandidateScopeAssessment(
+                outcome="drift",
+                finding="candidate_scope_drift",
+                reason="paths_outside_declared_domains",
                 details=details,
             )
+        details["unmatched_paths"] = []
+        return CandidateScopeAssessment(
+            outcome="in_scope",
+            finding="",
+            reason="all_paths_matched",
+            details=details,
+        )
 
 
 def path_domain_contains_changed_path(domain: str, changed_path: str) -> bool:
@@ -717,6 +742,7 @@ class CandidateCollector:
         self.run_id = run_id
         self.task_id = task_id
         self.scope_policy = scope_policy
+        self.last_scope_assessment: CandidateScopeAssessment | None = None
 
     def collect_derived(self) -> CandidateRecord:
         candidate = self.snapshot(source="derived")
@@ -768,8 +794,17 @@ class CandidateCollector:
         return candidate
 
     def validate_scope(self, candidate: CandidateRecord) -> None:
-        if self.scope_policy is not None:
-            self.scope_policy.validate(candidate)
+        if self.scope_policy is None:
+            return
+        assessment = self.scope_policy.assess(candidate)
+        self.last_scope_assessment = assessment
+        self._record_scope_assessment(candidate, assessment)
+        if assessment.outcome == "drift":
+            raise CandidateCollectionError(
+                "candidate_scope_drift",
+                "candidate changed paths fall outside the task's declared path domains",
+                details=assessment.details,
+            )
 
     def _resolve_declared_revision(self, field: str, revision: str) -> str:
         """Resolve a worker-declared revision inside the claimed workspace.
@@ -958,6 +993,30 @@ class CandidateCollector:
                 run_id=self.run_id,
                 task_id=self.task_id,
                 payload=candidate.to_payload(),
+            )
+        )
+
+    def _record_scope_assessment(
+        self,
+        candidate: CandidateRecord,
+        assessment: CandidateScopeAssessment,
+    ) -> None:
+        from vibe_loop.runs import RunLifecycleEvent
+
+        payload = assessment.to_payload(candidate)
+        if any(
+            record.get("record_type") == "candidate_scope_assessed"
+            and record.get("run_id") == self.run_id
+            and record.get("task_id") == self.task_id
+            and all(record.get(key) == value for key, value in payload.items())
+            for record in self.run_store.read_records()
+        ):
+            return
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.candidate_scope_assessed(
+                run_id=self.run_id,
+                task_id=self.task_id,
+                payload=payload,
             )
         )
 

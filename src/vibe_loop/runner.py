@@ -3469,6 +3469,7 @@ class VibeRunner:
                     )
                     message = str(exc)
                 except CandidateCollectionError as exc:
+                    review_budget_finding_payloads = exc.carryover_findings
                     scope_finding = exc.code in {
                         "candidate_scope_drift",
                         "candidate_scope_unenforceable",
@@ -3628,7 +3629,9 @@ class VibeRunner:
                 )
             if runtime_owned and classification.status != "completed":
                 review_carryover_requested = bool(
-                    review_budget_exhausted or task.prior_findings
+                    review_budget_exhausted
+                    or review_budget_finding_payloads
+                    or task.prior_findings
                 )
                 if review_carryover_requested and not review_budget_finding_payloads:
                     review_budget_finding_payloads = task.prior_findings
@@ -4204,7 +4207,19 @@ class VibeRunner:
                 RunStage.CANDIDATE,
                 reason=f"review_remediation_candidate:{remediation_round}",
             )
-            gate_summary = gate_controller.run()
+            try:
+                gate_summary = gate_controller.run()
+            except CandidateCollectionError as exc:
+                if exc.code != "candidate_scope_drift" or not open_findings:
+                    raise
+                raise CandidateCollectionError(
+                    exc.code,
+                    str(exc),
+                    details=exc.details,
+                    carryover_findings=tuple(
+                        finding.to_payload() for finding in open_findings
+                    ),
+                ) from exc
             closure_ordinal += 1
             review_result = router.review(
                 gate_summary,

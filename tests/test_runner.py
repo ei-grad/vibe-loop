@@ -10249,10 +10249,19 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
         )
         self.assertEqual(source.status, "on-hold")
 
-    def test_candidate_scope_drift_preserves_named_finding_and_comparison(
+    def test_candidate_scope_drift_preserves_named_and_open_review_findings(
         self,
     ) -> None:
         task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        review_finding = ReviewFinding(
+            finding_id="F-1",
+            severity="P1",
+            summary="Open review finding survives scope drift",
+            evidence="review reproduction",
+            files=("src/vibe_loop/runner.py",),
+            lines=("4207",),
+            state="open",
+        )
         details = {
             "declared_domains": {
                 "resources": ["resource:database"],
@@ -10263,7 +10272,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             runner, _, _ = self._build_runner(directory, [task], {})
-            self._enable_runtime_owned_task_source(runner, task)
+            source = self._enable_runtime_owned_task_source(runner, task)
 
             with patch.object(
                 runner,
@@ -10272,6 +10281,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                     "candidate_scope_drift",
                     "candidate changed paths fall outside declared domains",
                     details=details,
+                    carryover_findings=(review_finding.to_payload(),),
                 ),
             ):
                 result = self._run_task(
@@ -10290,6 +10300,127 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 **details,
             },
         )
+        self.assertEqual(
+            json.loads(source.settlement_context["VIBE_LOOP_PRIOR_FINDINGS"]),
+            [review_finding.to_payload()],
+        )
+        self.assertEqual(
+            source.settlement_context["VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS"],
+            "0",
+        )
+
+    def test_review_remediation_scope_drift_carries_open_ledger_findings(
+        self,
+    ) -> None:
+        task = Task(
+            task_id="T-1",
+            title="Task",
+            status="ready",
+            agent="worker",
+            paths=("candidate.txt",),
+            conflict_domains_known=True,
+        )
+        finding_payload = {
+            "id": "F-1",
+            "severity": "P1",
+            "summary": "Review finding remains open",
+            "evidence": "review reproduction",
+            "files": ["candidate.txt"],
+            "lines": ["1"],
+            "state": "open",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {})
+            reviewer = runner.config.repo / "reviewer.py"
+            reviewer.write_text(
+                "import json\n"
+                f"finding = {finding_payload!r}\n"
+                "print(json.dumps({\n"
+                "    'verdict': 'findings', 'findings': [finding],\n"
+                "    'session_id': '', 'session_id_source': '',\n"
+                "}))\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "add", "reviewer.py"], cwd=runner.config.repo, check=True
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "add reviewer fixture"],
+                cwd=runner.config.repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            source = self._enable_runtime_owned_task_source(runner, task)
+            review_agent = AgentConfig(
+                command=f"{sys.executable} {reviewer} {{prompt}}",
+                agent_kind="custom",
+                prompt_dialect="codex",
+                skill_ref_prefix="$",
+            )
+            runner.config = dataclasses.replace(
+                runner.config,
+                completion=CompletionConfig(commands=("true",)),
+                agent_profiles={
+                    **runner.config.agent_profiles,
+                    "review": review_agent,
+                },
+                orchestration=OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    gates=("completion.commands[0]",),
+                    verify_on_main=("completion.commands[0]",),
+                    task_provenance_mode="adapter",
+                    explicit_keys=frozenset(
+                        {
+                            "mode",
+                            "reviewer_profile",
+                            "gates",
+                            "verify_on_main",
+                            "task_provenance_mode",
+                        }
+                    ),
+                ),
+            )
+            worker_calls = 0
+
+            def implementing_worker(command, cwd, log, **kwargs):
+                nonlocal worker_calls
+                worker_calls += 1
+                if "on_start" in kwargs:
+                    kwargs["on_start"](os.getpid())
+                    path = cwd / "candidate.txt"
+                    message = "implement candidate"
+                else:
+                    self.assertIn("Review finding remains open", command)
+                    path = cwd / "docs" / "drift.md"
+                    path.parent.mkdir()
+                    message = "drift during remediation"
+                path.write_text("change\n", encoding="utf-8")
+                subprocess.run(
+                    ["git", "add", str(path.relative_to(cwd))],
+                    cwd=cwd,
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "commit", "-m", message],
+                    cwd=cwd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return runner_module.StreamingCommandResult(exit_code=0)
+
+            result = self._run_task(runner, task, implementing_worker)
+
+        self.assertEqual(worker_calls, 2)
+        self.assertEqual(result.classification, "failed")
+        self.assertEqual(result.classification_source, "candidate_scope_drift")
+        self.assertEqual(
+            json.loads(source.settlement_context["VIBE_LOOP_PRIOR_FINDINGS"]),
+            [finding_payload],
+        )
+        self.assertEqual(source.prior_findings, (finding_payload,))
 
     def test_adopted_workspace_older_than_main_reanchors_before_gates(self) -> None:
         """An adopted workspace base is older than `main` by design.
@@ -10312,14 +10443,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 text=True,
             ).stdout.strip()
 
-        task = Task(
-            task_id="T-1",
-            title="Task",
-            status="ready",
-            agent="worker",
-            paths=("candidate.txt",),
-            conflict_domains_known=True,
-        )
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
         observed_candidates: list[CandidateRecord] = []
         with tempfile.TemporaryDirectory() as directory:
             runner, _, _ = self._build_runner(directory, [task], {})
@@ -10570,14 +10694,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
     def test_runtime_owned_run_executes_candidate_gates_review_and_integration(
         self,
     ) -> None:
-        task = Task(
-            task_id="T-1",
-            title="Task",
-            status="ready",
-            agent="worker",
-            paths=("candidate.txt",),
-            conflict_domains_known=True,
-        )
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
         with tempfile.TemporaryDirectory() as directory:
             runner, _, _ = self._build_runner(directory, [task], {})
             reviewer = runner.config.repo / "reviewer.py"
@@ -10750,14 +10867,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
     def test_runtime_owned_conflict_returns_to_implementer_in_same_run(
         self,
     ) -> None:
-        task = Task(
-            task_id="T-1",
-            title="Task",
-            status="ready",
-            agent="worker",
-            paths=("README.md",),
-            conflict_domains_known=True,
-        )
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
         with tempfile.TemporaryDirectory() as directory:
             runner, _, _ = self._build_runner(directory, [task], {})
             reviewer = runner.config.repo / "reviewer.py"

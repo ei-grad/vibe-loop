@@ -1589,6 +1589,12 @@ class RuntimeGateTests(unittest.TestCase):
         candidate = collector.collect_declared(head_commit=self.head)
 
         self.assertEqual(candidate.changed_paths, ("tracked.txt",))
+        assessment = self.store.read_records()[-2]
+        self.assertEqual(assessment["record_type"], "candidate_scope_assessed")
+        self.assertEqual(assessment["outcome"], "in_scope")
+        self.assertEqual(assessment["finding"], "")
+        self.assertEqual(assessment["changed_paths"], ["tracked.txt"])
+        self.assertEqual(assessment["unmatched_paths"], [])
 
     def test_candidate_scope_names_drift_and_reports_comparison(self) -> None:
         collector = self.collector_with_scope(
@@ -1614,6 +1620,11 @@ class RuntimeGateTests(unittest.TestCase):
                 "unmatched_paths": ["tracked.txt"],
             },
         )
+        assessment = self.store.read_records()[-1]
+        self.assertEqual(assessment["record_type"], "candidate_scope_assessed")
+        self.assertEqual(assessment["outcome"], "drift")
+        self.assertEqual(assessment["finding"], "candidate_scope_drift")
+        self.assertEqual(assessment["reason"], "paths_outside_declared_domains")
 
     def test_candidate_scope_without_domains_is_explicitly_unenforceable(
         self,
@@ -1622,13 +1633,16 @@ class RuntimeGateTests(unittest.TestCase):
             CandidateScopePolicy(known=False),
         )
 
-        with self.assertRaises(CandidateCollectionError) as raised:
-            collector.collect_derived()
+        candidate = collector.collect_derived()
 
-        self.assertEqual(raised.exception.code, "candidate_scope_unenforceable")
-        self.assertEqual(raised.exception.details["reason"], "conflict_domains_unknown")
-        self.assertEqual(raised.exception.details["changed_paths"], ["tracked.txt"])
-        self.assertEqual(raised.exception.details["unmatched_paths"], ["tracked.txt"])
+        self.assertEqual(candidate.changed_paths, ("tracked.txt",))
+        assessment = self.store.read_records()[-2]
+        self.assertEqual(assessment["record_type"], "candidate_scope_assessed")
+        self.assertEqual(assessment["outcome"], "unenforceable")
+        self.assertEqual(assessment["finding"], "candidate_scope_unenforceable")
+        self.assertEqual(assessment["reason"], "conflict_domains_unknown")
+        self.assertEqual(assessment["changed_paths"], ["tracked.txt"])
+        self.assertEqual(assessment["unmatched_paths"], ["tracked.txt"])
 
     def test_candidate_scope_with_resource_domains_only_is_unenforceable(
         self,
@@ -1640,13 +1654,15 @@ class RuntimeGateTests(unittest.TestCase):
             )
         )
 
-        with self.assertRaises(CandidateCollectionError) as raised:
-            collector.collect_derived()
+        candidate = collector.collect_derived()
 
-        self.assertEqual(raised.exception.code, "candidate_scope_unenforceable")
-        self.assertEqual(raised.exception.details["reason"], "non_path_domains_only")
+        self.assertEqual(candidate.changed_paths, ("tracked.txt",))
+        assessment = self.store.read_records()[-2]
+        self.assertEqual(assessment["outcome"], "unenforceable")
+        self.assertEqual(assessment["finding"], "candidate_scope_unenforceable")
+        self.assertEqual(assessment["reason"], "non_path_domains_only")
         self.assertEqual(
-            raised.exception.details["declared_domains"],
+            assessment["declared_domains"],
             {"resources": ["resource:database"], "paths": []},
         )
 

@@ -5571,8 +5571,6 @@ class CliTests(unittest.TestCase):
                         "host": socket.gethostname(),
                         "started_at": "2026-07-21T00:00:00+00:00",
                         "base_main": base,
-                        "paths": ["candidate.txt"],
-                        "conflict_domains_known": True,
                         "fencing_token": fencing_token,
                     }
                 ),
@@ -5658,6 +5656,18 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["candidate"]["head_commit"], head)
         self.assertEqual(payload["candidate"]["base_main"], base)
         self.assertEqual(payload["candidate"]["changed_paths"], ["candidate.txt"])
+        self.assertEqual(
+            payload["scope_assessment"]["finding"],
+            "candidate_scope_unenforceable",
+        )
+        self.assertEqual(
+            payload["scope_assessment"]["reason"],
+            "conflict_domains_unknown",
+        )
+        self.assertEqual(
+            [record["record_type"] for record in records[-2:]],
+            ["candidate_scope_assessed", "candidate_recorded"],
+        )
         self.assertEqual(records[-1]["record_type"], "candidate_recorded")
         self.assertEqual(records[-1]["source"], "worker_command")
         self.assertEqual(wrong_exit, 1)

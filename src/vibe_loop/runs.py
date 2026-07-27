@@ -78,6 +78,7 @@ WORKSPACE_REFRESH_REFUSALS = frozenset(
     }
 )
 CANDIDATE_RECORDED_RECORD_TYPE = "candidate_recorded"
+CANDIDATE_SCOPE_ASSESSED_RECORD_TYPE = "candidate_scope_assessed"
 CANDIDATE_BASE_ANCHOR_RECORD_TYPE = "candidate_base_anchor"
 GATE_RESULT_RECORD_TYPE = "gate_result"
 REVIEW_STARTED_RECORD_TYPE = "review_started"
@@ -168,6 +169,7 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         WORKSPACE_PROVISIONED_RECORD_TYPE,
         WORKSPACE_PREFLIGHT_RECORD_TYPE,
         CANDIDATE_RECORDED_RECORD_TYPE,
+        CANDIDATE_SCOPE_ASSESSED_RECORD_TYPE,
         CANDIDATE_BASE_ANCHOR_RECORD_TYPE,
         GATE_RESULT_RECORD_TYPE,
         REVIEW_STARTED_RECORD_TYPE,
@@ -831,6 +833,21 @@ class RunLifecycleEvent:
     ) -> RunLifecycleEvent:
         return cls(
             record_type=CANDIDATE_RECORDED_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def candidate_scope_assessed(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=CANDIDATE_SCOPE_ASSESSED_RECORD_TYPE,
             run_id=run_id,
             task_id=task_id,
             payload=payload,

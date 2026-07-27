@@ -2522,13 +2522,28 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
             else:
                 print(f"worker candidate refused: {code}: {exc}", file=sys.stderr)
             return 1
-        payload = {"recorded": True, "candidate": recorded.to_payload()}
+        scope_assessment = collector.last_scope_assessment
+        payload = {
+            "recorded": True,
+            "candidate": recorded.to_payload(),
+            "scope_assessment": (
+                scope_assessment.to_payload(recorded)
+                if scope_assessment is not None
+                else None
+            ),
+        }
         if json_requested(args):
             print(json.dumps(payload, indent=2))
         else:
+            scope_signal = (
+                f" scope_signal={scope_assessment.finding}"
+                if scope_assessment is not None and scope_assessment.finding
+                else ""
+            )
             print(
                 "worker candidate recorded "
                 f"task={task_id} run={run_id} head={recorded.head_commit}"
+                f"{scope_signal}"
             )
         return 0
 
