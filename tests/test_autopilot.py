@@ -673,9 +673,10 @@ class AutopilotStatusTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertIn("blockers:", rendered)
+        self.assertIn("task dispatch blockers:", rendered)
         self.assertIn("TASK-01", rendered)
         self.assertIn("workspace_collision", rendered)
+        self.assertNotIn("\nblockers:\n", rendered)
         self.assertNotIn("blockers: none", rendered)
 
     def test_successful_workspace_preflight_clears_prior_status_rejection(
@@ -7623,6 +7624,95 @@ class AutopilotMaintenanceTests(unittest.TestCase):
         self.assertIn("autopilot_health_failed", cycle.blockers)
         self.assertEqual(len(launched), 0)
         self.assertEqual([call["kind"] for call in calls], ["health"])
+
+    def test_failed_health_command_is_reported_with_dispatch_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml='[autopilot]\nhealth_command = "health"\n',
+            )
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.workspace_preflight(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    decision="rejected",
+                    reason="workspace_refresh_conflict",
+                    retry_disposition="defer_until_workspace_changes",
+                    worker_launch_allowed=False,
+                )
+            )
+            runner, calls = self._stub_runner({"health": 1})
+            launched: list[object] = []
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=lambda command, **k: launched.append(command) or 0,
+                maintenance_runner=runner,
+            )
+            rendered = render_autopilot_status(collect_project_status(config))
+
+        cycle = summary.cycles[0]
+        self.assertEqual(cycle.status, "blocked")
+        self.assertIn(
+            "task_dispatch_blocked:TASK-01: workspace preflight rejected "
+            "worker launch: workspace_refresh_conflict "
+            "(defer_until_workspace_changes)",
+            cycle.blockers,
+        )
+        self.assertIn("autopilot_health_failed", cycle.blockers)
+        self.assertEqual(len(launched), 0)
+        self.assertEqual([call["kind"] for call in calls], ["health"])
+        self.assertIn(
+            "last cycle health blockers:\n  - autopilot_health_failed",
+            rendered,
+        )
+        self.assertIn(
+            "task dispatch blockers:\n"
+            "  - TASK-01: workspace preflight rejected worker launch: "
+            "workspace_refresh_conflict (defer_until_workspace_changes)",
+            rendered,
+        )
+
+    def test_historical_health_failure_preserves_current_observations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Done", "", "finished slice")],
+                extra_toml='[autopilot]\nhealth_command = "health"\n',
+            )
+            config = load_config(repo)
+            runner, _ = self._stub_runner({"health": 1})
+
+            run_autopilot(
+                config,
+                once=True,
+                launcher=lambda *a, **k: 0,
+                maintenance_runner=runner,
+            )
+            status = collect_project_status(config, process_exists=lambda pid: False)
+            rendered = render_autopilot_status(status)
+
+        self.assertEqual(status.blockers, ())
+        self.assertEqual(status.observations, ("no_runnable_work",))
+        self.assertEqual(
+            status.last_cycle.blockers,
+            ("autopilot_health_failed",),
+        )
+        self.assertIn("observations:\n  - no_runnable_work", rendered)
+        self.assertIn(
+            "last cycle health blockers:\n  - autopilot_health_failed",
+            rendered,
+        )
+        self.assertLess(
+            rendered.index("observations:"),
+            rendered.index("last cycle health blockers:"),
+        )
 
     def test_summary_and_troubleshoot_fire_around_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

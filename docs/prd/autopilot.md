@@ -420,7 +420,10 @@ Acceptance must cover an `[autopilot]` config section, bounded command output,
 safe environment variables, command-result records, command redaction in status
 JSON, low-ready queue handling, and the rule that generated task-source
 profiles cannot introduce maintenance commands. An explicitly configured
-`planning_command` takes precedence over native planning.
+`planning_command` takes precedence over native planning. The health command
+runs even when another cycle blocker is already present. Human status reports
+the latest cycle's health failures beside its timestamped cycle summary and
+separately from current task-scoped dispatch blockers.
 
 Related implementation IDs: `AUTO-04`.
 
