@@ -840,6 +840,7 @@ class CandidateCollector:
         *,
         source: str,
         base_main: str | None = None,
+        comparison_base: str | None = None,
     ) -> CandidateRecord:
         observed_branch = self._git_text("branch", "--show-current")
         if observed_branch != self.branch:
@@ -872,17 +873,17 @@ class CandidateCollector:
                 "candidate workspace has uncommitted tracked changes",
                 details={"status": tracked_status.splitlines()[:20]},
             )
-        comparison_base = self._git_text(
-            "merge-base",
-            head_commit,
-            f"refs/heads/{self._comparison_main_branch()}^{{commit}}",
+        resolved_comparison_base = self._resolve_comparison_base(
+            head_commit=head_commit,
+            base_main=resolved_base,
+            comparison_base=comparison_base,
         )
         changed = self._git_bytes(
             "diff",
             "--name-only",
             "--diff-filter=ACDMRTUXB",
             "-z",
-            f"{comparison_base}...{head_commit}",
+            f"{resolved_comparison_base}...{head_commit}",
         )
         changed_paths = tuple(
             sorted(
@@ -898,24 +899,69 @@ class CandidateCollector:
             head_commit=head_commit,
             changed_paths=changed_paths,
             source=source,
-            comparison_base=comparison_base,
+            comparison_base=resolved_comparison_base,
         )
 
-    def _comparison_main_branch(self) -> str:
-        git_dir = self._git_text("rev-parse", "--absolute-git-dir")
-        common_dir = self._git_text(
+    def _resolve_comparison_base(
+        self,
+        *,
+        head_commit: str,
+        base_main: str,
+        comparison_base: str | None,
+    ) -> str:
+        if comparison_base:
+            resolved = self._git_text("rev-parse", "--verify", comparison_base)
+            if (
+                self._git_result(
+                    "merge-base",
+                    "--is-ancestor",
+                    resolved,
+                    head_commit,
+                ).returncode
+                != 0
+            ):
+                raise CandidateCollectionError(
+                    "candidate_comparison_base_mismatch",
+                    "candidate head does not descend from its recorded comparison base",
+                    details={
+                        "comparison_base": resolved,
+                        "head_commit": head_commit,
+                    },
+                )
+            return resolved
+
+        main_result = self._git_result(
             "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{self.main_branch}^{{commit}}",
         )
-        if git_dir == common_dir:
-            return self.main_branch
-        return self._git_text(
-            f"--git-dir={common_dir}",
-            "symbolic-ref",
-            "--short",
-            "HEAD",
-        ).removeprefix("refs/heads/")
+        main_head = main_result.stdout.strip()
+        if main_result.returncode == 1:
+            return base_main
+        if main_result.returncode != 0 or not main_head:
+            raise CandidateCollectionError(
+                "candidate_git_error",
+                "candidate mainline revision could not be read",
+                details={
+                    "main_branch": self.main_branch,
+                    "stderr": main_result.stderr.strip(),
+                },
+            )
+        merge_base_result = self._git_result("merge-base", head_commit, main_head)
+        resolved = merge_base_result.stdout.strip()
+        if merge_base_result.returncode == 1:
+            return base_main
+        if merge_base_result.returncode != 0 or not resolved:
+            raise CandidateCollectionError(
+                "candidate_git_error",
+                "candidate comparison base could not be read",
+                details={
+                    "main_branch": self.main_branch,
+                    "stderr": merge_base_result.stderr.strip(),
+                },
+            )
+        return resolved
 
     def matches(self, candidate: CandidateRecord) -> bool:
         try:
@@ -923,6 +969,7 @@ class CandidateCollector:
                 self.snapshot(
                     source=candidate.source,
                     base_main=candidate.base_main,
+                    comparison_base=candidate.comparison_base or candidate.base_main,
                 ).fingerprint
                 == candidate.fingerprint
             )
@@ -1585,7 +1632,7 @@ class ReviewRequest:
             "candidate": {
                 **self.candidate.to_payload(),
                 "diff_source": (
-                    f"git diff {self.candidate.base_main}..."
+                    f"git diff {self.candidate.comparison_base or self.candidate.base_main}..."
                     f"{self.candidate.head_commit}"
                 ),
             },

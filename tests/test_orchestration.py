@@ -55,6 +55,7 @@ from vibe_loop.orchestration import (
     ReviewExecutionError,
     ReviewFinding,
     ReviewProviderLimitError,
+    ReviewRequest,
     ReviewOutputMalformed,
     ReviewRouteMismatchError,
     ReviewRouter,
@@ -1629,7 +1630,9 @@ class RuntimeGateTests(unittest.TestCase):
         self.assertEqual(assessment["outcome"], "in_scope")
         self.assertEqual(assessment["comparison_base"], advanced_main)
 
-    def test_candidate_scope_uses_primary_branch_for_linked_worktree(self) -> None:
+    def test_candidate_scope_uses_configured_branch_with_detached_primary(
+        self,
+    ) -> None:
         git(self.repo, "branch", "-m", "worker/task-01", "integration")
         worker = Path(self.directory.name) / "linked-worker"
         git(
@@ -1647,6 +1650,7 @@ class RuntimeGateTests(unittest.TestCase):
         git(self.repo, "commit", "-m", "advance integration")
         advanced_main = git(self.repo, "rev-parse", "HEAD").stdout.strip()
         git(worker, "merge", "--no-edit", "integration")
+        git(self.repo, "checkout", "--detach")
         collector = CandidateCollector(
             worktree=worker,
             branch="worker/linked",
@@ -1654,6 +1658,7 @@ class RuntimeGateTests(unittest.TestCase):
             run_store=self.store,
             run_id="run-1",
             task_id="TASK-01",
+            main_branch="integration",
             scope_policy=CandidateScopePolicy(
                 known=True,
                 paths=("worker",),
@@ -1664,6 +1669,77 @@ class RuntimeGateTests(unittest.TestCase):
 
         self.assertEqual(candidate.changed_paths, ())
         self.assertEqual(candidate.comparison_base, advanced_main)
+
+    def test_candidate_scope_falls_back_when_mainline_ref_is_absent(self) -> None:
+        collector = CandidateCollector(
+            worktree=self.repo,
+            branch="worker/task-01",
+            base_main=self.base,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            main_branch="missing",
+        )
+
+        candidate = collector.collect_derived()
+
+        self.assertEqual(candidate.changed_paths, ("tracked.txt",))
+        self.assertEqual(candidate.comparison_base, self.base)
+
+    def test_candidate_scope_falls_back_for_unrelated_mainline(self) -> None:
+        tree = git(self.repo, "rev-parse", f"{self.base}^{{tree}}").stdout.strip()
+        unrelated = git(
+            self.repo,
+            "commit-tree",
+            tree,
+            "-m",
+            "unrelated root",
+        ).stdout.strip()
+        git(self.repo, "branch", "unrelated", unrelated)
+        collector = CandidateCollector(
+            worktree=self.repo,
+            branch="worker/task-01",
+            base_main=self.base,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            main_branch="unrelated",
+        )
+
+        candidate = collector.collect_derived()
+
+        self.assertEqual(candidate.changed_paths, ("tracked.txt",))
+        self.assertEqual(candidate.comparison_base, self.base)
+
+    def test_recorded_comparison_base_survives_mainline_integration(self) -> None:
+        worker = Path(self.directory.name) / "stable-worker"
+        git(
+            self.repo,
+            "worktree",
+            "add",
+            "-b",
+            "worker/stable",
+            str(worker),
+            self.base,
+        )
+        (worker / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+        git(worker, "add", "candidate.txt")
+        git(worker, "commit", "-m", "candidate")
+        collector = CandidateCollector(
+            worktree=worker,
+            branch="worker/stable",
+            base_main=self.base,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+        )
+        candidate = collector.collect_derived()
+        main_worktree = Path(self.directory.name) / "stable-main"
+        git(self.repo, "worktree", "add", str(main_worktree), "main")
+        git(main_worktree, "merge", "--ff-only", "worker/stable")
+
+        self.assertTrue(collector.matches(candidate))
+        self.assertEqual(candidate.changed_paths, ("candidate.txt",))
 
     def test_candidate_scope_names_drift_and_reports_comparison(self) -> None:
         collector = self.collector_with_scope(
@@ -5020,6 +5096,26 @@ class ReviewRouterTests(unittest.TestCase):
                 ),
             ),
             candidate_recorded=True,
+        )
+
+    def test_review_request_uses_candidate_comparison_base(self) -> None:
+        candidate = dataclasses.replace(
+            self.candidate,
+            comparison_base="d" * 40,
+        )
+        request = ReviewRequest(
+            run_id="run-1",
+            task_id="TASK-01",
+            candidate=candidate,
+            gate_results=(),
+            policy_references=("REVIEW.md",),
+        )
+
+        payload = request.to_payload()
+
+        self.assertEqual(
+            payload["candidate"]["diff_source"],
+            f"git diff {'d' * 40}...{'b' * 40}",
         )
 
     def agent(self, provider: str, *, command: str | None = None) -> AgentConfig:

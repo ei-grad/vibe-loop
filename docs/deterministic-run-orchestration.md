@@ -414,7 +414,11 @@ with reset evidence / timeout / fatal), session identity
 worker report if filed, candidate declaration — via a new fenced
 `vibe-loop worker candidate --head <sha> ...` command or derived by
 `CandidateCollector` from the claimed branch (head commit, changed paths vs
-`base_main`) when the worker did not declare one.
+the recorded `comparison_base`) when the worker did not declare one. Initial
+collection selects that comparison base as the merge base of the candidate head
+and configured local mainline when available, falling back to the validated
+`base_main`; later matching, gate, recovery, and review stages reuse the
+persisted comparison base.
 
 ### Reviewer stage I/O
 
