@@ -963,6 +963,24 @@ class CandidateCollector:
                     "stderr": merge_base_result.stderr.strip(),
                 },
             )
+        anchor_relation = self._git_result(
+            "merge-base",
+            "--is-ancestor",
+            base_main,
+            resolved,
+        )
+        if anchor_relation.returncode == 1:
+            return base_main
+        if anchor_relation.returncode != 0:
+            raise CandidateCollectionError(
+                "candidate_git_error",
+                "candidate comparison base ancestry could not be read",
+                details={
+                    "base_main": base_main,
+                    "comparison_base": resolved,
+                    "stderr": anchor_relation.stderr.strip(),
+                },
+            )
         return resolved
 
     def matches(self, candidate: CandidateRecord) -> bool:

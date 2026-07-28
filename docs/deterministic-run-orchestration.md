@@ -296,8 +296,9 @@ New record types:
   stages (`from_stage`, `to_stage`, `reason`, ordinal for repeated stages).
 - `gate_result` — gate id/command identity (redacted to configured key),
   exit class, duration, log reference, evidence digest.
-- `candidate_recorded` — head commit, base main, changed paths summary,
-  declaration source (`worker_command` | `derived`).
+- `candidate_recorded` — persisted candidate evidence. The authoritative
+  [runtime candidate contract](prd/run-orchestration.md#prd-orc-004-runtime-gates-and-candidate-stabilization)
+  owns its field set and derivation rules.
 - `review_started` / `review_verdict` — bounded review identity and control
   evidence. [PRD-WRK-009](prd/worker-supervision.md#prd-wrk-009-runtime-lifecycle-events)
   owns the exact telemetry, privacy, and integration-fence contract.

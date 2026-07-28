@@ -1711,6 +1711,36 @@ class RuntimeGateTests(unittest.TestCase):
         self.assertEqual(candidate.changed_paths, ("tracked.txt",))
         self.assertEqual(candidate.comparison_base, self.base)
 
+    def test_candidate_scope_never_compares_behind_base_anchor(self) -> None:
+        git(self.repo, "checkout", "main")
+        (self.repo / "infra.txt").write_text("mainline\n", encoding="utf-8")
+        git(self.repo, "add", "infra.txt")
+        git(self.repo, "commit", "-m", "advance main")
+        base_anchor = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        git(self.repo, "checkout", "-b", "worker/rewound-main")
+        (self.repo / "worker.txt").write_text("candidate\n", encoding="utf-8")
+        git(self.repo, "add", "worker.txt")
+        git(self.repo, "commit", "-m", "candidate")
+        candidate_head = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        git(self.repo, "branch", "-f", "main", self.base)
+        collector = CandidateCollector(
+            worktree=self.repo,
+            branch="worker/rewound-main",
+            base_main=base_anchor,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            scope_policy=CandidateScopePolicy(
+                known=True,
+                paths=("worker.txt",),
+            ),
+        )
+
+        candidate = collector.collect_declared(head_commit=candidate_head)
+
+        self.assertEqual(candidate.changed_paths, ("worker.txt",))
+        self.assertEqual(candidate.comparison_base, base_anchor)
+
     def test_candidate_rejects_comparison_base_outside_head_history(self) -> None:
         tree = git(self.repo, "rev-parse", f"{self.base}^{{tree}}").stdout.strip()
         unrelated = git(
