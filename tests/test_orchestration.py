@@ -3811,11 +3811,12 @@ class RuntimeIntegrationTests(unittest.TestCase):
     ) -> None:
         log_path = self.repo / ".vibe-loop" / "integration" / "diagnostic.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_bytes(b"x" * 50_000)
+        log_path.write_bytes(b"HEAD-START " + (b"x" * 50_000) + b" FATAL-AT-END")
 
         single_line = verification_output_tail(log_path)
 
-        self.assertTrue(single_line)
+        self.assertNotIn("HEAD-START", single_line)
+        self.assertIn("FATAL-AT-END", single_line)
         self.assertLessEqual(len(single_line), 2000)
         log_path.write_bytes((b"progress\r" * 2_000) + b"FATAL: verification failed")
 

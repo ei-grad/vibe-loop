@@ -43,6 +43,7 @@ from vibe_loop.retry import (
 )
 from vibe_loop.tasks import (
     BLOCKED_FAMILY_STATUSES,
+    TASK_SOURCE_ERROR_LINE_LIMIT,
     Task,
     TaskSource,
     bound_error_stream_for_redaction,
@@ -3740,10 +3741,6 @@ def verification_output_tail(log_path: Path) -> str:
             offset = max(0, size - VERIFICATION_OUTPUT_READ_BYTES)
             stream.seek(offset)
             raw = stream.read()
-            if offset and b"\n" not in raw and b"\r" not in raw:
-                stream.seek(0)
-                raw = stream.read(VERIFICATION_OUTPUT_READ_BYTES)
-                offset = 0
     except OSError:
         return ""
     text = (
@@ -3751,8 +3748,13 @@ def verification_output_tail(log_path: Path) -> str:
     )
     if offset:
         newline = text.find("\n")
-        text = text[newline + 1 :]
-    bounded = bound_error_stream_for_redaction(text)
+        if newline >= 0:
+            text = text[newline + 1 :]
+            bounded = bound_error_stream_for_redaction(text)
+        else:
+            bounded = bounded_error_stream(text, TASK_SOURCE_ERROR_LINE_LIMIT)
+    else:
+        bounded = bound_error_stream_for_redaction(text)
     redacted = redact_evidence_text(bounded)
     redacted = redact_fencing_token_diagnostic(redacted, {})
     return bounded_error_stream(redacted)

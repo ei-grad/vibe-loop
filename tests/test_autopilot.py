@@ -446,6 +446,24 @@ class AutopilotStatusTests(unittest.TestCase):
                 str(registry),
                 "--json",
             )
+            run_store.append_result(
+                RunResult(
+                    run_id="run-2",
+                    task_id="TASK-02",
+                    classification="completed",
+                    classification_source="worker_report",
+                    exit_code=0,
+                    log_path=config.state_path / "runs" / "run-2.log",
+                    start_main="base",
+                    end_main="candidate-2",
+                )
+            )
+            cleared_text_code, cleared_text = invoke(
+                "autopilot", "status", "--repo", str(repo)
+            )
+            cleared_json_code, cleared_json = invoke(
+                "autopilot", "status", "--repo", str(repo), "--json"
+            )
 
         self.assertEqual(
             (
@@ -454,8 +472,10 @@ class AutopilotStatusTests(unittest.TestCase):
                 status_json_code,
                 project_text_code,
                 project_json_code,
+                cleared_text_code,
+                cleared_json_code,
             ),
-            (0, 0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0, 0),
         )
         expected_header = (
             "main_verification_failed: task=TASK-01 run=run-1 "
@@ -468,6 +488,11 @@ class AutopilotStatusTests(unittest.TestCase):
             failure = json.loads(encoded)["latest_main_verification_failure"]
             self.assertEqual(failure["command_key"], "completion.commands[0]")
             self.assertEqual(failure["output_tail"], "backup lock unavailable")
+        self.assertNotIn("main_verification_failed:", cleared_text)
+        self.assertEqual(
+            json.loads(cleared_json)["latest_main_verification_failure"],
+            {},
+        )
 
     def test_unapproved_run_does_not_reset_approved_non_closure_streak(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
