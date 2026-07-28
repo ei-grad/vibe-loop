@@ -1677,21 +1677,13 @@ def supervisor_code_staleness(
     started_commit = str(started_identity.get("commit") or "")
     started_fingerprint = str(started_identity.get("fingerprint") or "")
     current_fingerprint = str(current_identity.get("fingerprint") or "")
-    identity_changed = bool(
-        (started_commit and current_commit and started_commit != current_commit)
-        or (
-            started_fingerprint
-            and current_fingerprint
-            and started_fingerprint != current_fingerprint
-        )
-    )
     commits_behind: int | None = None
     changed_files: tuple[str, ...] = ()
     changed_files_truncated = 0
     if (
-        identity_changed
-        and started_commit
+        started_commit
         and current_commit
+        and started_commit != current_commit
         and source_root.is_dir()
         and relative_runtime_path
     ):
@@ -1728,6 +1720,15 @@ def supervisor_code_staleness(
             all_changed_files = tuple(line for line in files_text.splitlines() if line)
             changed_files = all_changed_files[:20]
             changed_files_truncated = max(0, len(all_changed_files) - 20)
+
+    if started_fingerprint and current_fingerprint:
+        identity_changed = started_fingerprint != current_fingerprint
+    elif commits_behind is not None:
+        identity_changed = commits_behind > 0
+    else:
+        identity_changed = bool(
+            started_commit and current_commit and started_commit != current_commit
+        )
 
     stale = running and identity_changed
     report: dict[str, object] = {

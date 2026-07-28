@@ -2177,6 +2177,91 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertFalse(fresh_report["stale"])
         self.assertEqual(fresh_advisories, ())
 
+    def test_supervisor_code_staleness_ignores_non_runtime_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runtime_path = repo / "src" / "vibe_loop"
+            runtime_path.mkdir(parents=True)
+            (runtime_path / "runtime.py").write_text("VALUE = 1\n", encoding="utf-8")
+            run(repo, "git", "init")
+            run(repo, "git", "config", "user.email", "test@example.com")
+            run(repo, "git", "config", "user.name", "Test User")
+            run(repo, "git", "add", ".")
+            run(repo, "git", "commit", "-m", "initial runtime")
+            started_identity = runtime_code_identity(runtime_path)
+
+            (repo / "README.md").write_text("documentation\n", encoding="utf-8")
+            run(repo, "git", "add", ".")
+            run(repo, "git", "commit", "-m", "document runtime")
+            current_identity = runtime_code_identity(runtime_path)
+
+            report, advisories = supervisor_code_staleness(
+                {
+                    "occurred_at": "2026-07-28T00:00:00+00:00",
+                    "code_identity": started_identity,
+                },
+                current_identity=current_identity,
+                running=True,
+            )
+
+        self.assertFalse(report["stale"])
+        self.assertEqual(report["commits_behind"], 0)
+        self.assertEqual(report["changed_files"], [])
+        self.assertEqual(advisories, ())
+
+    def test_supervisor_status_reports_stale_code_and_restart_clears(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "supervised"
+            runtime_repo = root / "runtime"
+            repo.mkdir()
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            runtime_path = runtime_repo / "src" / "vibe_loop"
+            runtime_path.mkdir(parents=True)
+            (runtime_path / "runtime.py").write_text("VALUE = 1\n", encoding="utf-8")
+            run(runtime_repo, "git", "init")
+            run(runtime_repo, "git", "config", "user.email", "test@example.com")
+            run(runtime_repo, "git", "config", "user.name", "Test User")
+            run(runtime_repo, "git", "add", ".")
+            run(runtime_repo, "git", "commit", "-m", "initial runtime")
+            started_identity = runtime_code_identity(runtime_path)
+
+            (runtime_path / "runtime.py").write_text("VALUE = 2\n", encoding="utf-8")
+            run(runtime_repo, "git", "add", ".")
+            run(runtime_repo, "git", "commit", "-m", "change runtime")
+            current_identity = runtime_code_identity(runtime_path)
+            config = load_config(repo)
+            observed = []
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                with mock.patch(
+                    "vibe_loop.autopilot.IMPORTED_RUNTIME_CODE_IDENTITY",
+                    current_identity,
+                ):
+                    observed.append(collect_project_status(config))
+                return 0
+
+            with mock.patch(
+                "vibe_loop.autopilot.IMPORTED_RUNTIME_CODE_IDENTITY",
+                started_identity,
+            ):
+                run_autopilot(config, once=True, launcher=launcher)
+            with mock.patch(
+                "vibe_loop.autopilot.IMPORTED_RUNTIME_CODE_IDENTITY",
+                current_identity,
+            ):
+                run_autopilot(config, once=True, launcher=launcher)
+
+        stale, fresh = (status.supervisor for status in observed)
+        self.assertTrue(stale.code["stale"])
+        self.assertEqual(stale.code["commits_behind"], 1)
+        self.assertEqual(
+            [advisory["code"] for advisory in stale.advisories],
+            ["supervisor_code_stale"],
+        )
+        self.assertFalse(fresh.code["stale"])
+        self.assertEqual(fresh.advisories, ())
+
     def test_detached_command_preserves_full_start_argument_set(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
