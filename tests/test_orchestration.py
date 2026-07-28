@@ -55,6 +55,7 @@ from vibe_loop.orchestration import (
     ReviewExecutionError,
     ReviewFinding,
     ReviewProviderLimitError,
+    ReviewRequest,
     ReviewOutputMalformed,
     ReviewRouteMismatchError,
     ReviewRouter,
@@ -1595,6 +1596,280 @@ class RuntimeGateTests(unittest.TestCase):
         self.assertEqual(assessment["finding"], "")
         self.assertEqual(assessment["changed_paths"], ["tracked.txt"])
         self.assertEqual(assessment["unmatched_paths"], [])
+        self.assertEqual(assessment["comparison_base"], self.base)
+
+    def test_candidate_scope_excludes_changes_merged_from_main(self) -> None:
+        main_worktree = Path(self.directory.name) / "main-worktree"
+        git(self.repo, "worktree", "add", str(main_worktree), "main")
+        git(self.repo, "checkout", "-b", "worker/no-changes", self.base)
+        git(self.repo, "commit", "--allow-empty", "-m", "empty worker commit")
+        (main_worktree / "mainline.txt").write_text("mainline\n", encoding="utf-8")
+        git(main_worktree, "add", "mainline.txt")
+        git(main_worktree, "commit", "-m", "advance main")
+        advanced_main = git(main_worktree, "rev-parse", "HEAD").stdout.strip()
+        git(self.repo, "merge", "--no-edit", "main")
+        merged_head = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        collector = CandidateCollector(
+            worktree=self.repo,
+            branch="worker/no-changes",
+            base_main=self.base,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            scope_policy=CandidateScopePolicy(
+                known=True,
+                paths=("worker",),
+            ),
+        )
+
+        candidate = collector.collect_declared(head_commit=merged_head)
+
+        self.assertEqual(candidate.changed_paths, ())
+        self.assertEqual(candidate.comparison_base, advanced_main)
+        assessment = self.store.read_records()[-2]
+        self.assertEqual(assessment["outcome"], "in_scope")
+        self.assertEqual(assessment["comparison_base"], advanced_main)
+
+    def test_candidate_scope_uses_configured_branch_with_detached_primary(
+        self,
+    ) -> None:
+        git(self.repo, "branch", "-m", "worker/task-01", "integration")
+        worker = Path(self.directory.name) / "linked-worker"
+        git(
+            self.repo,
+            "worktree",
+            "add",
+            "-b",
+            "worker/linked",
+            str(worker),
+            self.base,
+        )
+        git(worker, "commit", "--allow-empty", "-m", "empty worker commit")
+        (self.repo / "mainline.txt").write_text("mainline\n", encoding="utf-8")
+        git(self.repo, "add", "mainline.txt")
+        git(self.repo, "commit", "-m", "advance integration")
+        advanced_main = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        git(worker, "merge", "--no-edit", "integration")
+        git(self.repo, "checkout", "--detach")
+        collector = CandidateCollector(
+            worktree=worker,
+            branch="worker/linked",
+            base_main=self.base,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            main_branch="integration",
+            scope_policy=CandidateScopePolicy(
+                known=True,
+                paths=("worker",),
+            ),
+        )
+
+        candidate = collector.collect_derived()
+
+        self.assertEqual(candidate.changed_paths, ())
+        self.assertEqual(candidate.comparison_base, advanced_main)
+
+    def test_candidate_scope_falls_back_when_mainline_ref_is_absent(self) -> None:
+        collector = CandidateCollector(
+            worktree=self.repo,
+            branch="worker/task-01",
+            base_main=self.base,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            main_branch="missing",
+        )
+
+        candidate = collector.collect_derived()
+
+        self.assertEqual(candidate.changed_paths, ("tracked.txt",))
+        self.assertEqual(candidate.comparison_base, self.base)
+
+    def test_candidate_scope_falls_back_for_unrelated_mainline(self) -> None:
+        tree = git(self.repo, "rev-parse", f"{self.base}^{{tree}}").stdout.strip()
+        unrelated = git(
+            self.repo,
+            "commit-tree",
+            tree,
+            "-m",
+            "unrelated root",
+        ).stdout.strip()
+        git(self.repo, "branch", "unrelated", unrelated)
+        collector = CandidateCollector(
+            worktree=self.repo,
+            branch="worker/task-01",
+            base_main=self.base,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            main_branch="unrelated",
+        )
+
+        candidate = collector.collect_derived()
+
+        self.assertEqual(candidate.changed_paths, ("tracked.txt",))
+        self.assertEqual(candidate.comparison_base, self.base)
+
+    def test_candidate_scope_never_compares_behind_base_anchor(self) -> None:
+        git(self.repo, "checkout", "main")
+        (self.repo / "infra.txt").write_text("mainline\n", encoding="utf-8")
+        git(self.repo, "add", "infra.txt")
+        git(self.repo, "commit", "-m", "advance main")
+        base_anchor = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        git(self.repo, "checkout", "-b", "worker/rewound-main")
+        (self.repo / "worker.txt").write_text("candidate\n", encoding="utf-8")
+        git(self.repo, "add", "worker.txt")
+        git(self.repo, "commit", "-m", "candidate")
+        candidate_head = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        git(self.repo, "branch", "-f", "main", self.base)
+        collector = CandidateCollector(
+            worktree=self.repo,
+            branch="worker/rewound-main",
+            base_main=base_anchor,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            scope_policy=CandidateScopePolicy(
+                known=True,
+                paths=("worker.txt",),
+            ),
+        )
+
+        candidate = collector.collect_declared(head_commit=candidate_head)
+
+        self.assertEqual(candidate.changed_paths, ("worker.txt",))
+        self.assertEqual(candidate.comparison_base, base_anchor)
+
+    def test_candidate_rejects_comparison_base_outside_head_history(self) -> None:
+        tree = git(self.repo, "rev-parse", f"{self.base}^{{tree}}").stdout.strip()
+        unrelated = git(
+            self.repo,
+            "commit-tree",
+            tree,
+            "-m",
+            "unrelated root",
+        ).stdout.strip()
+
+        with self.assertRaises(CandidateCollectionError) as raised:
+            self.collector.snapshot(
+                source="derived",
+                comparison_base=unrelated,
+            )
+
+        self.assertEqual(
+            raised.exception.code,
+            "candidate_comparison_base_mismatch",
+        )
+        self.assertIn(
+            "does not descend from its recorded comparison base",
+            str(raised.exception),
+        )
+        self.assertEqual(
+            raised.exception.details,
+            {
+                "comparison_base": unrelated,
+                "head_commit": self.head,
+            },
+        )
+
+    def test_candidate_reports_mainline_revision_read_error(self) -> None:
+        real_git_result = self.collector._git_result
+
+        def failing_mainline_read(*args: str):
+            if args[:3] == ("rev-parse", "--verify", "--quiet"):
+                return subprocess.CompletedProcess(
+                    ["git", *args],
+                    2,
+                    stdout="",
+                    stderr="fatal: mainline read failed\n",
+                )
+            return real_git_result(*args)
+
+        with patch.object(
+            self.collector,
+            "_git_result",
+            side_effect=failing_mainline_read,
+        ):
+            with self.assertRaises(CandidateCollectionError) as raised:
+                self.collector.collect_derived()
+
+        self.assertEqual(raised.exception.code, "candidate_git_error")
+        self.assertIn(
+            "mainline revision could not be read",
+            str(raised.exception),
+        )
+        self.assertEqual(
+            raised.exception.details,
+            {
+                "main_branch": "main",
+                "stderr": "fatal: mainline read failed",
+            },
+        )
+
+    def test_candidate_reports_comparison_base_read_error(self) -> None:
+        real_git_result = self.collector._git_result
+
+        def failing_merge_base(*args: str):
+            if args[:1] == ("merge-base",) and "--is-ancestor" not in args:
+                return subprocess.CompletedProcess(
+                    ["git", *args],
+                    2,
+                    stdout="",
+                    stderr="fatal: merge-base failed\n",
+                )
+            return real_git_result(*args)
+
+        with patch.object(
+            self.collector,
+            "_git_result",
+            side_effect=failing_merge_base,
+        ):
+            with self.assertRaises(CandidateCollectionError) as raised:
+                self.collector.collect_derived()
+
+        self.assertEqual(raised.exception.code, "candidate_git_error")
+        self.assertIn(
+            "comparison base could not be read",
+            str(raised.exception),
+        )
+        self.assertEqual(
+            raised.exception.details,
+            {
+                "main_branch": "main",
+                "stderr": "fatal: merge-base failed",
+            },
+        )
+
+    def test_recorded_comparison_base_survives_mainline_integration(self) -> None:
+        worker = Path(self.directory.name) / "stable-worker"
+        git(
+            self.repo,
+            "worktree",
+            "add",
+            "-b",
+            "worker/stable",
+            str(worker),
+            self.base,
+        )
+        (worker / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+        git(worker, "add", "candidate.txt")
+        git(worker, "commit", "-m", "candidate")
+        collector = CandidateCollector(
+            worktree=worker,
+            branch="worker/stable",
+            base_main=self.base,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+        )
+        candidate = collector.collect_derived()
+        main_worktree = Path(self.directory.name) / "stable-main"
+        git(self.repo, "worktree", "add", str(main_worktree), "main")
+        git(main_worktree, "merge", "--ff-only", "worker/stable")
+
+        self.assertTrue(collector.matches(candidate))
+        self.assertEqual(candidate.changed_paths, ("candidate.txt",))
 
     def test_candidate_scope_names_drift_and_reports_comparison(self) -> None:
         collector = self.collector_with_scope(
@@ -1609,6 +1884,10 @@ class RuntimeGateTests(unittest.TestCase):
             collector.collect_declared(head_commit=self.head)
 
         self.assertEqual(raised.exception.code, "candidate_scope_drift")
+        self.assertIn(
+            f"comparison base {self.base}",
+            str(raised.exception),
+        )
         self.assertEqual(
             raised.exception.details,
             {
@@ -1618,6 +1897,7 @@ class RuntimeGateTests(unittest.TestCase):
                 },
                 "changed_paths": ["tracked.txt"],
                 "unmatched_paths": ["tracked.txt"],
+                "comparison_base": self.base,
             },
         )
         assessment = self.store.read_records()[-1]
@@ -2258,6 +2538,39 @@ class CandidateBaseReanchorTests(unittest.TestCase):
         self.assertEqual(
             [record["outcome"] for record in anchor_records],
             ["re-anchored-clean"],
+        )
+
+    def test_reanchor_compares_diff_from_each_candidate_comparison_base(
+        self,
+    ) -> None:
+        (self.worktree / "candidate.txt").write_text(
+            "candidate\n",
+            encoding="utf-8",
+        )
+        git(self.worktree, "add", "candidate.txt")
+        git(self.worktree, "commit", "-m", "candidate")
+        merged_base = self.advance_main("merged\n")
+        git(self.worktree, "merge", "--no-edit", "main")
+        candidate = self.collector.collect_derived()
+        (self.repo / "later.txt").write_text("advanced\n", encoding="utf-8")
+        git(self.repo, "add", "later.txt")
+        git(self.repo, "commit", "-m", "advance main again")
+        advanced_base = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+        reanchored = CandidateBaseReanchorer(
+            candidate_collector=self.collector,
+            main_branch="main",
+            max_attempts=2,
+        ).stabilize(candidate)
+
+        self.assertEqual(candidate.base_main, self.base)
+        self.assertEqual(candidate.comparison_base, merged_base)
+        self.assertEqual(reanchored.base_main, advanced_base)
+        self.assertEqual(reanchored.comparison_base, advanced_base)
+        self.assertEqual(reanchored.changed_paths, ("candidate.txt",))
+        self.assertEqual(
+            self.store.read_records()[-1]["outcome"],
+            "re-anchored-clean",
         )
 
     def test_unchanged_base_records_typed_noop(self) -> None:
@@ -4950,6 +5263,26 @@ class ReviewRouterTests(unittest.TestCase):
                 ),
             ),
             candidate_recorded=True,
+        )
+
+    def test_review_request_uses_candidate_comparison_base(self) -> None:
+        candidate = dataclasses.replace(
+            self.candidate,
+            comparison_base="d" * 40,
+        )
+        request = ReviewRequest(
+            run_id="run-1",
+            task_id="TASK-01",
+            candidate=candidate,
+            gate_results=(),
+            policy_references=("REVIEW.md",),
+        )
+
+        payload = request.to_payload()
+
+        self.assertEqual(
+            payload["candidate"]["diff_source"],
+            f"git diff {'d' * 40}...{'b' * 40}",
         )
 
     def agent(self, provider: str, *, command: str | None = None) -> AgentConfig:

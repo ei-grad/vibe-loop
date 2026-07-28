@@ -579,6 +579,7 @@ class CandidateRecord:
     head_commit: str
     changed_paths: tuple[str, ...]
     source: str
+    comparison_base: str = ""
 
     def __post_init__(self) -> None:
         if self.source not in CANDIDATE_RECORD_SOURCE_KINDS:
@@ -604,6 +605,7 @@ class CandidateRecord:
             "head_commit": self.head_commit,
             "changed_paths": list(self.changed_paths),
             "source": self.source,
+            "comparison_base": self.comparison_base or self.base_main,
             "candidate_fingerprint": self.fingerprint,
         }
 
@@ -617,6 +619,7 @@ class CandidateRecord:
         head_commit = record.get("head_commit")
         changed_paths = record.get("changed_paths")
         source = record.get("source")
+        comparison_base = record.get("comparison_base", base_main)
         if (
             not isinstance(branch, str)
             or not isinstance(worktree, str)
@@ -625,6 +628,7 @@ class CandidateRecord:
             or not isinstance(changed_paths, list)
             or not all(isinstance(path, str) for path in changed_paths)
             or source not in CANDIDATE_RECORD_SOURCE_KINDS
+            or not isinstance(comparison_base, str)
         ):
             return None
         candidate = cls(
@@ -634,6 +638,7 @@ class CandidateRecord:
             head_commit=head_commit,
             changed_paths=tuple(changed_paths),
             source=str(source),
+            comparison_base=comparison_base,
         )
         if record.get("candidate_fingerprint") != candidate.fingerprint:
             return None
@@ -671,6 +676,7 @@ class CandidateScopePolicy:
             },
             "changed_paths": list(candidate.changed_paths),
             "unmatched_paths": list(candidate.changed_paths),
+            "comparison_base": candidate.comparison_base or candidate.base_main,
         }
         if not self.known:
             return CandidateScopeAssessment(
@@ -733,6 +739,7 @@ class CandidateCollector:
         run_store: object,
         run_id: str,
         task_id: str,
+        main_branch: str = "main",
         scope_policy: CandidateScopePolicy | None = None,
     ) -> None:
         self.worktree = worktree.resolve()
@@ -741,6 +748,7 @@ class CandidateCollector:
         self.run_store = run_store
         self.run_id = run_id
         self.task_id = task_id
+        self.main_branch = main_branch
         self.scope_policy = scope_policy
         self.last_scope_assessment: CandidateScopeAssessment | None = None
 
@@ -800,9 +808,11 @@ class CandidateCollector:
         self.last_scope_assessment = assessment
         self._record_scope_assessment(candidate, assessment)
         if assessment.outcome == "drift":
+            comparison_base = candidate.comparison_base or candidate.base_main
             raise CandidateCollectionError(
                 "candidate_scope_drift",
-                "candidate changed paths fall outside the task's declared path domains",
+                "candidate changed paths relative to comparison base "
+                f"{comparison_base} fall outside the task's declared path domains",
                 details=assessment.details,
             )
 
@@ -832,6 +842,7 @@ class CandidateCollector:
         *,
         source: str,
         base_main: str | None = None,
+        comparison_base: str | None = None,
     ) -> CandidateRecord:
         observed_branch = self._git_text("branch", "--show-current")
         if observed_branch != self.branch:
@@ -864,12 +875,17 @@ class CandidateCollector:
                 "candidate workspace has uncommitted tracked changes",
                 details={"status": tracked_status.splitlines()[:20]},
             )
+        resolved_comparison_base = self._resolve_comparison_base(
+            head_commit=head_commit,
+            base_main=resolved_base,
+            comparison_base=comparison_base,
+        )
         changed = self._git_bytes(
             "diff",
             "--name-only",
             "--diff-filter=ACDMRTUXB",
             "-z",
-            f"{resolved_base}...{head_commit}",
+            f"{resolved_comparison_base}...{head_commit}",
         )
         changed_paths = tuple(
             sorted(
@@ -885,7 +901,87 @@ class CandidateCollector:
             head_commit=head_commit,
             changed_paths=changed_paths,
             source=source,
+            comparison_base=resolved_comparison_base,
         )
+
+    def _resolve_comparison_base(
+        self,
+        *,
+        head_commit: str,
+        base_main: str,
+        comparison_base: str | None,
+    ) -> str:
+        if comparison_base:
+            resolved = self._git_text("rev-parse", "--verify", comparison_base)
+            if (
+                self._git_result(
+                    "merge-base",
+                    "--is-ancestor",
+                    resolved,
+                    head_commit,
+                ).returncode
+                != 0
+            ):
+                raise CandidateCollectionError(
+                    "candidate_comparison_base_mismatch",
+                    "candidate head does not descend from its recorded comparison base",
+                    details={
+                        "comparison_base": resolved,
+                        "head_commit": head_commit,
+                    },
+                )
+            return resolved
+
+        main_result = self._git_result(
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{self.main_branch}^{{commit}}",
+        )
+        main_head = main_result.stdout.strip()
+        if main_result.returncode == 1:
+            return base_main
+        if main_result.returncode != 0 or not main_head:
+            raise CandidateCollectionError(
+                "candidate_git_error",
+                "candidate mainline revision could not be read",
+                details={
+                    "main_branch": self.main_branch,
+                    "stderr": main_result.stderr.strip(),
+                },
+            )
+        merge_base_result = self._git_result("merge-base", head_commit, main_head)
+        resolved = merge_base_result.stdout.strip()
+        if merge_base_result.returncode == 1:
+            return base_main
+        if merge_base_result.returncode != 0 or not resolved:
+            raise CandidateCollectionError(
+                "candidate_git_error",
+                "candidate comparison base could not be read",
+                details={
+                    "main_branch": self.main_branch,
+                    "stderr": merge_base_result.stderr.strip(),
+                },
+            )
+        anchor_relation = self._git_result(
+            "merge-base",
+            "--is-ancestor",
+            base_main,
+            resolved,
+        )
+        if anchor_relation.returncode == 1:
+            return base_main
+        if anchor_relation.returncode != 0:
+            raise CandidateCollectionError(
+                "candidate_git_error",
+                "candidate comparison base ancestry could not be read",
+                details={
+                    "base_main": base_main,
+                    "comparison_base": resolved,
+                    "stderr": anchor_relation.stderr.strip(),
+                },
+            )
+        return resolved
 
     def matches(self, candidate: CandidateRecord) -> bool:
         try:
@@ -893,6 +989,7 @@ class CandidateCollector:
                 self.snapshot(
                     source=candidate.source,
                     base_main=candidate.base_main,
+                    comparison_base=candidate.comparison_base or candidate.base_main,
                 ).fingerprint
                 == candidate.fingerprint
             )
@@ -1140,7 +1237,7 @@ class CandidateBaseReanchorer:
             attempted_in_call = True
             previous = candidate
             previous_diff = self._candidate_diff(
-                previous.base_main,
+                previous.comparison_base or previous.base_main,
                 previous.head_commit,
             )
             # Ambient Git config must not decide whether the rebase is clean.
@@ -1181,7 +1278,10 @@ class CandidateBaseReanchorer:
             )
             if (
                 rebased.changed_paths != previous.changed_paths
-                or self._candidate_diff(rebased.base_main, rebased.head_commit)
+                or self._candidate_diff(
+                    rebased.comparison_base or rebased.base_main,
+                    rebased.head_commit,
+                )
                 != previous_diff
             ):
                 self._restore_candidate(previous.head_commit, observed_base, attempts)
@@ -1555,7 +1655,7 @@ class ReviewRequest:
             "candidate": {
                 **self.candidate.to_payload(),
                 "diff_source": (
-                    f"git diff {self.candidate.base_main}..."
+                    f"git diff {self.candidate.comparison_base or self.candidate.base_main}..."
                     f"{self.candidate.head_commit}"
                 ),
             },

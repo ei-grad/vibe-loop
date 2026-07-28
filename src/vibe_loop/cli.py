@@ -2571,6 +2571,7 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
                 run_store=run_store,
                 run_id=run_id,
                 task_id=task_id,
+                main_branch=config.main_branch,
                 scope_policy=CandidateScopePolicy(
                     known=active.conflict_domains_known,
                     resources=active.resources,
