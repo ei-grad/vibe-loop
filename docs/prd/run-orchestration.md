@@ -212,16 +212,10 @@ when the runtime-selected reviewer provider supports session injection and the
 approving pass used the injected or resumed identity; it is `agent-reported`
 for every non-injecting provider, regardless of the source label the reviewer
 reports. The quality variable is absent whenever the session variable is
-absent and from task-source transitions other than completion. A completion
-backend must persist the quality with the reviewer actor and expose it in task
-history rather than treating the two qualities as equivalent.
-
-Agent-reported identities are accepted and recorded by default so legitimate
-non-injecting reviewer providers remain usable. Each project may instead
-require `runtime-bound` identity through explicit task-source backend policy;
-that policy must refuse an agent-reported completion before changing project
-state. A backend that supports neither recording the quality nor an explicit
-policy does not implement this completion contract.
+absent and from task-source transitions other than completion. The runtime
+exports both qualities without deciding whether a task-source backend accepts
+an agent-reported identity; persistence, history presentation, and per-project
+completion policy belong to the task-source backend contract.
 
 The exact runtime-owned Codex reviewer command `codex review {prompt}` has no
 supported way to bind a first-class provider/model/effort route without changing
