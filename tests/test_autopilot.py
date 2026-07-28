@@ -76,6 +76,7 @@ from vibe_loop.autopilot import (
     NativePlanningWorkerInterrupted,
     ProjectEntry,
     ProjectRegistry,
+    SupervisorStatus,
     TaskQueueStatus,
     WorktreeDispositionCycleResult,
     apply_autopilot_reload_request,
@@ -2237,6 +2238,7 @@ class AutopilotRunTests(unittest.TestCase):
             )
 
         self.assertTrue(stale_report["stale"])
+        self.assertEqual(stale_report["commit_relation"], "supervisor_behind")
         self.assertEqual(stale_report["commits_behind"], 2)
         self.assertEqual(
             stale_report["changed_files"],
@@ -2255,6 +2257,7 @@ class AutopilotRunTests(unittest.TestCase):
                     ],
                     "changed_files_truncated": 0,
                     "identity_source": "recorded",
+                    "commit_relation": "supervisor_behind",
                     "message": (
                         "the running supervisor uses older runtime code "
                         "(2 intervening runtime commits); restart it after "
@@ -2264,7 +2267,82 @@ class AutopilotRunTests(unittest.TestCase):
             ),
         )
         self.assertFalse(fresh_report["stale"])
+        self.assertEqual(fresh_report["commit_relation"], "same")
         self.assertEqual(fresh_advisories, ())
+
+    def test_supervisor_code_staleness_does_not_reverse_checkout_direction(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runtime_path = repo / "src" / "vibe_loop"
+            runtime_path.mkdir(parents=True)
+            (runtime_path / "runtime.py").write_text("VALUE = 1\n", encoding="utf-8")
+            run(repo, "git", "init")
+            run(repo, "git", "config", "user.email", "test@example.com")
+            run(repo, "git", "config", "user.name", "Test User")
+            run(repo, "git", "add", ".")
+            run(repo, "git", "commit", "-m", "initial runtime")
+            older_identity = runtime_code_identity(runtime_path)
+
+            (runtime_path / "runtime.py").write_text("VALUE = 2\n", encoding="utf-8")
+            run(repo, "git", "add", ".")
+            run(repo, "git", "commit", "-m", "newer runtime")
+            supervisor_identity = runtime_code_identity(runtime_path)
+
+            report, advisories = supervisor_code_staleness(
+                {"code_identity": supervisor_identity},
+                current_identity=older_identity,
+                running=True,
+            )
+
+        self.assertEqual(report["commit_relation"], "supervisor_ahead")
+        self.assertFalse(report["stale"])
+        self.assertIsNone(report["commits_behind"])
+        self.assertEqual(report["changed_files"], [])
+        self.assertEqual(advisories, ())
+
+    def test_supervisor_code_staleness_includes_bundled_skill_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runtime_path = repo / "src" / "vibe_loop"
+            skill_path = runtime_path / "skills" / "example" / "SKILL.md"
+            runtime_path.mkdir(parents=True)
+            (runtime_path / "runtime.py").write_text("VALUE = 1\n", encoding="utf-8")
+            run(repo, "git", "init")
+            run(repo, "git", "config", "user.email", "test@example.com")
+            run(repo, "git", "config", "user.name", "Test User")
+            run(repo, "git", "add", ".")
+            run(repo, "git", "commit", "-m", "initial runtime")
+            started_identity = runtime_code_identity(runtime_path)
+
+            skill_path.parent.mkdir(parents=True)
+            skill_path.write_text("# Example\n", encoding="utf-8")
+            run(repo, "git", "add", ".")
+            run(repo, "git", "commit", "-m", "add bundled skill")
+            current_identity = runtime_code_identity(runtime_path)
+
+            report, advisories = supervisor_code_staleness(
+                {"code_identity": started_identity},
+                current_identity=current_identity,
+                running=True,
+            )
+
+        self.assertNotEqual(
+            started_identity["fingerprint"],
+            current_identity["fingerprint"],
+        )
+        self.assertEqual(report["commit_relation"], "supervisor_behind")
+        self.assertTrue(report["stale"])
+        self.assertEqual(report["commits_behind"], 1)
+        self.assertEqual(
+            report["changed_files"],
+            ["src/vibe_loop/skills/example/SKILL.md"],
+        )
+        self.assertEqual(
+            [advisory["code"] for advisory in advisories],
+            ["supervisor_code_stale"],
+        )
 
     def test_supervisor_code_staleness_ignores_non_runtime_commits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2297,6 +2375,85 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertEqual(report["commits_behind"], 0)
         self.assertEqual(report["changed_files"], [])
         self.assertEqual(advisories, ())
+
+    def test_inferred_code_identity_and_truncated_files_are_rendered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime_repo = root / "runtime"
+            runtime_path = runtime_repo / "src" / "vibe_loop"
+            runtime_path.mkdir(parents=True)
+            (runtime_path / "runtime.py").write_text("VALUE = 1\n", encoding="utf-8")
+            run(runtime_repo, "git", "init")
+            run(runtime_repo, "git", "config", "user.email", "test@example.com")
+            run(runtime_repo, "git", "config", "user.name", "Test User")
+            run(runtime_repo, "git", "add", ".")
+            commit_environment = {
+                **os.environ,
+                "GIT_AUTHOR_DATE": "2026-07-20T00:00:00+00:00",
+                "GIT_COMMITTER_DATE": "2026-07-20T00:00:00+00:00",
+            }
+            subprocess.run(
+                ["git", "commit", "-m", "initial runtime"],
+                cwd=runtime_repo,
+                check=True,
+                env=commit_environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            for index in range(25):
+                (runtime_path / f"changed_{index:02d}.py").write_text(
+                    f"VALUE = {index}\n",
+                    encoding="utf-8",
+                )
+            run(runtime_repo, "git", "add", ".")
+            commit_environment.update(
+                {
+                    "GIT_AUTHOR_DATE": "2026-07-21T00:00:00+00:00",
+                    "GIT_COMMITTER_DATE": "2026-07-21T00:00:00+00:00",
+                }
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "change runtime"],
+                cwd=runtime_repo,
+                check=True,
+                env=commit_environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            current_identity = runtime_code_identity(runtime_path)
+            report, advisories = supervisor_code_staleness(
+                {"occurred_at": "2026-07-20T12:00:00+00:00"},
+                current_identity=current_identity,
+                running=True,
+            )
+
+            status_repo = root / "status"
+            status_repo.mkdir()
+            configured_repo(
+                status_repo,
+                [("TASK-01", "Next", "", "ready slice")],
+            )
+            status = collect_project_status(load_config(status_repo))
+            status = dataclasses.replace(
+                status,
+                supervisor=SupervisorStatus(
+                    code=report,
+                    advisories=advisories,
+                ),
+                advisories=advisories,
+            )
+            rendered = render_autopilot_status(status)
+
+        self.assertEqual(report["identity_source"], "inferred_from_start_time")
+        self.assertEqual(report["commit_relation"], "supervisor_behind")
+        self.assertTrue(report["stale"])
+        self.assertEqual(report["commits_behind"], 1)
+        self.assertEqual(len(report["changed_files"]), 20)
+        self.assertEqual(report["changed_files_truncated"], 5)
+        self.assertIn("identity_source=inferred_from_start_time", rendered)
+        self.assertIn("commit_relation=supervisor_behind", rendered)
+        self.assertIn("changed_files_truncated=5", rendered)
 
     def test_supervisor_status_reports_stale_code_and_restart_clears(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

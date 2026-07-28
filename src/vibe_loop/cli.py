@@ -1207,7 +1207,10 @@ def dispatch(args: argparse.Namespace) -> int:
                 "perspective": "file_as_loaded_now",
             }
         )
-        if supervisor.advisories:
+        if any(
+            advisory.get("code") == "supervisor_config_stale"
+            for advisory in supervisor.advisories
+        ):
             config_report["note"] = (
                 "this config block reports the file as it would be loaded now, "
                 "not the configuration used by the running supervisor"
@@ -1900,6 +1903,8 @@ def render_autopilot_status(status: ProjectStatus) -> str:
             "supervisor code: "
             f"start={supervisor.code.get('started_commit') or 'unavailable'} "
             f"current={supervisor.code.get('current_commit') or 'unavailable'} "
+            f"identity_source={supervisor.code.get('identity_source') or 'unknown'} "
+            f"commit_relation={supervisor.code.get('commit_relation') or 'unknown'} "
             f"runtime_commits_behind={distance} "
             f"stale={str(bool(supervisor.code.get('stale'))).lower()}"
         )
@@ -1990,10 +1995,21 @@ def render_autopilot_status(status: ProjectStatus) -> str:
                     else "unknown"
                 )
                 changed_files = ", ".join(advisory.get("changed_files", []))
+                changed_files_truncated = advisory.get("changed_files_truncated")
+                omitted = (
+                    changed_files_truncated
+                    if isinstance(changed_files_truncated, int)
+                    else 0
+                )
                 lines.append(
                     f"  - supervisor_code_stale: "
                     f"runtime_commits_behind={distance}"
+                    f" identity_source="
+                    f"{advisory.get('identity_source') or 'unknown'}"
+                    f" commit_relation="
+                    f"{advisory.get('commit_relation') or 'unknown'}"
                     + (f" changed_files={changed_files}" if changed_files else "")
+                    + (f" changed_files_truncated={omitted}" if omitted else "")
                 )
             else:
                 changed_keys = ", ".join(advisory.get("changed_keys", []))

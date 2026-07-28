@@ -1228,7 +1228,13 @@ def runtime_code_identity(runtime_path: Path | None = None) -> dict[str, object]
     )
     digest = hashlib.sha256()
     try:
-        source_files = sorted(runtime_path.rglob("*.py"))
+        source_files = sorted(
+            path
+            for path in runtime_path.rglob("*")
+            if path.is_file()
+            and "__pycache__" not in path.parts
+            and path.suffix not in {".pyc", ".pyo"}
+        )
         for source_file in source_files:
             digest.update(source_file.relative_to(runtime_path).as_posix().encode())
             digest.update(b"\0")
@@ -1694,20 +1700,30 @@ def supervisor_code_staleness(
     commits_behind: int | None = None
     changed_files: tuple[str, ...] = ()
     changed_files_truncated = 0
+    commit_relation = "unknown"
     if (
         started_commit
         and current_commit
-        and started_commit != current_commit
         and source_root.is_dir()
         and relative_runtime_path
     ):
-        merge_base, merge_base_error = git_text(
-            source_root,
-            "merge-base",
-            started_commit,
-            current_commit,
-        )
-        if not merge_base_error and merge_base == started_commit:
+        if started_commit == current_commit:
+            commit_relation = "same"
+        else:
+            merge_base, merge_base_error = git_text(
+                source_root,
+                "merge-base",
+                started_commit,
+                current_commit,
+            )
+            if not merge_base_error:
+                if merge_base == started_commit:
+                    commit_relation = "supervisor_behind"
+                elif merge_base == current_commit:
+                    commit_relation = "supervisor_ahead"
+                else:
+                    commit_relation = "diverged"
+        if commit_relation == "supervisor_behind":
             count_text, count_error = git_text(
                 source_root,
                 "rev-list",
@@ -1721,19 +1737,21 @@ def supervisor_code_staleness(
                     commits_behind = int(count_text)
                 except ValueError:
                     commits_behind = None
-        files_text, files_error = git_text(
-            source_root,
-            "diff",
-            "--name-only",
-            started_commit,
-            current_commit,
-            "--",
-            relative_runtime_path,
-        )
-        if not files_error:
-            all_changed_files = tuple(line for line in files_text.splitlines() if line)
-            changed_files = all_changed_files[:20]
-            changed_files_truncated = max(0, len(all_changed_files) - 20)
+            files_text, files_error = git_text(
+                source_root,
+                "diff",
+                "--name-only",
+                started_commit,
+                current_commit,
+                "--",
+                relative_runtime_path,
+            )
+            if not files_error:
+                all_changed_files = tuple(
+                    line for line in files_text.splitlines() if line
+                )
+                changed_files = all_changed_files[:20]
+                changed_files_truncated = max(0, len(all_changed_files) - 20)
 
     if started_fingerprint and current_fingerprint:
         identity_changed = started_fingerprint != current_fingerprint
@@ -1744,13 +1762,22 @@ def supervisor_code_staleness(
             started_commit and current_commit and started_commit != current_commit
         )
 
-    stale = running and identity_changed
+    stale = (
+        running
+        and identity_changed
+        and commit_relation
+        in {
+            "same",
+            "supervisor_behind",
+        }
+    )
     report: dict[str, object] = {
         "started_commit": started_commit,
         "current_commit": current_commit,
         "started_fingerprint": started_fingerprint,
         "current_fingerprint": current_fingerprint,
         "identity_source": identity_source,
+        "commit_relation": commit_relation,
         "stale": stale,
         "commits_behind": commits_behind,
         "changed_files": list(changed_files),
@@ -1759,11 +1786,21 @@ def supervisor_code_staleness(
     if not stale:
         return report, ()
 
-    distance = (
-        f"{commits_behind} intervening runtime commits"
-        if commits_behind is not None
-        else "an unknown runtime commit distance"
-    )
+    if commit_relation == "supervisor_behind":
+        distance = (
+            f"{commits_behind} intervening runtime commits"
+            if commits_behind is not None
+            else "an unknown runtime commit distance"
+        )
+        message = (
+            f"the running supervisor uses older runtime code ({distance}); "
+            "restart it after active workers finish"
+        )
+    else:
+        message = (
+            "the running supervisor code differs from the status process at "
+            "the same commit; inspect local runtime changes before restarting"
+        )
     advisory = {
         "code": "supervisor_code_stale",
         "severity": "warning",
@@ -1771,10 +1808,8 @@ def supervisor_code_staleness(
         "changed_files": list(changed_files),
         "changed_files_truncated": changed_files_truncated,
         "identity_source": identity_source,
-        "message": (
-            f"the running supervisor uses older runtime code ({distance}); "
-            "restart it after active workers finish"
-        ),
+        "commit_relation": commit_relation,
+        "message": message,
     }
     return report, (advisory,)
 

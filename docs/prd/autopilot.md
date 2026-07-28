@@ -181,6 +181,11 @@ bounded changed-file list when Git history is available. The advisory clears
 when a restarted supervisor records the current identity. For start records
 created before code identity was recorded, status may derive the starting
 runtime commit from the record time and must label that identity as inferred.
+Runtime identity covers executable modules and bundled runtime assets. Status
+must verify that the current checkout descends from the supervisor commit before
+describing the supervisor as behind or recommending a restart; an ahead or
+diverged supervisor is not stale relative to that checkout. A bounded
+changed-file list must state how many additional entries were omitted.
 Code staleness is advisory only and never authorizes a restart while workers
 are active.
 
