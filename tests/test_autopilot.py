@@ -2304,6 +2304,48 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertEqual(report["changed_files"], [])
         self.assertEqual(advisories, ())
 
+    def test_supervisor_code_staleness_reports_fingerprint_only_mismatch(
+        self,
+    ) -> None:
+        started_identity = {"fingerprint": "sha256:started"}
+        current_identity = {"fingerprint": "sha256:current"}
+
+        stale_report, stale_advisories = supervisor_code_staleness(
+            {"code_identity": started_identity},
+            current_identity=current_identity,
+            running=True,
+        )
+        fresh_report, fresh_advisories = supervisor_code_staleness(
+            {"code_identity": current_identity},
+            current_identity=current_identity,
+            running=True,
+        )
+
+        self.assertEqual(stale_report["commit_relation"], "unknown")
+        self.assertTrue(stale_report["stale"])
+        self.assertIsNone(stale_report["commits_behind"])
+        self.assertEqual(
+            stale_advisories,
+            (
+                {
+                    "code": "supervisor_code_stale",
+                    "severity": "warning",
+                    "commits_behind": None,
+                    "changed_files": [],
+                    "changed_files_truncated": 0,
+                    "identity_source": "recorded",
+                    "commit_relation": "unknown",
+                    "message": (
+                        "the running supervisor code differs from the status "
+                        "process, but Git history cannot establish which is "
+                        "newer; compare runtime installations before restarting"
+                    ),
+                },
+            ),
+        )
+        self.assertFalse(fresh_report["stale"])
+        self.assertEqual(fresh_advisories, ())
+
     def test_supervisor_code_staleness_includes_bundled_skill_changes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

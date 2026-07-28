@@ -1762,14 +1762,14 @@ def supervisor_code_staleness(
             started_commit and current_commit and started_commit != current_commit
         )
 
+    fingerprint_comparable = bool(started_fingerprint and current_fingerprint)
     stale = (
         running
         and identity_changed
-        and commit_relation
-        in {
-            "same",
-            "supervisor_behind",
-        }
+        and (
+            commit_relation in {"same", "supervisor_behind"}
+            or (commit_relation == "unknown" and fingerprint_comparable)
+        )
     )
     report: dict[str, object] = {
         "started_commit": started_commit,
@@ -1796,10 +1796,16 @@ def supervisor_code_staleness(
             f"the running supervisor uses older runtime code ({distance}); "
             "restart it after active workers finish"
         )
-    else:
+    elif commit_relation == "same":
         message = (
             "the running supervisor code differs from the status process at "
             "the same commit; inspect local runtime changes before restarting"
+        )
+    else:
+        message = (
+            "the running supervisor code differs from the status process, but "
+            "Git history cannot establish which is newer; compare runtime "
+            "installations before restarting"
         )
     advisory = {
         "code": "supervisor_code_stale",
