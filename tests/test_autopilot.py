@@ -97,6 +97,7 @@ from vibe_loop.autopilot import (
     recheck_sleep_slices,
     reload_detached_autopilot,
     reload_autopilot_cycle_config,
+    runtime_code_identity,
     run_autopilot,
     run_maintenance_command,
     launch_native_planning_worker,
@@ -106,6 +107,8 @@ from vibe_loop.autopilot import (
     run_worktree_disposition,
     sleep_until_stop,
     start_detached_autopilot,
+    detached_autopilot_command,
+    supervisor_code_staleness,
     cleanup_detached_candidate,
     OwnedProcessIdentity,
     drain_owned_process_tree,
@@ -2097,6 +2100,117 @@ class AutopilotRunTests(unittest.TestCase):
                 for record in policy_records
             )
         )
+        started = next(
+            record
+            for record in records
+            if record["record_type"] == AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE
+        )
+        self.assertTrue(started["code_identity"]["fingerprint"].startswith("sha256:"))
+
+    def test_supervisor_code_staleness_reports_runtime_commits_and_clears(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runtime_path = repo / "src" / "vibe_loop"
+            runtime_path.mkdir(parents=True)
+            (runtime_path / "runtime.py").write_text("VALUE = 1\n", encoding="utf-8")
+            run(repo, "git", "init")
+            run(repo, "git", "config", "user.email", "test@example.com")
+            run(repo, "git", "config", "user.name", "Test User")
+            run(repo, "git", "add", ".")
+            run(repo, "git", "commit", "-m", "initial runtime")
+            started_identity = runtime_code_identity(runtime_path)
+
+            (runtime_path / "runtime.py").write_text("VALUE = 2\n", encoding="utf-8")
+            run(repo, "git", "add", ".")
+            run(repo, "git", "commit", "-m", "change runtime")
+            (runtime_path / "extra.py").write_text("EXTRA = True\n", encoding="utf-8")
+            run(repo, "git", "add", ".")
+            run(repo, "git", "commit", "-m", "extend runtime")
+            current_identity = runtime_code_identity(runtime_path)
+
+            stale_report, stale_advisories = supervisor_code_staleness(
+                {
+                    "occurred_at": "2026-07-28T00:00:00+00:00",
+                    "code_identity": started_identity,
+                },
+                current_identity=current_identity,
+                running=True,
+            )
+            fresh_report, fresh_advisories = supervisor_code_staleness(
+                {
+                    "occurred_at": "2026-07-28T00:00:00+00:00",
+                    "code_identity": current_identity,
+                },
+                current_identity=current_identity,
+                running=True,
+            )
+
+        self.assertTrue(stale_report["stale"])
+        self.assertEqual(stale_report["commits_behind"], 2)
+        self.assertEqual(
+            stale_report["changed_files"],
+            ["src/vibe_loop/extra.py", "src/vibe_loop/runtime.py"],
+        )
+        self.assertEqual(
+            stale_advisories,
+            (
+                {
+                    "code": "supervisor_code_stale",
+                    "severity": "warning",
+                    "commits_behind": 2,
+                    "changed_files": [
+                        "src/vibe_loop/extra.py",
+                        "src/vibe_loop/runtime.py",
+                    ],
+                    "changed_files_truncated": 0,
+                    "identity_source": "recorded",
+                    "message": (
+                        "the running supervisor uses older runtime code "
+                        "(2 intervening runtime commits); restart it after "
+                        "active workers finish"
+                    ),
+                },
+            ),
+        )
+        self.assertFalse(fresh_report["stale"])
+        self.assertEqual(fresh_advisories, ())
+
+    def test_detached_command_preserves_full_start_argument_set(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            command = detached_autopilot_command(
+                load_config(repo),
+                jobs=3,
+                reload_config_jobs=True,
+                interval=120,
+                once=True,
+                max_cycles=4,
+                ask_agent=True,
+                continue_on_failure=True,
+                max_slices=5,
+                max_tasks=6,
+                min_ready=7,
+                dispatch_min_ready=8,
+            )
+
+        self.assertIn("--detached-reload-signal", command)
+        self.assertIn("--reload-config-jobs", command)
+        self.assertIn("--once", command)
+        self.assertIn("--ask-agent", command)
+        self.assertIn("--continue-on-failure", command)
+        for option, expected in (
+            ("--jobs", "3"),
+            ("--interval", "120"),
+            ("--max-cycles", "4"),
+            ("--max-slices", "5"),
+            ("--max-tasks", "6"),
+            ("--min-ready", "7"),
+            ("--dispatch-min-ready", "8"),
+        ):
+            self.assertEqual(command[command.index(option) + 1], expected)
 
     def test_running_supervisor_reports_changed_config_keys(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

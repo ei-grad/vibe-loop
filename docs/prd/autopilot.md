@@ -173,6 +173,17 @@ per-cycle keys from restart-required keys. Once a per-cycle change is applied,
 it no longer appears stale. The per-key comparison material is internal
 journal data and must not appear in status output.
 
+The start record must also include the supervisor's import-time runtime-code
+identity. Status compares that identity with the code used by the status
+process. A running mismatch produces a typed `supervisor_code_stale` advisory
+with the number of intervening commits that touched the runtime package and a
+bounded changed-file list when Git history is available. The advisory clears
+when a restarted supervisor records the current identity. For start records
+created before code identity was recorded, status may derive the starting
+runtime commit from the record time and must label that identity as inferred.
+Code staleness is advisory only and never authorizes a restart while workers
+are active.
+
 An unreadable or invalid file at a cycle boundary does not terminate the
 supervisor or advance the applied snapshot. The cycle retains the last valid
 configuration, withholds dispatch, records `autopilot_config_reload_failed`,

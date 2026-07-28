@@ -1893,6 +1893,16 @@ def render_autopilot_status(status: ProjectStatus) -> str:
                     else ""
                 )
             )
+    if supervisor.code:
+        commits_behind = supervisor.code.get("commits_behind")
+        distance = str(commits_behind) if isinstance(commits_behind, int) else "unknown"
+        lines.append(
+            "supervisor code: "
+            f"start={supervisor.code.get('started_commit') or 'unavailable'} "
+            f"current={supervisor.code.get('current_commit') or 'unavailable'} "
+            f"runtime_commits_behind={distance} "
+            f"stale={str(bool(supervisor.code.get('stale'))).lower()}"
+        )
     lines.append(f"worktree disposition: {status.worktree_disposition_policy}")
     disposition = status.worktree_disposition
     if disposition:
@@ -1972,8 +1982,22 @@ def render_autopilot_status(status: ProjectStatus) -> str:
     if status.advisories:
         lines.append("advisories:")
         for advisory in status.advisories:
-            changed_keys = ", ".join(advisory.get("changed_keys", []))
-            lines.append(f"  - {advisory['code']}: {changed_keys}")
+            if advisory["code"] == "supervisor_code_stale":
+                commits_behind = advisory.get("commits_behind")
+                distance = (
+                    str(commits_behind)
+                    if isinstance(commits_behind, int)
+                    else "unknown"
+                )
+                changed_files = ", ".join(advisory.get("changed_files", []))
+                lines.append(
+                    f"  - supervisor_code_stale: "
+                    f"runtime_commits_behind={distance}"
+                    + (f" changed_files={changed_files}" if changed_files else "")
+                )
+            else:
+                changed_keys = ", ".join(advisory.get("changed_keys", []))
+                lines.append(f"  - {advisory['code']}: {changed_keys}")
     if status.last_cycle is not None:
         cycle = status.last_cycle
         lines.append(

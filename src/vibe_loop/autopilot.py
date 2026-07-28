@@ -277,6 +277,7 @@ class SupervisorStatus:
     record: dict[str, Any] | None = None
     blocker: str = ""
     config: dict[str, object] = dataclasses.field(default_factory=dict)
+    code: dict[str, object] = dataclasses.field(default_factory=dict)
     advisories: tuple[dict[str, object], ...] = ()
 
     def to_json(self) -> dict[str, object]:
@@ -293,6 +294,7 @@ class SupervisorStatus:
             "record": record,
             "blocker": self.blocker,
             "config": dict(self.config),
+            "code": dict(self.code),
             "advisories": [dict(advisory) for advisory in self.advisories],
         }
         redacted = redact_fencing_token_payload(payload)
@@ -1204,6 +1206,52 @@ def git_text(repo: Path, *args: str) -> tuple[str, str]:
     return result.stdout.strip(), ""
 
 
+def runtime_code_identity(runtime_path: Path | None = None) -> dict[str, object]:
+    runtime_path = (
+        runtime_path.resolve()
+        if runtime_path is not None
+        else Path(__file__).resolve().parent
+    )
+    digest = hashlib.sha256()
+    try:
+        source_files = sorted(runtime_path.rglob("*.py"))
+        for source_file in source_files:
+            digest.update(source_file.relative_to(runtime_path).as_posix().encode())
+            digest.update(b"\0")
+            digest.update(source_file.read_bytes())
+            digest.update(b"\0")
+    except OSError:
+        return {}
+    if not source_files:
+        return {}
+
+    identity: dict[str, object] = {
+        "fingerprint": "sha256:" + digest.hexdigest(),
+        "runtime_path": str(runtime_path),
+    }
+    source_root, root_error = git_text(runtime_path, "rev-parse", "--show-toplevel")
+    if root_error:
+        return identity
+    commit, commit_error = git_text(Path(source_root), "rev-parse", "--verify", "HEAD")
+    if commit_error:
+        return identity
+    try:
+        relative_runtime_path = runtime_path.relative_to(Path(source_root))
+    except ValueError:
+        return identity
+    identity.update(
+        {
+            "commit": commit,
+            "source_root": source_root,
+            "relative_runtime_path": relative_runtime_path.as_posix(),
+        }
+    )
+    return identity
+
+
+IMPORTED_RUNTIME_CODE_IDENTITY = runtime_code_identity()
+
+
 def git_status_excludes(
     repo: Path, ignored_dirty_paths: tuple[Path, ...]
 ) -> tuple[str, ...]:
@@ -1330,6 +1378,11 @@ def collect_supervisor_status(
                 current_config=current_config,
                 running=supervisor_lock.state == "held",
             )
+            code_report, code_advisories = supervisor_code_staleness(
+                config_record,
+                current_identity=IMPORTED_RUNTIME_CODE_IDENTITY,
+                running=supervisor_lock.state == "held",
+            )
             last_reload = latest_autopilot_reload_result(
                 records,
                 run_id=lock_run_id,
@@ -1357,7 +1410,8 @@ def collect_supervisor_status(
                 ),
                 record=(newest_record or supervisor_lock.metadata),
                 config=config_report,
-                advisories=advisories,
+                code=code_report,
+                advisories=(*advisories, *code_advisories),
             )
         if supervisor_lock.locked and supervisor_lock.state == "stale":
             lock_run_id = str(supervisor_lock.metadata.get("run_id") or "")
@@ -1578,6 +1632,134 @@ def supervisor_config_staleness(
         "per_cycle_keys": list(per_cycle_keys),
         "restart_required_keys": list(restart_required_keys),
         "message": message,
+    }
+    return report, (advisory,)
+
+
+def supervisor_code_staleness(
+    record: Mapping[str, Any] | None,
+    *,
+    current_identity: Mapping[str, object],
+    running: bool,
+) -> tuple[dict[str, object], tuple[dict[str, object], ...]]:
+    if record is None or not current_identity:
+        return {}, ()
+
+    started_identity = {
+        str(key): value
+        for key, value in dict(record.get("code_identity") or {}).items()
+    }
+    identity_source = "recorded"
+    current_commit = str(current_identity.get("commit") or "")
+    source_root = Path(str(current_identity.get("source_root") or ""))
+    relative_runtime_path = str(current_identity.get("relative_runtime_path") or "")
+    if not started_identity and current_commit and source_root.is_dir():
+        started_at = str(record.get("occurred_at") or "")
+        inferred_commit, error = git_text(
+            source_root,
+            "rev-list",
+            "-1",
+            f"--before={started_at}",
+            current_commit,
+            "--",
+            relative_runtime_path,
+        )
+        if not error and inferred_commit:
+            started_identity = {
+                "commit": inferred_commit,
+                "source_root": str(source_root),
+                "relative_runtime_path": relative_runtime_path,
+            }
+            identity_source = "inferred_from_start_time"
+    if not started_identity:
+        return {}, ()
+
+    started_commit = str(started_identity.get("commit") or "")
+    started_fingerprint = str(started_identity.get("fingerprint") or "")
+    current_fingerprint = str(current_identity.get("fingerprint") or "")
+    identity_changed = bool(
+        (started_commit and current_commit and started_commit != current_commit)
+        or (
+            started_fingerprint
+            and current_fingerprint
+            and started_fingerprint != current_fingerprint
+        )
+    )
+    commits_behind: int | None = None
+    changed_files: tuple[str, ...] = ()
+    changed_files_truncated = 0
+    if (
+        identity_changed
+        and started_commit
+        and current_commit
+        and source_root.is_dir()
+        and relative_runtime_path
+    ):
+        merge_base, merge_base_error = git_text(
+            source_root,
+            "merge-base",
+            started_commit,
+            current_commit,
+        )
+        if not merge_base_error and merge_base == started_commit:
+            count_text, count_error = git_text(
+                source_root,
+                "rev-list",
+                "--count",
+                f"{started_commit}..{current_commit}",
+                "--",
+                relative_runtime_path,
+            )
+            if not count_error:
+                try:
+                    commits_behind = int(count_text)
+                except ValueError:
+                    commits_behind = None
+        files_text, files_error = git_text(
+            source_root,
+            "diff",
+            "--name-only",
+            started_commit,
+            current_commit,
+            "--",
+            relative_runtime_path,
+        )
+        if not files_error:
+            all_changed_files = tuple(line for line in files_text.splitlines() if line)
+            changed_files = all_changed_files[:20]
+            changed_files_truncated = max(0, len(all_changed_files) - 20)
+
+    stale = running and identity_changed
+    report: dict[str, object] = {
+        "started_commit": started_commit,
+        "current_commit": current_commit,
+        "started_fingerprint": started_fingerprint,
+        "current_fingerprint": current_fingerprint,
+        "identity_source": identity_source,
+        "stale": stale,
+        "commits_behind": commits_behind,
+        "changed_files": list(changed_files),
+        "changed_files_truncated": changed_files_truncated,
+    }
+    if not stale:
+        return report, ()
+
+    distance = (
+        f"{commits_behind} intervening runtime commits"
+        if commits_behind is not None
+        else "an unknown runtime commit distance"
+    )
+    advisory = {
+        "code": "supervisor_code_stale",
+        "severity": "warning",
+        "commits_behind": commits_behind,
+        "changed_files": list(changed_files),
+        "changed_files_truncated": changed_files_truncated,
+        "identity_source": identity_source,
+        "message": (
+            f"the running supervisor uses older runtime code ({distance}); "
+            "restart it after active workers finish"
+        ),
     }
     return report, (advisory,)
 
@@ -8359,6 +8541,7 @@ def run_autopilot(
                 "config_path": str(config.config_path) if config.config_path else "",
                 "config_key_fingerprints": dict(config.config_key_fingerprints),
                 "reload_config_jobs": reload_config_jobs,
+                "code_identity": dict(IMPORTED_RUNTIME_CODE_IDENTITY),
             }
         )
         cycle_number = 0
