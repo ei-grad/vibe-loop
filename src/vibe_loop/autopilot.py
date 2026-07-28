@@ -4695,6 +4695,8 @@ def restartable_cycle_reason(
         reason = str(record.get("reason") or "")
         source = str(record.get("classification_source") or "")
         classification = str(record.get("classification") or record.get("status") or "")
+        if classification == "completed":
+            continue
         if source == "autopilot_stop":
             return source
         if classification == "timed_out" or source in {
@@ -4738,22 +4740,16 @@ def preserved_cycle_work(
     main_ref = f"refs/heads/{main_branch}"
     for branch, record in sorted(claims.items()):
         branch_ref = f"refs/heads/{branch}"
-        result = subprocess.run(
-            [
-                "git",
-                "rev-list",
-                "--count",
-                f"{main_ref}..{branch_ref}",
-            ],
-            cwd=repo,
-            text=True,
-            capture_output=True,
-            check=False,
+        count_text, error = git_text(
+            repo,
+            "rev-list",
+            "--count",
+            f"{main_ref}..{branch_ref}",
         )
-        if result.returncode != 0:
+        if error:
             continue
         try:
-            commit_count = int(result.stdout.strip())
+            commit_count = int(count_text)
         except ValueError:
             continue
         if commit_count <= 0:

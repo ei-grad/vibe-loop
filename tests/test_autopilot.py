@@ -71,6 +71,7 @@ from vibe_loop.autopilot import (
     planning_provider_launched,
     planning_source_fingerprint,
     preserved_cycle_work,
+    recent_cycle_summaries,
     restartable_cycle_reason,
     NativePlanningWorkerInterrupted,
     ProjectEntry,
@@ -517,6 +518,63 @@ class AutopilotStatusTests(unittest.TestCase):
         )
         self.assertIn(
             "restartable reason=restart_budget_exhausted",
+            rendered,
+        )
+
+    def test_preserved_work_round_trips_through_cycle_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            status = collect_project_status(config)
+            AutopilotCycleResult(
+                cycle_id="cycle-empty",
+                repo=config.repo,
+                status="completed",
+                occurred_at="2026-07-28T06:00:00+00:00",
+                project_status=status,
+            ).append_to(run_store)
+            preserved_work = (
+                {
+                    "task_id": "TASK-01",
+                    "branch": "vibe-loop/TASK-01",
+                    "commit_count": 2,
+                },
+                {
+                    "task_id": "TASK-02",
+                    "branch": "vibe-loop/TASK-02",
+                    "commit_count": 1,
+                },
+            )
+            AutopilotCycleResult(
+                cycle_id="cycle-preserved",
+                repo=config.repo,
+                status="restartable",
+                reason="child_exit_nonzero",
+                occurred_at="2026-07-28T06:05:22+00:00",
+                project_status=status,
+                preserved_work=preserved_work,
+            ).append_to(run_store)
+
+            updated = collect_project_status(config)
+            payload = updated.to_json()
+            rendered = render_autopilot_status(updated)
+            recent = recent_cycle_summaries(run_store)
+
+        self.assertEqual(recent[0].preserved_work, ())
+        self.assertEqual(recent[1].preserved_work, preserved_work)
+        self.assertEqual(
+            payload["last_cycle"]["preserved_work"],
+            [dict(item) for item in preserved_work],
+        )
+        self.assertIn("last cycle preserved work:", rendered)
+        self.assertIn(
+            "TASK-01 branch=vibe-loop/TASK-01 commits=2",
+            rendered,
+        )
+        self.assertIn(
+            "TASK-02 branch=vibe-loop/TASK-02 commits=1",
             rendered,
         )
 
@@ -6250,6 +6308,43 @@ class AutopilotRecheckTests(unittest.TestCase):
             "child_exit_nonzero",
         )
 
+    def test_restartable_cycle_reason_ignores_completed_runs(self) -> None:
+        failed = RunResult(
+            run_id="failed-run",
+            task_id="TASK-01",
+            classification="failed",
+            classification_source="exit_code_or_completion_check",
+            reason="exit_code_or_completion_check",
+            exit_code=1,
+            log_path=Path("/tmp/failed.log"),
+            start_main="base",
+            end_main="base",
+        ).to_record()
+        completed = RunResult(
+            run_id="completed-run",
+            task_id="TASK-02",
+            classification="completed",
+            classification_source="worker_report",
+            reason="worker_report",
+            exit_code=0,
+            log_path=Path("/tmp/completed.log"),
+            start_main="base",
+            end_main="candidate",
+        ).to_record()
+
+        self.assertEqual(
+            restartable_cycle_reason(1, [failed, completed]),
+            "exit_code_or_completion_check",
+        )
+        self.assertEqual(
+            restartable_cycle_reason(1, [completed]),
+            "child_exit_nonzero",
+        )
+        self.assertEqual(
+            restartable_cycle_reason(-9, [completed]),
+            "run_interrupted_or_killed",
+        )
+
     def test_restartable_cycle_records_preserved_branch_commit_count(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -6286,6 +6381,24 @@ class AutopilotRecheckTests(unittest.TestCase):
                 },
             ),
         )
+
+    def test_preserved_cycle_work_ignores_git_execution_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            missing_repo = Path(directory) / "missing"
+            preserved = preserved_cycle_work(
+                missing_repo,
+                "main",
+                [
+                    {
+                        "record_type": "workspace_claim",
+                        "run_id": "run-1",
+                        "task_id": "TASK-01",
+                        "branch": "vibe-loop/TASK-01",
+                    }
+                ],
+            )
+
+        self.assertEqual(preserved, ())
 
     def test_task_source_polling_includes_restartable_backoff(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
