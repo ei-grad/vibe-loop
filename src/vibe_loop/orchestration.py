@@ -875,7 +875,7 @@ class CandidateCollector:
         comparison_base = self._git_text(
             "merge-base",
             head_commit,
-            f"refs/heads/{self.main_branch}^{{commit}}",
+            f"refs/heads/{self._comparison_main_branch()}^{{commit}}",
         )
         changed = self._git_bytes(
             "diff",
@@ -900,6 +900,22 @@ class CandidateCollector:
             source=source,
             comparison_base=comparison_base,
         )
+
+    def _comparison_main_branch(self) -> str:
+        git_dir = self._git_text("rev-parse", "--absolute-git-dir")
+        common_dir = self._git_text(
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        )
+        if git_dir == common_dir:
+            return self.main_branch
+        return self._git_text(
+            f"--git-dir={common_dir}",
+            "symbolic-ref",
+            "--short",
+            "HEAD",
+        ).removeprefix("refs/heads/")
 
     def matches(self, candidate: CandidateRecord) -> bool:
         try:

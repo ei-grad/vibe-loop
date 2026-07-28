@@ -1629,6 +1629,42 @@ class RuntimeGateTests(unittest.TestCase):
         self.assertEqual(assessment["outcome"], "in_scope")
         self.assertEqual(assessment["comparison_base"], advanced_main)
 
+    def test_candidate_scope_uses_primary_branch_for_linked_worktree(self) -> None:
+        git(self.repo, "branch", "-m", "worker/task-01", "integration")
+        worker = Path(self.directory.name) / "linked-worker"
+        git(
+            self.repo,
+            "worktree",
+            "add",
+            "-b",
+            "worker/linked",
+            str(worker),
+            self.base,
+        )
+        git(worker, "commit", "--allow-empty", "-m", "empty worker commit")
+        (self.repo / "mainline.txt").write_text("mainline\n", encoding="utf-8")
+        git(self.repo, "add", "mainline.txt")
+        git(self.repo, "commit", "-m", "advance integration")
+        advanced_main = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        git(worker, "merge", "--no-edit", "integration")
+        collector = CandidateCollector(
+            worktree=worker,
+            branch="worker/linked",
+            base_main=self.base,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            scope_policy=CandidateScopePolicy(
+                known=True,
+                paths=("worker",),
+            ),
+        )
+
+        candidate = collector.collect_derived()
+
+        self.assertEqual(candidate.changed_paths, ())
+        self.assertEqual(candidate.comparison_base, advanced_main)
+
     def test_candidate_scope_names_drift_and_reports_comparison(self) -> None:
         collector = self.collector_with_scope(
             CandidateScopePolicy(

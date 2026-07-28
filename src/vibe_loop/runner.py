@@ -3097,7 +3097,6 @@ class VibeRunner:
                         run_store=self.run_store,
                         run_id=run_id,
                         task_id=task.task_id,
-                        main_branch=self.config.main_branch,
                         scope_policy=CandidateScopePolicy(
                             known=task.conflict_domains_known,
                             resources=task.resources,
@@ -4066,7 +4065,6 @@ class VibeRunner:
             run_store=self.run_store,
             run_id=run_id,
             task_id=task.task_id,
-            main_branch=self.config.main_branch,
             scope_policy=CandidateScopePolicy(
                 known=task.conflict_domains_known,
                 resources=task.resources,
