@@ -82,6 +82,7 @@ from vibe_loop.orchestration import (
     plan_session_continuation,
     provider_capabilities,
     require_candidate_review_clear,
+    verification_output_tail,
     workspace_retry_disposition,
 )
 from vibe_loop.runner import VibeRunner
@@ -3804,6 +3805,24 @@ class RuntimeIntegrationTests(unittest.TestCase):
         )
         self.assertIn("output tail:\n", rendered)
         self.assertIn("migration failed: lock contention", rendered)
+
+    def test_verification_output_retains_unterminated_and_carriage_return_logs(
+        self,
+    ) -> None:
+        log_path = self.repo / ".vibe-loop" / "integration" / "diagnostic.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_bytes(b"x" * 50_000)
+
+        single_line = verification_output_tail(log_path)
+
+        self.assertTrue(single_line)
+        self.assertLessEqual(len(single_line), 2000)
+        log_path.write_bytes((b"progress\r" * 2_000) + b"FATAL: verification failed")
+
+        carriage_return = verification_output_tail(log_path)
+
+        self.assertIn("FATAL: verification failed", carriage_return)
+        self.assertLessEqual(len(carriage_return), 2012)
 
     def test_main_recovery_refuses_to_overwrite_overlapping_worktree_change(
         self,

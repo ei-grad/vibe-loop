@@ -102,7 +102,13 @@ The payload includes queue counts, runnable tasks, active workers, stale locks,
 workspace and git diagnostics, the main-integration lock, supervisor state,
 blockers, project binding, the last cycle, and `disk_headroom` with its live
 filesystem reading, thresholds, verdict, and blocker evidence. It also includes
-a bounded projection of the latest `worktree_disposition` journal record,
+a `latest_main_verification_failure` projection when the latest terminal run
+ended for that reason, naming the failed command, exit status, and retained
+output tail. The key is an empty object when the latest terminal run has no such
+failure. Human-readable output prints the failure immediately after the
+non-closure summary, with the retained output on indented lines. The payload
+also includes a bounded projection of the latest `worktree_disposition` journal
+record,
 prioritizing refused, failed, and otherwise reapable worktrees and including
 their collection-time `keep_guardrails`, outcome guardrails, action errors, and
 non-removal reasons. The projection reports the total and omitted worktree

@@ -14,7 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -354,6 +354,120 @@ class AutopilotStatusTests(unittest.TestCase):
                 for blocker in payload["blockers"]
             )
         )
+
+    def test_status_views_surface_latest_main_verification_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            repo.mkdir()
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.integration_result(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    payload={
+                        "outcome": "failed",
+                        "status": "failed",
+                        "reason": "main_verification_failed",
+                        "branch": "worker/TASK-01",
+                        "candidate_head": "candidate",
+                        "refreshed_head": "candidate",
+                        "main_before": "base",
+                        "main_after": "base",
+                        "verification": [
+                            {
+                                "phase": "main",
+                                "command_key": "completion.commands[0]",
+                                "exit_class": "failed",
+                                "exit_code": 1,
+                                "duration_seconds": 0.25,
+                                "log_reference": "main-1.log",
+                                "evidence_digest": "sha256:digest",
+                                "output_tail": "backup lock unavailable",
+                            }
+                        ],
+                        "recovered": True,
+                        "diagnostics": {"main_recovery": "restored"},
+                    },
+                )
+            )
+            run_store.append_result(
+                RunResult(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    classification="failed",
+                    classification_source="main_verification_failed",
+                    exit_code=1,
+                    log_path=config.state_path / "runs" / "run-1.log",
+                    start_main="base",
+                    end_main="base",
+                )
+            )
+            registry = Path(directory) / "projects.json"
+
+            def invoke(*args: str) -> tuple[int, str]:
+                stdout = StringIO()
+                with redirect_stdout(stdout), redirect_stderr(StringIO()):
+                    exit_code = main(list(args))
+                return exit_code, stdout.getvalue()
+
+            register_code, _ = invoke(
+                "autopilot",
+                "projects",
+                "register",
+                "--repo",
+                str(repo),
+                "--name",
+                "demo",
+                "--registry",
+                str(registry),
+            )
+            status_text_code, status_text = invoke(
+                "autopilot", "status", "--repo", str(repo)
+            )
+            status_json_code, status_json = invoke(
+                "autopilot", "status", "--repo", str(repo), "--json"
+            )
+            project_text_code, project_text = invoke(
+                "autopilot",
+                "projects",
+                "inspect",
+                "demo",
+                "--registry",
+                str(registry),
+            )
+            project_json_code, project_json = invoke(
+                "autopilot",
+                "projects",
+                "inspect",
+                "demo",
+                "--registry",
+                str(registry),
+                "--json",
+            )
+
+        self.assertEqual(
+            (
+                register_code,
+                status_text_code,
+                status_json_code,
+                project_text_code,
+                project_json_code,
+            ),
+            (0, 0, 0, 0, 0),
+        )
+        expected_header = (
+            "main_verification_failed: task=TASK-01 run=run-1 "
+            "command=completion.commands[0] exit=1"
+        )
+        for rendered in (status_text, project_text):
+            self.assertIn(expected_header, rendered)
+            self.assertIn("output tail:\n    backup lock unavailable", rendered)
+        for encoded in (status_json, project_json):
+            failure = json.loads(encoded)["latest_main_verification_failure"]
+            self.assertEqual(failure["command_key"], "completion.commands[0]")
+            self.assertEqual(failure["output_tail"], "backup lock unavailable")
 
     def test_unapproved_run_does_not_reset_approved_non_closure_streak(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

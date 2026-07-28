@@ -3740,13 +3740,17 @@ def verification_output_tail(log_path: Path) -> str:
             offset = max(0, size - VERIFICATION_OUTPUT_READ_BYTES)
             stream.seek(offset)
             raw = stream.read()
+            if offset and b"\n" not in raw and b"\r" not in raw:
+                stream.seek(0)
+                raw = stream.read(VERIFICATION_OUTPUT_READ_BYTES)
+                offset = 0
     except OSError:
         return ""
-    text = raw.decode("utf-8", errors="replace")
+    text = (
+        raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    )
     if offset:
         newline = text.find("\n")
-        if newline < 0:
-            return ""
         text = text[newline + 1 :]
     bounded = bound_error_stream_for_redaction(text)
     redacted = redact_evidence_text(bounded)

@@ -1609,26 +1609,10 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
     command = getattr(args, "autopilot_command", None)
     if command == "status":
         status = collect_project_status(config)
-        verification_failure = RunStore(
-            config.state_path / "runs.jsonl"
-        ).latest_main_verification_failure()
-        verification_failure = redact_runtime_context_payload(
-            verification_failure,
-            config.runtime_context,
-        )
-        verification_failure = redact_fencing_token_payload(verification_failure)
-        assert isinstance(verification_failure, dict)
         if getattr(args, "json", False):
-            payload = status.to_json()
-            payload["latest_main_verification_failure"] = verification_failure
-            print(json.dumps(payload, indent=2, default=list))
+            print(json.dumps(status.to_json(), indent=2, default=list))
         else:
-            print(
-                render_autopilot_status(
-                    status,
-                    verification_failure=verification_failure,
-                )
-            )
+            print(render_autopilot_status(status))
         return 0
     if command == "projects":
         return dispatch_autopilot_projects(args)
@@ -1812,11 +1796,7 @@ def render_autopilot_reload(result) -> str:
     )
 
 
-def render_autopilot_status(
-    status: ProjectStatus,
-    *,
-    verification_failure: Mapping[str, object] | None = None,
-) -> str:
+def render_autopilot_status(status: ProjectStatus) -> str:
     lines = [f"repo: {status.display_name} ({status.repo})"]
     disk_headroom = status.disk_headroom
     targets = disk_headroom.get("targets")
@@ -1866,8 +1846,10 @@ def render_autopilot_status(
         f"consecutive={non_closure.consecutive}/"
         f"{non_closure.alarm_threshold}{alarm}; reasons: {reasons}"
     )
-    if verification_failure:
-        lines.extend(render_main_verification_failure(verification_failure))
+    if status.latest_main_verification_failure:
+        lines.extend(
+            render_main_verification_failure(status.latest_main_verification_failure)
+        )
     if status.alarms:
         lines.append("alarms:")
         lines.extend(f"  - {alarm}" for alarm in status.alarms)

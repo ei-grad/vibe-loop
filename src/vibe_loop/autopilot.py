@@ -440,6 +440,9 @@ class ProjectStatus:
     non_closure: NonClosureSummary = dataclasses.field(
         default_factory=NonClosureSummary
     )
+    latest_main_verification_failure: dict[str, object] = dataclasses.field(
+        default_factory=dict
+    )
     next_wake: str = ""
     attempt_circuit_breakers: tuple[dict[str, object], ...] = ()
     runtime_context: tuple[tuple[str, str], ...] = ()
@@ -485,6 +488,9 @@ class ProjectStatus:
                 self.last_cycle.to_json() if self.last_cycle is not None else None
             ),
             "non_closure": self.non_closure.to_json(),
+            "latest_main_verification_failure": dict(
+                self.latest_main_verification_failure
+            ),
             "next_wake": self.next_wake,
             "attempt_circuit_breakers": [
                 dict(breaker) for breaker in self.attempt_circuit_breakers
@@ -576,6 +582,7 @@ def collect_project_status(
     contract_blockers = config_contract_blockers(config)
     run_store = RunStore(config.state_path / "runs.jsonl")
     non_closure = summarize_non_closures(run_store)
+    latest_verification_failure = run_store.latest_main_verification_failure()
     troubleshoot = latest_native_troubleshoot(run_store)
     if disk_health_result is None:
         disk_health_result = run_disk_health(config, cycle_id="status")
@@ -612,6 +619,7 @@ def collect_project_status(
             ),
             last_cycle=latest_cycle_summary(run_store),
             non_closure=non_closure,
+            latest_main_verification_failure=latest_verification_failure,
             blockers=(
                 *(item.code for item in project_binding.diagnostics),
                 *(item.code for item in contract_blockers),
@@ -787,6 +795,7 @@ def collect_project_status(
         stranded_review_tasks=stranded_reviews,
         last_cycle=last_cycle,
         non_closure=non_closure,
+        latest_main_verification_failure=latest_verification_failure,
         next_wake=next_wake,
         attempt_circuit_breakers=attempt_circuit_breakers,
         runtime_context=config.runtime_context,
