@@ -414,6 +414,7 @@ class RunResult:
     stats: dict[str, object] = dataclasses.field(default_factory=dict)
     recovery_intent: dict[str, object] | None = None
     finished_at: str = dataclasses.field(default_factory=utc_now_iso)
+    reason: str = ""
 
     def to_json(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -428,6 +429,7 @@ class RunResult:
             "log": str(self.log_path),
             "start_main": self.start_main,
             "end_main": self.end_main,
+            "reason": self.reason,
             "message": self.message,
             "started_at": self.started_at,
             "agent_command_source": self.agent_command_source,
@@ -1439,6 +1441,7 @@ class RunHistoryView:
     session_id: str
     session_id_source: str
     transcript_path: str
+    reason: str
     message: str
     agent_kind: str
     agent_prompt_dialect: str
@@ -1489,6 +1492,7 @@ class RunHistoryView:
             session_id=latest_text(valid_records, "session_id") or run_id,
             session_id_source=latest_text(valid_records, "session_id_source"),
             transcript_path=latest_text(valid_records, "transcript_path"),
+            reason=latest_text(valid_records, "reason"),
             message=latest_text(valid_records, "message"),
             agent_kind=latest_text(valid_records, "agent_kind"),
             agent_prompt_dialect=latest_text(valid_records, "agent_prompt_dialect"),
@@ -1559,6 +1563,7 @@ class RunHistoryView:
             "session_id": self.session_id,
             "session_id_source": self.session_id_source,
             "transcript_path": self.transcript_path,
+            "reason": self.reason,
             "message": self.message,
             "agent_kind": self.agent_kind,
             "agent_prompt_dialect": self.agent_prompt_dialect,

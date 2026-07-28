@@ -236,6 +236,14 @@ available, actions, blockers, child pid/log path when relevant, and next wake.
 The record also carries the number of durable `run_started` records appended by
 the child. A child that exits cleanly with zero such records is an idle cycle,
 not a completed dispatch cycle.
+A `restartable` cycle carries the non-empty machine-readable reason from the
+decision or run classification that produced it. When a dispatched task leaves
+committed work on a branch ahead of main, the cycle records the task, branch,
+and ahead commit count. Human and JSON status expose both fields for the latest
+cycle. Run results and task lock-release records carry the same reason; a
+non-completed worker report includes its status in that reason even when the
+worker supplied no message, while a supplied report message remains available
+as the run-result detail.
 Cycle and supervisor records also carry the configured worktree-disposition
 policy. Worktree-disposition records carry that policy plus candidate counts,
 evidence, reasons, and outcomes. Existing run readers must keep tolerating

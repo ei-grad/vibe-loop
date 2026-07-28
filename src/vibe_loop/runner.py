@@ -851,6 +851,17 @@ class ClassificationResult:
     detail: str = ""
 
 
+def classification_reason(
+    classification: ClassificationResult,
+    worker_report: WorkerReport | None,
+) -> str:
+    if classification.source == "worker_report" and worker_report is not None:
+        if worker_report.status != "completed":
+            return f"worker_report_{worker_report.status}"
+        return "worker_report"
+    return classification.source or "run_classified"
+
+
 @dataclasses.dataclass(frozen=True)
 class BatchSelectionValidation:
     tasks: tuple[Task, ...] = ()
@@ -2380,6 +2391,7 @@ class VibeRunner:
         # and not a completion.
         settled_outcome = "unknown"
         settled_classification = ""
+        settled_reason = "run_outcome_unknown"
         runtime_owned = False
         activated_runtime_owned = False
         task_source_terminal_confirmed = True
@@ -3520,6 +3532,11 @@ class VibeRunner:
                     agent_kind=agent_kind,
                 )
                 if (
+                    classification.source == "worker_report"
+                    and worker_report is not None
+                ):
+                    message = worker_report.message
+                if (
                     classification.source == "worker_report_missing"
                     and classification.detail
                 ):
@@ -3723,6 +3740,7 @@ class VibeRunner:
                 log_path=log_path,
                 start_main=start_main,
                 end_main=end_main,
+                reason=classification_reason(classification, worker_report),
                 message=message,
                 started_at=active_state.started_at,
                 session_id=session_id,
@@ -3803,6 +3821,7 @@ class VibeRunner:
             # so an append that raises leaves the run settling as unknown.
             settled_classification = classification.status
             settled_outcome = settled_run_outcome(classification.status)
+            settled_reason = result.reason
             if self.recovery_budget_exhausted_by(result, recovery):
                 # This is the last permitted recovery attempt and it still could
                 # not settle the task, so the supervisor will treat this run as
@@ -3815,12 +3834,14 @@ class VibeRunner:
                 )
                 settled_outcome = "failed"
                 settled_classification = "failed"
+                settled_reason = "recovery_budget_exhausted"
             report_status(
                 f"recorded {classification.status} result for {task.task_id}: "
                 f"{log_path}"
             )
             return result
         except KeyboardInterrupt:
+            settled_reason = "worker_interrupted"
             try:
                 compensate_unstarted_workspace()
             finally:
@@ -3835,6 +3856,7 @@ class VibeRunner:
                     )
             raise
         except Exception:
+            settled_reason = "run_task_exception"
             # The run body calls configurable process, lock, source, and run
             # store backends whose exception families are not closed.
             try:
@@ -3893,6 +3915,7 @@ class VibeRunner:
                             "started_at": active_state.started_at,
                             "outcome": settled_outcome,
                             "classification": settled_classification,
+                            "reason": settled_reason,
                         },
                     )
                 )
