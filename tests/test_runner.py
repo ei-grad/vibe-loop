@@ -11960,7 +11960,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             self.assertEqual(released[0].get("classification"), "completed")
             self.assertEqual(released[0].get("reason"), "worker_report")
 
-    def test_blocked_worker_report_records_reason_without_message(self) -> None:
+    def test_blocked_worker_report_records_reason_and_message(self) -> None:
         task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
         with tempfile.TemporaryDirectory() as directory:
             runner, _, _ = self._build_runner(directory, [task], {"T-1": None})
@@ -11984,7 +11984,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
 
         self.assertEqual(result.reason, "worker_report_blocked")
         self.assertEqual(run_result["reason"], "worker_report_blocked")
-        self.assertEqual(run_result["message"], "")
+        self.assertEqual(run_result["message"], "blocked via worker report")
         self.assertEqual(released["reason"], "worker_report_blocked")
 
     def test_parallel_jobs_settle_each_run_independently(self) -> None:

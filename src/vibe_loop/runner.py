@@ -3532,6 +3532,11 @@ class VibeRunner:
                     agent_kind=agent_kind,
                 )
                 if (
+                    classification.source == "worker_report"
+                    and worker_report is not None
+                ):
+                    message = worker_report.message
+                if (
                     classification.source == "worker_report_missing"
                     and classification.detail
                 ):
