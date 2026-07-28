@@ -41,6 +41,7 @@ from vibe_loop.config import (
     normalize_registry_runtime_context,
     normalize_registry_runtime_context_assignments,
     prepare_shell_command,
+    resolve_task_agent,
     unresolved_agent_command_message,
     unresolved_prompt_dialect_message,
 )
@@ -78,6 +79,7 @@ from vibe_loop.runner import (
     CandidateExclusion,
     ProviderUsageObserver,
     VibeRunner,
+    attempt_circuit_inputs,
     inject_structured_usage_output,
     new_run_id,
     parse_agent_runtime_context_from_command,
@@ -115,6 +117,7 @@ from vibe_loop.runs import (
     WORKSPACE_CLAIM_RECORD_TYPE,
     WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
     WORKSPACE_PREFLIGHT_RECORD_TYPE,
+    AttemptCircuitState,
     RunLifecycleEvent,
     RunResult,
     RunStore,
@@ -889,6 +892,19 @@ def collect_task_queue_status(
         for task in candidate_snapshot.runnable
         if task.task_id not in admission_blocked_ids
     )
+    attempt_circuit_blockers = current_attempt_circuit_dispatch_blockers(
+        config,
+        runnable,
+        RunStore(config.state_path / "runs.jsonl").attempt_circuit_states(
+            threshold=config.supervision.cross_run_attempt_threshold
+        ),
+    )
+    attempt_circuit_blocked_ids = {
+        str(blocker["task_id"]) for blocker in attempt_circuit_blockers
+    }
+    runnable = tuple(
+        task for task in runnable if task.task_id not in attempt_circuit_blocked_ids
+    )
     return TaskQueueStatus(
         total=len(tasks),
         ready=len(candidate_snapshot.ready),
@@ -909,8 +925,68 @@ def collect_task_queue_status(
             for task in tasks
             if task.status.casefold() == "gated"
         ),
-        dispatch_blockers=(*candidate_blockers, *admission_blockers),
+        dispatch_blockers=(
+            *candidate_blockers,
+            *admission_blockers,
+            *attempt_circuit_blockers,
+        ),
     )
+
+
+def current_attempt_circuit_dispatch_blockers(
+    config: VibeConfig,
+    tasks: Sequence[Task],
+    states: Sequence[AttemptCircuitState],
+) -> tuple[dict[str, object], ...]:
+    current_states = {state.task_id: state for state in states if state.open}
+    if not current_states:
+        return ()
+    candidate, candidate_error = git_text(config.repo, "rev-parse", "HEAD")
+    base, base_error = git_text(config.repo, "rev-parse", config.main_branch)
+    if candidate_error or base_error:
+        return ()
+
+    blockers: list[dict[str, object]] = []
+    for task in tasks:
+        state = current_states.get(task.task_id)
+        if state is None:
+            continue
+        selection = resolve_task_agent(config, task)
+        current_inputs = attempt_circuit_inputs(
+            task,
+            config,
+            base=base,
+            candidate=candidate,
+            agent=selection.config,
+            profile=selection.profile,
+        )
+        if state.inputs != current_inputs:
+            continue
+        blockers.append(
+            {
+                "task_id": task.task_id,
+                "mechanism": "attempt_circuit",
+                "code": "attempt_circuit_open",
+                "key": "supervision.cross_run_attempt_threshold",
+                "message": (
+                    "attempt circuit open: "
+                    f"attempt_count={state.attempt_count} "
+                    f"pending_count={state.pending_count} "
+                    f"threshold={state.threshold} "
+                    f"blocker_class={state.blocker_class or 'noncompleted'}"
+                ),
+                "remedy": (
+                    "Change the task or relevant configuration, advance the "
+                    "base/candidate, or clear the record with "
+                    "`vibe-loop attempt-circuit reset <task-id>`."
+                ),
+                "attempt_count": state.attempt_count,
+                "pending_count": state.pending_count,
+                "threshold": state.threshold,
+                "blocker_class": state.blocker_class,
+            }
+        )
+    return tuple(blockers)
 
 
 def candidate_exclusion_dispatch_blocker(

@@ -1708,6 +1708,7 @@ def attempt_circuit_state(
         attempt_count=attempt_count,
         pending_count=pending,
         avoided_launches=avoided_launches,
+        withheld=avoided_launches > 0,
         opened_at=string_value(opened.get("occurred_at")),
         opening_reason=string_value(opened.get("reason")),
         reset_at=string_value(reset_record.get("occurred_at")),

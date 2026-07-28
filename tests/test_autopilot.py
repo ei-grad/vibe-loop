@@ -133,9 +133,15 @@ from vibe_loop.config import (
     TaskSourceConfig,
     load_config,
     normalize_registry_runtime_context,
+    resolve_task_agent,
 )
 from vibe_loop.retry import ProviderLimitSignal
-from vibe_loop.runner import AgentProviderLimitError, CandidateSnapshot
+from vibe_loop.runner import (
+    AgentProviderLimitError,
+    CandidateSnapshot,
+    VibeRunner,
+    attempt_circuit_inputs,
+)
 from vibe_loop.locks import (
     AUTOPILOT_LOCK_NAME,
     LockBackendError,
@@ -354,6 +360,76 @@ class AutopilotStatusTests(unittest.TestCase):
                 for blocker in payload["blockers"]
             )
         )
+
+    def test_attempt_circuit_blocks_current_task_and_removes_it_from_runnable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            runner = VibeRunner(config)
+            task = runner.source.list_tasks()[0]
+            selection = resolve_task_agent(config, task)
+            head = git_text(repo, "rev-parse", "HEAD")
+            inputs = attempt_circuit_inputs(
+                task,
+                config,
+                base=head,
+                candidate=head,
+                agent=selection.config,
+                profile=selection.profile,
+            )
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            for index in range(2):
+                run_id = f"failed-{index}"
+                run_store.reserve_attempt_circuit(
+                    run_id=run_id,
+                    inputs=inputs,
+                    threshold=3,
+                )
+                result = RunResult(
+                    run_id=run_id,
+                    task_id=task.task_id,
+                    classification="blocked",
+                    classification_source="worker_report",
+                    exit_code=1,
+                    log_path=repo / f"{run_id}.log",
+                    start_main=head,
+                    end_main=head,
+                )
+                run_store.append_result(result)
+            run_store.reserve_attempt_circuit(
+                run_id="pending",
+                inputs=inputs,
+                threshold=3,
+            )
+            avoided = run_store.reserve_attempt_circuit(
+                run_id="avoided",
+                inputs=inputs,
+                threshold=3,
+            )
+            status = collect_project_status(config)
+            payload = status.to_json()
+            rendered = render_autopilot_status(status)
+
+        self.assertTrue(avoided.open)
+        self.assertEqual(payload["queue"]["ready"], 1)
+        self.assertEqual(payload["queue"]["runnable"], 0)
+        self.assertEqual(payload["queue"]["runnable_tasks"], [])
+        blocker = payload["queue"]["dispatch_blockers"][0]
+        self.assertEqual(blocker["mechanism"], "attempt_circuit")
+        self.assertEqual(blocker["attempt_count"], 2)
+        self.assertEqual(blocker["pending_count"], 1)
+        self.assertEqual(blocker["threshold"], 3)
+        self.assertEqual(blocker["blocker_class"], "blocked:worker_report")
+        self.assertEqual(payload["supervisor"]["dispatch_state"], "blocked")
+        self.assertIn("task_dispatch_blocked:TASK-01", payload["blockers"][0])
+        self.assertIn("task dispatch blockers:", rendered)
+        self.assertIn("attempt circuit open", rendered)
+        self.assertIn("attempt_count=2 pending_count=1 threshold=3", rendered)
+        self.assertIn("vibe-loop attempt-circuit reset <task-id>", rendered)
+        self.assertNotIn("blockers: none", rendered)
 
     def test_status_views_surface_latest_main_verification_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

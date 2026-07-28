@@ -11452,6 +11452,13 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
 
                 self.assertIsNone(result)
                 self.assertFalse(lock_manager.is_locked(task.task_id))
+                if exit_path == "attempt_circuit_open":
+                    releases = [
+                        record
+                        for record in runner.run_store.read_records()
+                        if record.get("record_type") == "lock_released"
+                    ]
+                    self.assertEqual(releases[-1]["reason"], "attempt_circuit_open")
 
     def test_runtime_owned_recovery_stale_workspace_releases_task_lock(
         self,

@@ -2556,6 +2556,7 @@ class VibeRunner:
                 threshold=self.config.supervision.cross_run_attempt_threshold,
             )
             if circuit_state.open:
+                pre_launch_failure_reason = "attempt_circuit_open"
                 raise AttemptCircuitOpen(circuit_state)
             run_contract = RunContractResolver(self.config).resolve(agent_selection)
             runtime_owned = run_contract.payload["mode"] == "runtime-owned"
