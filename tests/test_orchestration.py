@@ -1595,6 +1595,39 @@ class RuntimeGateTests(unittest.TestCase):
         self.assertEqual(assessment["finding"], "")
         self.assertEqual(assessment["changed_paths"], ["tracked.txt"])
         self.assertEqual(assessment["unmatched_paths"], [])
+        self.assertEqual(assessment["comparison_base"], self.base)
+
+    def test_candidate_scope_excludes_changes_merged_from_main(self) -> None:
+        main_worktree = Path(self.directory.name) / "main-worktree"
+        git(self.repo, "worktree", "add", str(main_worktree), "main")
+        git(self.repo, "checkout", "-b", "worker/no-changes", self.base)
+        git(self.repo, "commit", "--allow-empty", "-m", "empty worker commit")
+        (main_worktree / "mainline.txt").write_text("mainline\n", encoding="utf-8")
+        git(main_worktree, "add", "mainline.txt")
+        git(main_worktree, "commit", "-m", "advance main")
+        advanced_main = git(main_worktree, "rev-parse", "HEAD").stdout.strip()
+        git(self.repo, "merge", "--no-edit", "main")
+        merged_head = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        collector = CandidateCollector(
+            worktree=self.repo,
+            branch="worker/no-changes",
+            base_main=self.base,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            scope_policy=CandidateScopePolicy(
+                known=True,
+                paths=("worker",),
+            ),
+        )
+
+        candidate = collector.collect_declared(head_commit=merged_head)
+
+        self.assertEqual(candidate.changed_paths, ())
+        self.assertEqual(candidate.comparison_base, advanced_main)
+        assessment = self.store.read_records()[-2]
+        self.assertEqual(assessment["outcome"], "in_scope")
+        self.assertEqual(assessment["comparison_base"], advanced_main)
 
     def test_candidate_scope_names_drift_and_reports_comparison(self) -> None:
         collector = self.collector_with_scope(
@@ -1618,6 +1651,7 @@ class RuntimeGateTests(unittest.TestCase):
                 },
                 "changed_paths": ["tracked.txt"],
                 "unmatched_paths": ["tracked.txt"],
+                "comparison_base": self.base,
             },
         )
         assessment = self.store.read_records()[-1]

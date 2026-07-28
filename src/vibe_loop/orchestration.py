@@ -579,6 +579,7 @@ class CandidateRecord:
     head_commit: str
     changed_paths: tuple[str, ...]
     source: str
+    comparison_base: str = ""
 
     def __post_init__(self) -> None:
         if self.source not in CANDIDATE_RECORD_SOURCE_KINDS:
@@ -604,6 +605,7 @@ class CandidateRecord:
             "head_commit": self.head_commit,
             "changed_paths": list(self.changed_paths),
             "source": self.source,
+            "comparison_base": self.comparison_base or self.base_main,
             "candidate_fingerprint": self.fingerprint,
         }
 
@@ -617,6 +619,7 @@ class CandidateRecord:
         head_commit = record.get("head_commit")
         changed_paths = record.get("changed_paths")
         source = record.get("source")
+        comparison_base = record.get("comparison_base", base_main)
         if (
             not isinstance(branch, str)
             or not isinstance(worktree, str)
@@ -625,6 +628,7 @@ class CandidateRecord:
             or not isinstance(changed_paths, list)
             or not all(isinstance(path, str) for path in changed_paths)
             or source not in CANDIDATE_RECORD_SOURCE_KINDS
+            or not isinstance(comparison_base, str)
         ):
             return None
         candidate = cls(
@@ -634,6 +638,7 @@ class CandidateRecord:
             head_commit=head_commit,
             changed_paths=tuple(changed_paths),
             source=str(source),
+            comparison_base=comparison_base,
         )
         if record.get("candidate_fingerprint") != candidate.fingerprint:
             return None
@@ -671,6 +676,7 @@ class CandidateScopePolicy:
             },
             "changed_paths": list(candidate.changed_paths),
             "unmatched_paths": list(candidate.changed_paths),
+            "comparison_base": candidate.comparison_base or candidate.base_main,
         }
         if not self.known:
             return CandidateScopeAssessment(
@@ -733,6 +739,7 @@ class CandidateCollector:
         run_store: object,
         run_id: str,
         task_id: str,
+        main_branch: str = "main",
         scope_policy: CandidateScopePolicy | None = None,
     ) -> None:
         self.worktree = worktree.resolve()
@@ -741,6 +748,7 @@ class CandidateCollector:
         self.run_store = run_store
         self.run_id = run_id
         self.task_id = task_id
+        self.main_branch = main_branch
         self.scope_policy = scope_policy
         self.last_scope_assessment: CandidateScopeAssessment | None = None
 
@@ -864,12 +872,17 @@ class CandidateCollector:
                 "candidate workspace has uncommitted tracked changes",
                 details={"status": tracked_status.splitlines()[:20]},
             )
+        comparison_base = self._git_text(
+            "merge-base",
+            head_commit,
+            f"refs/heads/{self.main_branch}^{{commit}}",
+        )
         changed = self._git_bytes(
             "diff",
             "--name-only",
             "--diff-filter=ACDMRTUXB",
             "-z",
-            f"{resolved_base}...{head_commit}",
+            f"{comparison_base}...{head_commit}",
         )
         changed_paths = tuple(
             sorted(
@@ -885,6 +898,7 @@ class CandidateCollector:
             head_commit=head_commit,
             changed_paths=changed_paths,
             source=source,
+            comparison_base=comparison_base,
         )
 
     def matches(self, candidate: CandidateRecord) -> bool:
