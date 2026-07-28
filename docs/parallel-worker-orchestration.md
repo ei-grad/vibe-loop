@@ -125,8 +125,8 @@ results are missing or ambiguous.
   shared primary control state internally from the task worktree. Project
   selector handling at the worker boundary follows
   [PRD-AUT-020](prd/autopilot.md#prd-aut-020).
-- Runtime task-source adapter session attribution, reviewer attestation
-  quality, and project policy are defined by
+- Runtime task-source adapter session attribution and reviewer attestation
+  quality are defined by
   [PRD-ORC-005](prd/run-orchestration.md#prd-orc-005-reviewer-routing-identity-and-continuation).
 - `workers --json` and `doctor --json` cross-check claimed workspace metadata
   against `git worktree list`, the current claimed worktree status, and branch

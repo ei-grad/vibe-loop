@@ -8719,21 +8719,6 @@ def implementer_session_from_records(
     return session_id
 
 
-def reviewer_session_from_records(
-    records: Sequence[Mapping[str, object]],
-    *,
-    run_id: str,
-    task_id: str,
-) -> str:
-    """Session id behind the approval integration relied on, else ""."""
-
-    return reviewer_session_attribution_from_records(
-        records,
-        run_id=run_id,
-        task_id=task_id,
-    ).session_id
-
-
 @dataclasses.dataclass(frozen=True)
 class ReviewerSessionAttribution:
     session_id: str = ""

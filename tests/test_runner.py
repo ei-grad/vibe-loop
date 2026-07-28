@@ -100,7 +100,6 @@ from vibe_loop.runner import (
     format_agent_command,
     implementer_session_from_records,
     reviewer_session_attribution_from_records,
-    reviewer_session_from_records,
     build_resume_continuation_prompt,
     classify_post_report_activity,
     classify_post_report_event,
@@ -12920,22 +12919,24 @@ class TaskSourceSessionExportTests(unittest.TestCase):
         verdict: str,
         session_id: str,
         session_id_source: str = "runtime_injected",
-        provider: str = "claude",
+        provider: str | None = "claude",
         pass_kind: str = "initial",
         run_id: str = RUN_ID,
         task_id: str = TASK_ID,
     ) -> None:
+        payload: dict[str, object] = {
+            "pass_kind": pass_kind,
+            "verdict": verdict,
+            "session_id": session_id,
+            "session_id_source": session_id_source,
+        }
+        if provider is not None:
+            payload["route"] = {"provider": provider}
         runner.run_store.append_lifecycle_event(
             RunLifecycleEvent.review_verdict(
                 run_id=run_id,
                 task_id=task_id,
-                payload={
-                    "pass_kind": pass_kind,
-                    "verdict": verdict,
-                    "session_id": session_id,
-                    "session_id_source": session_id_source,
-                    "route": {"provider": provider},
-                },
+                payload=payload,
             )
         )
 
@@ -13101,6 +13102,44 @@ class TaskSourceSessionExportTests(unittest.TestCase):
             context["VIBE_LOOP_REVIEWER_SESSION"],
             "reviewer-session-a",
         )
+        self.assertEqual(
+            context[REVIEWER_SESSION_ATTESTATION_ENV],
+            AGENT_REPORTED_REVIEWER_SESSION_ATTESTATION,
+        )
+
+    def test_injecting_provider_with_non_injected_source_is_agent_reported(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer-session-a",
+                session_id_source="observed",
+                provider="claude",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertEqual(
+            context[REVIEWER_SESSION_ATTESTATION_ENV],
+            AGENT_REPORTED_REVIEWER_SESSION_ATTESTATION,
+        )
+
+    def test_approval_without_route_is_agent_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="legacy-reviewer-session",
+                session_id_source="runtime_injected",
+                provider=None,
+            )
+
+            context = self._context(runner, self._lock(directory))
+
         self.assertEqual(
             context[REVIEWER_SESSION_ATTESTATION_ENV],
             AGENT_REPORTED_REVIEWER_SESSION_ATTESTATION,
@@ -13380,20 +13419,14 @@ class TaskSourceSessionExportTests(unittest.TestCase):
             ),
             "worker-session-a",
         )
-        self.assertEqual(
-            reviewer_session_from_records(
-                records,
-                run_id=self.RUN_ID,
-                task_id=self.TASK_ID,
-            ),
-            "reviewer-session-a",
+        reviewer_attribution = reviewer_session_attribution_from_records(
+            records,
+            run_id=self.RUN_ID,
+            task_id=self.TASK_ID,
         )
+        self.assertEqual(reviewer_attribution.session_id, "reviewer-session-a")
         self.assertEqual(
-            reviewer_session_attribution_from_records(
-                records,
-                run_id=self.RUN_ID,
-                task_id=self.TASK_ID,
-            ).attestation,
+            reviewer_attribution.attestation,
             AGENT_REPORTED_REVIEWER_SESSION_ATTESTATION,
         )
 

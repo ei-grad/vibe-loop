@@ -205,16 +205,27 @@ configured reviewer and proceeds while recording the provider relation
 explicitly. Session identity, model/effort, and native usage are recorded for
 every initial and closure pass.
 
-The completion adapter receives the approving identity in
-`VIBE_LOOP_REVIEWER_SESSION` and its quality in
+Runtime task-source adapters receive `VIBE_LOOP_IMPLEMENTER_SESSION` on every
+transition, including completion, settlement, and reset, when the run recorded
+a usable worker session. The completion adapter additionally receives the
+approving identity in `VIBE_LOOP_REVIEWER_SESSION` and its quality in
 `VIBE_LOOP_REVIEWER_SESSION_ATTESTATION`. The quality is `runtime-bound` only
 when the runtime-selected reviewer provider supports session injection and the
 approving pass used the injected or resumed identity; it is `agent-reported`
 for every non-injecting provider, regardless of the source label the reviewer
 reports. The quality variable is absent whenever the session variable is
-absent and from task-source transitions other than completion. The runtime
-exports both qualities without deciding whether a task-source backend accepts
-an agent-reported identity; persistence, history presentation, and per-project
+absent, and both reviewer variables are absent from task-source transitions
+other than completion.
+
+Absence is the fail-closed attribution signal: the runtime exports no empty
+value or placeholder. Before applying invocation context, the adapter process
+removes `VIBE_LOOP_IMPLEMENTER_SESSION`, `VIBE_LOOP_REVIEWER_SESSION`,
+`VIBE_LOOP_REVIEWER_SESSION_ATTESTATION`, `VIBE_LOOP_REPO`,
+`VIBE_LOOP_WORKTREE`, `VIBE_LOOP_BRANCH`, and
+`VIBE_LOOP_FENCING_TOKEN` from its inherited environment so an ambient value
+cannot satisfy a name the runtime withheld. The runtime exports both reviewer
+qualities without deciding whether a task-source backend accepts an
+agent-reported identity; persistence, history presentation, and per-project
 completion policy belong to the task-source backend contract.
 
 The exact runtime-owned Codex reviewer command `codex review {prompt}` has no
