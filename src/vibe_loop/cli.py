@@ -3304,6 +3304,7 @@ def render_run_inspection(inspection) -> str:
         f"exit: {exit_code}",
         f"session: {payload['session_id']} ({payload['session_id_source'] or '-'})",
         f"log: {payload['log'] or '-'}",
+        f"reason: {payload['reason'] or '-'}",
         f"message: {payload['message'] or '-'}",
         f"lifecycle: {payload['lifecycle_state'] or '-'}",
         "missing_lifecycle: "

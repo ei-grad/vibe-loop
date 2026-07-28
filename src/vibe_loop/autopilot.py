@@ -4692,6 +4692,7 @@ def restartable_cycle_reason(
             latest_results[run_id] = record
 
     for record in reversed(tuple(latest_results.values())):
+        reason = str(record.get("reason") or "")
         source = str(record.get("classification_source") or "")
         classification = str(record.get("classification") or record.get("status") or "")
         if source == "autopilot_stop":
@@ -4709,7 +4710,9 @@ def restartable_cycle_reason(
         if classification != "completed" and (
             str(record.get("run_id") or "") in completed_reports or report_completed
         ):
-            return source or "post_implementation_failure"
+            return reason or source or "post_implementation_failure"
+        if reason:
+            return reason
         if source:
             return source
 

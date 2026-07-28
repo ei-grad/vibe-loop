@@ -6191,6 +6191,25 @@ class AutopilotRecheckTests(unittest.TestCase):
                     ).to_json(),
                 ).to_record(),
             ),
+            (
+                "worker_report_blocked",
+                RunResult(
+                    run_id="blocked-run",
+                    task_id="TASK-01",
+                    classification="blocked",
+                    classification_source="worker_report",
+                    reason="worker_report_blocked",
+                    exit_code=1,
+                    log_path=Path("/tmp/blocked.log"),
+                    start_main="base",
+                    end_main="base",
+                    worker_report=WorkerReport(
+                        run_id="blocked-run",
+                        task_id="TASK-01",
+                        status="blocked",
+                    ).to_json(),
+                ).to_record(),
+            ),
         )
         observed: list[str] = []
         for expected_reason, route_record in route_records:
@@ -6220,7 +6239,11 @@ class AutopilotRecheckTests(unittest.TestCase):
 
         self.assertEqual(
             observed,
-            ["restart_budget_exhausted", "runtime_stage_failed"],
+            [
+                "restart_budget_exhausted",
+                "runtime_stage_failed",
+                "worker_report_blocked",
+            ],
         )
         self.assertEqual(
             restartable_cycle_reason(1, []),

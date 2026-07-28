@@ -9104,6 +9104,7 @@ class CliTests(unittest.TestCase):
             "exit: 0\n"
             "session: native-1 (native:stdout)\n"
             f"log: {runs_dir / 'run-1.log'}\n"
+            "reason: -\n"
             "message: -\n"
             "lifecycle: finalized\n"
             "missing_lifecycle: started, session_observed, workspace_claimed\n"
