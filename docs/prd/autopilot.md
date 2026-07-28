@@ -940,6 +940,25 @@ remain explicit instead of becoming a zero count. Malformed decisions fail
 closed without launching a write-capable worker. The two stages use the
 registered `autopilot_planning_decision` and `autopilot_planning_worker` record
 types.
+
+The read-write planning worker must derive a new task's path conflict domains
+from its complete acceptance criteria and likely write surface, including
+implementation callers and references, tests and fixtures, build manifests and
+lockfiles, and coupled documentation or roadmaps. It must not publish a narrow
+subset inferred only from the title or subject files. When it cannot justify a
+complete bounded path set, it leaves the entire conflict-domain set undeclared,
+including resource domains. Unknown domains serialize scheduling
+conservatively, while candidate path-scope enforcement remains explicitly
+unavailable as specified by
+[PRD-ORC-004](run-orchestration.md#prd-orc-004-runtime-gates-and-candidate-stabilization).
+Before creating new tasks or entering an isolated planning worktree, it must
+inspect the configured runtime state `runs.jsonl` for
+`candidate_scope_assessed` records whose `finding` is
+`candidate_scope_drift`, add every recorded `unmatched_paths` entry to the
+affected task's authoritative conflict domains, and re-read each created or
+repaired task to verify that its declared paths cover its acceptance and
+recorded scope evidence.
+
 Project-authored `[autopilot]` maintenance commands (`PRD-AUT-005`) continue to
 override or augment the native behaviors; native behavior is the default, not a
 replacement for explicit configuration.
