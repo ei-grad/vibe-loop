@@ -27,11 +27,6 @@ fixtures, and command output must not embed downstream project names or absolute
 developer-machine paths, and a release check must assert this so the feature is
 safe to ship and to surface in a future shared dashboard.
 
-When the latest terminal run ended in `main_verification_failed`, structured
-and human status name the failed command and expose its retained output tail.
-The retention and scrubbing contract is owned by
-[PRD-ORC-007](run-orchestration.md#prd-orc-007-runtime-integration-and-task-provenance).
-
 Related implementation IDs: `AUTO-01`, `AUTO-02`, `AUTO-05`.
 
 ### Supervisor Status Consistency

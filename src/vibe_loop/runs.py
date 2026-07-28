@@ -1732,6 +1732,65 @@ class RunStore:
     def __init__(self, path: Path):
         self.path = path
 
+    def latest_main_verification_failure(self) -> dict[str, object]:
+        records = self.read_records()
+        terminal = next(
+            (
+                record
+                for record in reversed(records)
+                if record.get("record_type") in {None, RUN_RECORD_TYPE}
+            ),
+            None,
+        )
+        if (
+            terminal is None
+            or (
+                string_value(terminal.get("classification_source"))
+                or string_value(terminal.get("reason"))
+            )
+            != "main_verification_failed"
+        ):
+            return {}
+        run_id = string_value(terminal.get("run_id"))
+        task_id = string_value(terminal.get("task_id"))
+        integration = next(
+            (
+                record
+                for record in reversed(records)
+                if record.get("record_type") == INTEGRATION_RESULT_RECORD_TYPE
+                and string_value(record.get("run_id")) == run_id
+                and string_value(record.get("task_id")) == task_id
+                and record.get("reason") == "main_verification_failed"
+            ),
+            None,
+        )
+        if integration is None:
+            return {}
+        verification = integration.get("verification")
+        checks = verification if isinstance(verification, list) else []
+        failed_check = next(
+            (
+                check
+                for check in reversed(checks)
+                if isinstance(check, Mapping)
+                and check.get("phase") == "main"
+                and check.get("exit_class") != "passed"
+            ),
+            None,
+        )
+        if failed_check is None:
+            return {}
+        output_tail = failed_check.get("output_tail")
+        return {
+            "reason": "main_verification_failed",
+            "run_id": run_id,
+            "task_id": task_id,
+            "command_key": string_value(failed_check.get("command_key")),
+            "exit_class": string_value(failed_check.get("exit_class")),
+            "exit_code": failed_check.get("exit_code"),
+            "output_tail": output_tail if isinstance(output_tail, str) else "",
+        }
+
     def reserve_attempt_circuit(
         self,
         *,

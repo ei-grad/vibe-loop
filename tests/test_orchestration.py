@@ -85,6 +85,7 @@ from vibe_loop.orchestration import (
     workspace_retry_disposition,
 )
 from vibe_loop.runner import VibeRunner
+from vibe_loop.cli import render_main_verification_failure
 from vibe_loop.locks import (
     MAIN_INTEGRATION_LOCK_NAME,
     LockFencingMismatch,
@@ -3780,6 +3781,29 @@ class RuntimeIntegrationTests(unittest.TestCase):
             record["verification"][-1]["output_tail"],
             failed.output_tail,
         )
+        self.store.append_result(
+            RunResult(
+                run_id="run-1",
+                task_id="TASK-01",
+                classification="failed",
+                classification_source="main_verification_failed",
+                exit_code=1,
+                log_path=self.repo / ".vibe-loop" / "runs" / "run-1.log",
+                start_main=self.base,
+                end_main=self.base,
+            )
+        )
+        diagnostic = self.store.latest_main_verification_failure()
+        self.assertEqual(diagnostic["command_key"], "completion.commands[1]")
+        self.assertEqual(diagnostic["output_tail"], failed.output_tail)
+        rendered = "\n".join(render_main_verification_failure(diagnostic))
+        self.assertIn(
+            "main_verification_failed: task=TASK-01 run=run-1 "
+            "command=completion.commands[1] exit=1",
+            rendered,
+        )
+        self.assertIn("output tail:\n", rendered)
+        self.assertIn("migration failed: lock contention", rendered)
 
     def test_main_recovery_refuses_to_overwrite_overlapping_worktree_change(
         self,

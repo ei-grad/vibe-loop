@@ -333,7 +333,9 @@ as an `execution_error`, distinct from a command failure.
 Each failed integration or main verification entry records the command key and
 the combined command-output tail. The tail uses the task-source adapter's
 pre-redaction line and window bounds, secret scrubbing, and final persisted
-bound. Passing verification entries omit command output.
+bound. Passing verification entries omit command output. When the latest
+terminal run ended in `main_verification_failed`, structured and human
+`autopilot status` name the failed command and expose its retained output tail.
 
 If main verification fails after a fast-forward, the runtime restores
 `main_before` with Git's keep-local-changes semantics. Unrelated tracked edits

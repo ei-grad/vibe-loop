@@ -1609,10 +1609,26 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
     command = getattr(args, "autopilot_command", None)
     if command == "status":
         status = collect_project_status(config)
+        verification_failure = RunStore(
+            config.state_path / "runs.jsonl"
+        ).latest_main_verification_failure()
+        verification_failure = redact_runtime_context_payload(
+            verification_failure,
+            config.runtime_context,
+        )
+        verification_failure = redact_fencing_token_payload(verification_failure)
+        assert isinstance(verification_failure, dict)
         if getattr(args, "json", False):
-            print(json.dumps(status.to_json(), indent=2, default=list))
+            payload = status.to_json()
+            payload["latest_main_verification_failure"] = verification_failure
+            print(json.dumps(payload, indent=2, default=list))
         else:
-            print(render_autopilot_status(status))
+            print(
+                render_autopilot_status(
+                    status,
+                    verification_failure=verification_failure,
+                )
+            )
         return 0
     if command == "projects":
         return dispatch_autopilot_projects(args)
@@ -1796,7 +1812,11 @@ def render_autopilot_reload(result) -> str:
     )
 
 
-def render_autopilot_status(status: ProjectStatus) -> str:
+def render_autopilot_status(
+    status: ProjectStatus,
+    *,
+    verification_failure: Mapping[str, object] | None = None,
+) -> str:
     lines = [f"repo: {status.display_name} ({status.repo})"]
     disk_headroom = status.disk_headroom
     targets = disk_headroom.get("targets")
@@ -1846,20 +1866,8 @@ def render_autopilot_status(status: ProjectStatus) -> str:
         f"consecutive={non_closure.consecutive}/"
         f"{non_closure.alarm_threshold}{alarm}; reasons: {reasons}"
     )
-    verification_failure = status.latest_main_verification_failure
     if verification_failure:
-        exit_code = verification_failure.get("exit_code")
-        lines.append(
-            "main_verification_failed: "
-            f"task={verification_failure.get('task_id') or '-'} "
-            f"run={verification_failure.get('run_id') or '-'} "
-            f"command={verification_failure.get('command_key') or '-'} "
-            f"exit={exit_code if exit_code is not None else '-'}"
-        )
-        output_tail = verification_failure.get("output_tail")
-        if isinstance(output_tail, str) and output_tail:
-            lines.append("  output tail:")
-            lines.extend(f"    {line}" for line in output_tail.splitlines())
+        lines.extend(render_main_verification_failure(verification_failure))
     if status.alarms:
         lines.append("alarms:")
         lines.extend(f"  - {alarm}" for alarm in status.alarms)
@@ -2082,6 +2090,24 @@ def render_autopilot_status(status: ProjectStatus) -> str:
                 f"avoided={breaker['avoided_launches']}"
             )
     return "\n".join(lines)
+
+
+def render_main_verification_failure(
+    failure: Mapping[str, object],
+) -> list[str]:
+    exit_code = failure.get("exit_code")
+    lines = [
+        "main_verification_failed: "
+        f"task={failure.get('task_id') or '-'} "
+        f"run={failure.get('run_id') or '-'} "
+        f"command={failure.get('command_key') or '-'} "
+        f"exit={exit_code if exit_code is not None else '-'}"
+    ]
+    output_tail = failure.get("output_tail")
+    if isinstance(output_tail, str) and output_tail:
+        lines.append("  output tail:")
+        lines.extend(f"    {line}" for line in output_tail.splitlines())
+    return lines
 
 
 def dispatch_wait_helper(args: argparse.Namespace) -> int:
