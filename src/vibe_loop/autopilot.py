@@ -6533,6 +6533,7 @@ def build_native_planning_worker_prompt(
     decision: NativePlanningDecision,
 ) -> str:
     skill_prefix = config.agent.require_skill_ref_prefix()
+    scope_evidence_path = config.state_path / "runs.jsonl"
     return (
         f"{skill_prefix}orchestrated-vibe-loop\n\n"
         "You are the separate read-write planning worker for an autopilot cycle. "
@@ -6544,9 +6545,14 @@ def build_native_planning_worker_prompt(
         "surface, including implementation callers and references, tests and "
         "fixtures, build manifests and lockfiles, and coupled documentation or "
         "roadmaps. Never publish an optimistic subset based only on the title or "
-        "subject files; leave path domains undeclared when a complete bounded set "
-        "cannot be justified. Before creating new tasks, inspect prior "
-        "candidate_scope_drift evidence. Add every recorded unmatched path to the "
+        "subject files. When a complete bounded path set cannot be justified, "
+        "leave the entire conflict-domain set undeclared, including resource "
+        "domains; unknown domains serialize scheduling conservatively, while "
+        "candidate path-scope enforcement remains explicitly unavailable. Before "
+        "creating new tasks or entering an isolated planning worktree, inspect "
+        f"prior scope evidence in {scope_evidence_path}. Read JSONL records whose "
+        "record_type is candidate_scope_assessed and finding is "
+        "candidate_scope_drift. Add every recorded unmatched_paths entry to the "
         "affected task's authoritative conflict domains so the scheduler and next "
         "retry read the repair from the task itself. Re-read each created or "
         "repaired task and verify its declared paths cover its acceptance and "

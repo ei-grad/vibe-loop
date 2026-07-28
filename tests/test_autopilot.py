@@ -7533,11 +7533,27 @@ class NativePlanningTests(unittest.TestCase):
         )
         self.assertIn("build manifests and lockfiles", worker_calls[0]["command"])
         self.assertIn(
-            "leave path domains undeclared when a complete bounded set",
+            "leave the entire conflict-domain set undeclared, including resource",
             worker_calls[0]["command"],
         )
         self.assertIn(
-            "inspect prior candidate_scope_drift evidence",
+            "candidate path-scope enforcement remains explicitly unavailable",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            str(config.state_path / "runs.jsonl"),
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "record_type is candidate_scope_assessed",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "finding is candidate_scope_drift",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "every recorded unmatched_paths entry",
             worker_calls[0]["command"],
         )
         self.assertIn(
