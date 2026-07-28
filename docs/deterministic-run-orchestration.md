@@ -413,12 +413,9 @@ with reset evidence / timeout / fatal), session identity
 (`session_id`, `session_id_source`, transcript path), provider-native usage,
 worker report if filed, candidate declaration — via a new fenced
 `vibe-loop worker candidate --head <sha> ...` command or derived by
-`CandidateCollector` from the claimed branch (head commit, changed paths vs
-the recorded `comparison_base`) when the worker did not declare one. Initial
-collection selects that comparison base as the merge base of the candidate head
-and configured local mainline when available, falling back to the validated
-`base_main`; later matching, gate, recovery, and review stages reuse the
-persisted comparison base.
+`CandidateCollector` from the claimed branch when the worker did not declare
+one, under the authoritative
+[runtime candidate contract](prd/run-orchestration.md#prd-orc-004-runtime-gates-and-candidate-stabilization).
 
 ### Reviewer stage I/O
 

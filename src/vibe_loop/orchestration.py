@@ -1219,7 +1219,7 @@ class CandidateBaseReanchorer:
             attempted_in_call = True
             previous = candidate
             previous_diff = self._candidate_diff(
-                previous.base_main,
+                previous.comparison_base or previous.base_main,
                 previous.head_commit,
             )
             # Ambient Git config must not decide whether the rebase is clean.
@@ -1260,7 +1260,10 @@ class CandidateBaseReanchorer:
             )
             if (
                 rebased.changed_paths != previous.changed_paths
-                or self._candidate_diff(rebased.base_main, rebased.head_commit)
+                or self._candidate_diff(
+                    rebased.comparison_base or rebased.base_main,
+                    rebased.head_commit,
+                )
                 != previous_diff
             ):
                 self._restore_candidate(previous.head_commit, observed_base, attempts)

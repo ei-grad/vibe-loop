@@ -136,19 +136,26 @@ Related implementation IDs: `ORC-04` (`run-until-done-preprovision-worker-worktr
 
 Configured gates must be executed by the runtime in the task worktree against
 a recorded candidate, not self-reported by the implementer. The candidate
-(head commit, base, changed paths) is either declared through a fenced worker
-command or derived by the runtime from the claimed branch; gate results are
-recorded as typed evidence referencing the gate's configuration key, exit
-class, duration, and log. Gate failure routes to bounded remediation, not to
-silent completion; gate evidence is part of the review request.
+(head commit, base anchor, comparison base, changed paths) is either
+declared through a fenced worker command or derived by the runtime from the
+claimed branch. Initial collection selects the comparison base as the merge
+base of the candidate head and configured local integration branch when
+available, falling back to the validated base anchor when the branch is
+missing or unrelated. Changed paths are computed relative to that comparison
+base. Matching and downstream diff consumers reuse the persisted comparison
+base for that recorded candidate. Gate results are recorded as typed evidence
+referencing the gate's configuration key, exit class, duration, and log. Gate
+failure routes to bounded remediation, not to silent completion; gate evidence
+is part of the review request.
 
 Conflict-domain fields remain optional in the
 [normalized task contract](task-discovery.md#prd-tsk-001-normalized-task-model).
 Before recording either a worker-declared or runtime-derived candidate, the
 runtime compares every changed path with any declared path conflict domains and
 records a typed scope assessment containing the declared resource and path
-domains, all changed paths, and the unmatched paths. A candidate with unmatched
-paths is rejected with a named scope-drift finding. Unknown or empty conflict
+domains, comparison base, all changed paths, and the unmatched paths. A
+candidate with unmatched paths is rejected with a named scope-drift finding
+whose message identifies the comparison base. Unknown or empty conflict
 domains, including a domain set containing only non-path resources, instead
 record a named scope-unenforceable assessment and allow the candidate to
 proceed; absence cannot silently pass as an enforced scope check or turn an
@@ -158,13 +165,15 @@ The candidate's base is the commit its workspace was provisioned from, which
 for an adopted workspace is legitimately older than `main` at run start. When
 that base is behind the integration branch, the runtime may re-anchor the
 candidate only through a conflict-free rebase whose aggregate binary diff and
-changed paths are unchanged. Every attempt records a typed base-anchor outcome
-and the rewritten candidate receives fresh gate evidence. Re-anchoring is an
-optimization over the merge integration already performs, so a conflict or a
-content divergence refuses and preserves the candidate rather than failing the
-run before review. Repeated base drift past the bound resolved in the run
-contract is the one case that parks the run, because such a run cannot produce
-gate evidence against a settled base at all.
+changed paths are unchanged when each candidate is measured from its own
+comparison base. A successfully re-anchored candidate uses the observed
+integration base as both its new base anchor and comparison base. Every
+attempt records a typed base-anchor outcome and the rewritten candidate receives
+fresh gate evidence. Re-anchoring is an optimization over the merge integration
+already performs, so a conflict or a content divergence refuses and preserves
+the candidate rather than failing the run before review. Repeated base drift
+past the bound resolved in the run contract is the one case that parks the run,
+because such a run cannot produce gate evidence against a settled base at all.
 
 Acceptance must cover gate execution and evidence records, candidate
 declaration and derivation, remediation budget enforcement on gate failure,
