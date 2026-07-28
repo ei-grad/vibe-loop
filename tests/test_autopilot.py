@@ -14,6 +14,8 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -164,7 +166,7 @@ from vibe_loop.runs import (
     WorkerReport,
     autopilot_child_started_record,
 )
-from vibe_loop.cli import render_autopilot_status, render_autopilot_stop
+from vibe_loop.cli import main, render_autopilot_status, render_autopilot_stop
 from vibe_loop.processes import (
     ProcessNode,
     collect_owned_descendants,
@@ -2454,6 +2456,50 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertIn("identity_source=inferred_from_start_time", rendered)
         self.assertIn("commit_relation=supervisor_behind", rendered)
         self.assertIn("changed_files_truncated=5", rendered)
+
+    def test_doctor_code_advisory_does_not_claim_config_divergence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            supervisor = SupervisorStatus(
+                state="running",
+                code={
+                    "started_commit": "old",
+                    "current_commit": "new",
+                    "identity_source": "recorded",
+                    "commit_relation": "supervisor_behind",
+                    "commits_behind": 1,
+                    "stale": True,
+                },
+                advisories=(
+                    {
+                        "code": "supervisor_code_stale",
+                        "severity": "warning",
+                        "identity_source": "recorded",
+                        "commit_relation": "supervisor_behind",
+                        "commits_behind": 1,
+                        "changed_files": ["src/vibe_loop/autopilot.py"],
+                        "changed_files_truncated": 0,
+                    },
+                ),
+            )
+            stdout = StringIO()
+            with (
+                mock.patch(
+                    "vibe_loop.cli.collect_supervisor_status",
+                    return_value=supervisor,
+                ),
+                redirect_stdout(stdout),
+            ):
+                exit_code = main(["doctor", "--repo", str(repo), "--json"])
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertNotIn("note", payload["config"])
+        self.assertEqual(
+            [advisory["code"] for advisory in payload["advisories"]],
+            ["supervisor_code_stale"],
+        )
 
     def test_supervisor_status_reports_stale_code_and_restart_clears(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

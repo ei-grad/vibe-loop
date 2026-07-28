@@ -24,7 +24,6 @@ import vibe_loop.cli as cli_module
 from vibe_loop.autopilot import (
     AUTOPILOT_RECORD_SCHEMA_VERSION,
     DiskCapacitySample,
-    SupervisorStatus,
     WORKTREE_DISPOSITION_STATUS_WORKTREE_LIMIT,
     collect_supervisor_status,
     run_autopilot,
@@ -10814,50 +10813,6 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertIn("per-cycle=sha256:", status_text)
         self.assertIn("advisories:", status_text)
         self.assertIn("supervisor_config_stale: autopilot.jobs", status_text)
-
-    def test_doctor_code_advisory_does_not_claim_config_divergence(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory) / "project"
-            init_planning_repo(repo, THREE_TASK_PLAN)
-            supervisor = SupervisorStatus(
-                state="running",
-                code={
-                    "started_commit": "old",
-                    "current_commit": "new",
-                    "identity_source": "recorded",
-                    "commit_relation": "supervisor_behind",
-                    "commits_behind": 1,
-                    "stale": True,
-                },
-                advisories=(
-                    {
-                        "code": "supervisor_code_stale",
-                        "severity": "warning",
-                        "identity_source": "recorded",
-                        "commit_relation": "supervisor_behind",
-                        "commits_behind": 1,
-                        "changed_files": ["src/vibe_loop/autopilot.py"],
-                        "changed_files_truncated": 0,
-                    },
-                ),
-            )
-            stdout = StringIO()
-            with (
-                patch(
-                    "vibe_loop.cli.collect_supervisor_status",
-                    return_value=supervisor,
-                ),
-                redirect_stdout(stdout),
-            ):
-                exit_code = main(["doctor", "--repo", str(repo), "--json"])
-            payload = json.loads(stdout.getvalue())
-
-        self.assertEqual(exit_code, 0)
-        self.assertNotIn("note", payload["config"])
-        self.assertEqual(
-            [advisory["code"] for advisory in payload["advisories"]],
-            ["supervisor_code_stale"],
-        )
 
     def test_run_reports_configured_dispatch_floor_hold(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
