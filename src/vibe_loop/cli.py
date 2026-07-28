@@ -1977,8 +1977,18 @@ def render_autopilot_status(status: ProjectStatus) -> str:
     if status.last_cycle is not None:
         cycle = status.last_cycle
         lines.append(
-            f"last cycle: {cycle.cycle_id} {cycle.status} @ {cycle.occurred_at}"
+            f"last cycle: {cycle.cycle_id} {cycle.status}"
+            + (f" reason={cycle.reason}" if cycle.reason else "")
+            + f" @ {cycle.occurred_at}"
         )
+        if cycle.preserved_work:
+            lines.append("last cycle preserved work:")
+            lines.extend(
+                f"  - {item.get('task_id') or 'unknown'} "
+                f"branch={item.get('branch') or 'unknown'} "
+                f"commits={item.get('commit_count') or 0}"
+                for item in cycle.preserved_work
+            )
         health_blockers = tuple(
             blocker
             for blocker in cycle.blockers
@@ -3295,6 +3305,7 @@ def render_run_inspection(inspection) -> str:
         f"exit: {exit_code}",
         f"session: {payload['session_id']} ({payload['session_id_source'] or '-'})",
         f"log: {payload['log'] or '-'}",
+        f"reason: {payload['reason'] or '-'}",
         f"message: {payload['message'] or '-'}",
         f"lifecycle: {payload['lifecycle_state'] or '-'}",
         "missing_lifecycle: "
