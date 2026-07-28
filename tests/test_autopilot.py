@@ -7661,6 +7661,39 @@ class NativePlanningTests(unittest.TestCase):
         self.assertIn(
             "add one reviewed dependency-ready task", worker_calls[0]["command"]
         )
+        self.assertIn(
+            "complete acceptance criteria and likely write surface",
+            worker_calls[0]["command"],
+        )
+        self.assertIn("build manifests and lockfiles", worker_calls[0]["command"])
+        self.assertIn(
+            "leave the entire conflict-domain set undeclared, including resource",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "candidate path-scope enforcement remains explicitly unavailable",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            str(config.state_path / "runs.jsonl"),
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "record_type is candidate_scope_assessed",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "finding is candidate_scope_drift",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "every recorded unmatched_paths entry",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "scheduler and next retry read the repair from the task itself",
+            worker_calls[0]["command"],
+        )
         self.assertEqual(
             records[0]["record_type"], AUTOPILOT_PLANNING_DECISION_RECORD_TYPE
         )
