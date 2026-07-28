@@ -1754,6 +1754,10 @@ class RuntimeGateTests(unittest.TestCase):
             collector.collect_declared(head_commit=self.head)
 
         self.assertEqual(raised.exception.code, "candidate_scope_drift")
+        self.assertIn(
+            f"comparison base {self.base}",
+            str(raised.exception),
+        )
         self.assertEqual(
             raised.exception.details,
             {

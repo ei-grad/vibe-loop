@@ -808,9 +808,11 @@ class CandidateCollector:
         self.last_scope_assessment = assessment
         self._record_scope_assessment(candidate, assessment)
         if assessment.outcome == "drift":
+            comparison_base = candidate.comparison_base or candidate.base_main
             raise CandidateCollectionError(
                 "candidate_scope_drift",
-                "candidate changed paths fall outside the task's declared path domains",
+                "candidate changed paths relative to comparison base "
+                f"{comparison_base} fall outside the task's declared path domains",
                 details=assessment.details,
             )
 
