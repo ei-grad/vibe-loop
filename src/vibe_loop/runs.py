@@ -287,6 +287,13 @@ class AttemptCircuitState:
     def open(self) -> bool:
         return self.attempt_count >= self.threshold or self.withheld
 
+    @property
+    def launch_blocked(self) -> bool:
+        return self.open or bool(
+            self.blocker_class
+            and self.attempt_count + self.pending_count >= self.threshold
+        )
+
     def to_json(self) -> dict[str, object]:
         return {
             "task_id": self.task_id,
@@ -1708,7 +1715,6 @@ def attempt_circuit_state(
         attempt_count=attempt_count,
         pending_count=pending,
         avoided_launches=avoided_launches,
-        withheld=avoided_launches > 0,
         opened_at=string_value(opened.get("occurred_at")),
         opening_reason=string_value(opened.get("reason")),
         reset_at=string_value(reset_record.get("occurred_at")),
@@ -1813,8 +1819,7 @@ class RunStore:
                 # Pending reservations are charged conservatively against the
                 # established failure class so concurrent supervisors cannot
                 # both claim the final permitted launch.
-                reserved = state.attempt_count + state.pending_count
-                if state.open or (state.blocker_class and reserved >= threshold):
+                if state.launch_blocked:
                     avoided = {
                         "schema_version": RUN_SCHEMA_VERSION,
                         "record_type": ATTEMPT_CIRCUIT_AVOIDED_RECORD_TYPE,
@@ -1927,10 +1932,16 @@ class RunStore:
             }
         )
 
-    def attempt_circuit_states(self, *, threshold: int) -> list[AttemptCircuitState]:
-        """Return currently open durable breakers from compatible journals."""
+    def attempt_circuit_task_states(
+        self,
+        *,
+        threshold: int,
+        records: list[dict[str, Any]] | None = None,
+    ) -> list[AttemptCircuitState]:
+        """Return the latest attempt state for each task in a compatible journal."""
 
-        records = self.read_records()
+        if records is None:
+            records = self.read_records()
         latest_inputs: dict[str, AttemptCircuitInputs] = {}
         for record in records:
             if record.get("record_type") != ATTEMPT_CIRCUIT_ATTEMPT_RECORD_TYPE:
@@ -1949,13 +1960,25 @@ class RunStore:
                 route=string_value(record.get("route")),
             )
         return [
-            state
+            attempt_circuit_state(records, inputs=inputs, threshold=threshold)
             for inputs in latest_inputs.values()
-            if (
-                state := attempt_circuit_state(
-                    records, inputs=inputs, threshold=threshold
-                )
-            ).open
+        ]
+
+    def attempt_circuit_states(
+        self,
+        *,
+        threshold: int,
+        records: list[dict[str, Any]] | None = None,
+    ) -> list[AttemptCircuitState]:
+        """Return currently open durable breakers from compatible journals."""
+
+        return [
+            state
+            for state in self.attempt_circuit_task_states(
+                threshold=threshold,
+                records=records,
+            )
+            if state.open
         ]
 
     def append_result(self, result: RunResult) -> None:

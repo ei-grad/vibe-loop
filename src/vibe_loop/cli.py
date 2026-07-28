@@ -1967,10 +1967,7 @@ def render_autopilot_status(status: ProjectStatus) -> str:
         guidance = project_binding_guidance(status.project_binding)
         if guidance:
             lines.append(f"  {guidance}")
-    elif not any(
-        blocker.get("mechanism") == "attempt_circuit"
-        for blocker in queue.dispatch_blockers
-    ):
+    else:
         lines.append("blockers: none")
     if queue.dispatch_blockers:
         lines.append("task dispatch blockers:")

@@ -232,6 +232,72 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(sum(not state.open for state in states), 1)
             self.assertEqual(sum(state.open for state in states), 1)
 
+    def test_pending_provider_wall_releases_conservative_attempt_hold(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(Path(directory) / "runs.jsonl")
+            inputs = AttemptCircuitInputs(
+                "TASK-01", "task", "config", "base", "candidate"
+            )
+            for index in range(2):
+                run_id = f"failure-{index}"
+                store.reserve_attempt_circuit(
+                    run_id=run_id,
+                    inputs=inputs,
+                    threshold=3,
+                )
+                result = RunResult(
+                    run_id=run_id,
+                    task_id=inputs.task_id,
+                    classification="blocked",
+                    classification_source="worker_report",
+                    exit_code=1,
+                    log_path=Path("run.log"),
+                    start_main=inputs.base,
+                    end_main=inputs.base,
+                )
+                store.append_result(result)
+                store.record_attempt_circuit_outcome(result, threshold=3)
+
+            store.reserve_attempt_circuit(
+                run_id="pending",
+                inputs=inputs,
+                threshold=3,
+            )
+            avoided = store.reserve_attempt_circuit(
+                run_id="avoided",
+                inputs=inputs,
+                threshold=3,
+            )
+            self.assertTrue(avoided.open)
+            self.assertTrue(avoided.launch_blocked)
+
+            provider_wall = RunResult(
+                run_id="pending",
+                task_id=inputs.task_id,
+                classification="provider_limit",
+                classification_source="provider_wall",
+                exit_code=1,
+                log_path=Path("run.log"),
+                start_main=inputs.base,
+                end_main=inputs.base,
+            )
+            store.append_result(provider_wall)
+            store.record_attempt_circuit_outcome(provider_wall, threshold=3)
+
+            state = store.attempt_circuit_task_states(threshold=3)[0]
+            self.assertEqual(state.attempt_count, 2)
+            self.assertEqual(state.pending_count, 0)
+            self.assertFalse(state.open)
+            self.assertFalse(state.launch_blocked)
+            self.assertEqual(store.attempt_circuit_states(threshold=3), [])
+            next_attempt = store.reserve_attempt_circuit(
+                run_id="after-wall",
+                inputs=inputs,
+                threshold=3,
+            )
+            self.assertFalse(next_attempt.open)
+            self.assertEqual(next_attempt.pending_count, 1)
+
     def test_run_result_exposes_public_model_and_effort_aliases(self) -> None:
         result = RunResult(
             run_id="run-effort",

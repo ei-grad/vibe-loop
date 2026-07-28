@@ -667,12 +667,19 @@ def collect_project_status(
     live_active_runs = tuple(
         worker.active for worker in workers if worker_holds_active_conflict(worker)
     )
+    records = run_store.read_records()
+    attempt_circuit_states = tuple(
+        run_store.attempt_circuit_task_states(
+            threshold=config.supervision.cross_run_attempt_threshold,
+            records=records,
+        )
+    )
     queue_status = collect_task_queue_status(
         config,
         active_runs=live_active_runs,
         locked_task_ids=frozenset(worker.active.task_id for worker in workers),
+        attempt_circuit_states=attempt_circuit_states,
     )
-    records = run_store.read_records()
     preflight_blockers = workspace_preflight_dispatch_blockers(
         queue_status,
         workers,
@@ -695,10 +702,7 @@ def collect_project_status(
     agent_blockers = agent_blocking_diagnostics(config)
     last_cycle = latest_cycle_summary(run_store)
     attempt_circuit_breakers = tuple(
-        breaker.to_json()
-        for breaker in run_store.attempt_circuit_states(
-            threshold=config.supervision.cross_run_attempt_threshold
-        )
+        state.to_json() for state in attempt_circuit_states if state.open
     )
     supervisor_lock = lock_manager.autopilot_status(process_exists=process_exists)
     supervisor = collect_supervisor_status(
@@ -836,6 +840,7 @@ def collect_task_queue_status(
     *,
     active_runs: tuple[ActiveRunState, ...] | None = None,
     locked_task_ids: frozenset[str] | None = None,
+    attempt_circuit_states: Sequence[AttemptCircuitState] | None = None,
 ) -> TaskQueueStatus:
     effective_config = config
     if timeout_seconds is not None:
@@ -892,20 +897,18 @@ def collect_task_queue_status(
         for task in candidate_snapshot.runnable
         if task.task_id not in admission_blocked_ids
     )
+    if attempt_circuit_states is None:
+        attempt_circuit_states = RunStore(
+            config.state_path / "runs.jsonl"
+        ).attempt_circuit_task_states(
+            threshold=config.supervision.cross_run_attempt_threshold
+        )
     attempt_circuit_blockers = current_attempt_circuit_dispatch_blockers(
         config,
         runnable,
-        RunStore(config.state_path / "runs.jsonl").attempt_circuit_states(
-            threshold=config.supervision.cross_run_attempt_threshold
-        ),
+        attempt_circuit_states,
     )
-    attempt_circuit_blocked_ids = {
-        str(blocker["task_id"]) for blocker in attempt_circuit_blockers
-    }
-    runnable = tuple(
-        task for task in runnable if task.task_id not in attempt_circuit_blocked_ids
-    )
-    return TaskQueueStatus(
+    queue_status = TaskQueueStatus(
         total=len(tasks),
         ready=len(candidate_snapshot.ready),
         runnable=len(runnable),
@@ -925,12 +928,9 @@ def collect_task_queue_status(
             for task in tasks
             if task.status.casefold() == "gated"
         ),
-        dispatch_blockers=(
-            *candidate_blockers,
-            *admission_blockers,
-            *attempt_circuit_blockers,
-        ),
+        dispatch_blockers=(*candidate_blockers, *admission_blockers),
     )
+    return apply_dispatch_blockers(queue_status, attempt_circuit_blockers)
 
 
 def current_attempt_circuit_dispatch_blockers(
@@ -938,7 +938,7 @@ def current_attempt_circuit_dispatch_blockers(
     tasks: Sequence[Task],
     states: Sequence[AttemptCircuitState],
 ) -> tuple[dict[str, object], ...]:
-    current_states = {state.task_id: state for state in states if state.open}
+    current_states = {state.task_id: state for state in states if state.launch_blocked}
     if not current_states:
         return ()
     candidate, candidate_error = git_text(config.repo, "rev-parse", "HEAD")

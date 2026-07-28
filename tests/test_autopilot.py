@@ -414,6 +414,7 @@ class AutopilotStatusTests(unittest.TestCase):
             rendered = render_autopilot_status(status)
 
         self.assertTrue(avoided.open)
+        self.assertTrue(avoided.launch_blocked)
         self.assertEqual(payload["queue"]["ready"], 1)
         self.assertEqual(payload["queue"]["runnable"], 0)
         self.assertEqual(payload["queue"]["runnable_tasks"], [])
@@ -429,7 +430,7 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertIn("attempt circuit open", rendered)
         self.assertIn("attempt_count=2 pending_count=1 threshold=3", rendered)
         self.assertIn("vibe-loop attempt-circuit reset <task-id>", rendered)
-        self.assertNotIn("blockers: none", rendered)
+        self.assertIn("blockers: none", rendered)
 
     def test_status_views_surface_latest_main_verification_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
