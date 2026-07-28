@@ -316,8 +316,10 @@ class CycleSummary:
     cycle_id: str
     status: str
     occurred_at: str
+    reason: str = ""
     actions: tuple[str, ...] = ()
     blockers: tuple[str, ...] = ()
+    preserved_work: tuple[dict[str, object], ...] = ()
     next_wake: str = ""
     record: dict[str, Any] = dataclasses.field(default_factory=dict)
 
@@ -367,8 +369,10 @@ class CycleSummary:
             "cycle_id": self.cycle_id,
             "status": self.status,
             "occurred_at": self.occurred_at,
+            "reason": self.reason,
             "actions": list(self.actions),
             "blockers": list(self.blockers),
+            "preserved_work": [dict(item) for item in self.preserved_work],
             "next_wake": self.next_wake,
             "record": dict(self.record),
         }
@@ -506,8 +510,10 @@ class AutopilotCycleResult:
     status: str
     occurred_at: str
     project_status: ProjectStatus
+    reason: str = ""
     actions: tuple[str, ...] = ()
     blockers: tuple[str, ...] = ()
+    preserved_work: tuple[dict[str, object], ...] = ()
     child_pid: int | None = None
     child_log: Path | None = None
     next_wake: str = ""
@@ -515,6 +521,12 @@ class AutopilotCycleResult:
     planning_backoff_seconds: float | None = None
     autopilot_run_id: str = ""
     dispatched_runs: int = 0
+
+    def __post_init__(self) -> None:
+        if self.status == "restartable" and not self.reason:
+            object.__setattr__(self, "reason", "child_exit_nonzero")
+        elif self.status == "terminated" and not self.reason:
+            object.__setattr__(self, "reason", "run_interrupted_or_killed")
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -525,6 +537,7 @@ class AutopilotCycleResult:
             "repo": str(self.repo),
             "status": self.status,
             "occurred_at": self.occurred_at,
+            "reason": self.reason,
             "queue": self.project_status.queue.to_json(),
             "workers": [worker.to_json() for worker in self.project_status.workers],
             "stranded_review_tasks": [
@@ -538,6 +551,7 @@ class AutopilotCycleResult:
             ),
             "actions": list(self.actions),
             "blockers": list(self.blockers),
+            "preserved_work": [dict(item) for item in self.preserved_work],
             "child_pid": self.child_pid,
             "child_log": str(self.child_log) if self.child_log is not None else "",
             "next_wake": self.next_wake,
@@ -1704,8 +1718,14 @@ def latest_cycle_summary(run_store: RunStore) -> CycleSummary | None:
             cycle_id=str(record.get("cycle_id") or ""),
             status=str(record.get("status") or ""),
             occurred_at=str(record.get("occurred_at") or ""),
+            reason=str(record.get("reason") or ""),
             actions=string_tuple(record.get("actions")),
             blockers=string_tuple(record.get("blockers")),
+            preserved_work=tuple(
+                dict(item)
+                for item in record.get("preserved_work", ())
+                if isinstance(item, Mapping)
+            ),
             next_wake=str(record.get("next_wake") or ""),
             record=record,
         )
@@ -1871,8 +1891,14 @@ def recent_cycle_summaries(
                 cycle_id=str(record.get("cycle_id") or ""),
                 status=str(record.get("status") or ""),
                 occurred_at=str(record.get("occurred_at") or ""),
+                reason=str(record.get("reason") or ""),
                 actions=string_tuple(record.get("actions")),
                 blockers=string_tuple(record.get("blockers")),
+                preserved_work=tuple(
+                    dict(item)
+                    for item in record.get("preserved_work", ())
+                    if isinstance(item, Mapping)
+                ),
                 next_wake=str(record.get("next_wake") or ""),
             )
         )
@@ -4640,6 +4666,105 @@ def classify_child_exit(exit_code: int) -> str:
     return "restartable"
 
 
+def restartable_cycle_reason(
+    exit_code: int,
+    records: Sequence[Mapping[str, object]],
+) -> str:
+    for record in reversed(records):
+        if (
+            record.get("record_type") == TASK_RESTART_RECORD_TYPE
+            and record.get("exhausted") is True
+        ):
+            return str(record.get("reason") or "restart_budget_exhausted")
+
+    completed_reports = {
+        str(record.get("run_id") or "")
+        for record in records
+        if record.get("record_type") == "worker_report"
+        and record.get("status") == "completed"
+    }
+    latest_results: dict[str, Mapping[str, object]] = {}
+    for record in records:
+        if record.get("record_type") not in {None, RUN_RECORD_TYPE}:
+            continue
+        run_id = str(record.get("run_id") or "")
+        if run_id:
+            latest_results[run_id] = record
+
+    for record in reversed(tuple(latest_results.values())):
+        source = str(record.get("classification_source") or "")
+        classification = str(record.get("classification") or record.get("status") or "")
+        if source == "autopilot_stop":
+            return source
+        if classification == "timed_out" or source in {
+            "worker_timeout",
+            "worker_interrupted",
+        }:
+            return source or "run_interrupted_or_killed"
+        worker_report = record.get("worker_report")
+        report_completed = (
+            isinstance(worker_report, Mapping)
+            and worker_report.get("status") == "completed"
+        )
+        if classification != "completed" and (
+            str(record.get("run_id") or "") in completed_reports or report_completed
+        ):
+            return source or "post_implementation_failure"
+        if source:
+            return source
+
+    if exit_code < 0:
+        return "run_interrupted_or_killed"
+    return "child_exit_nonzero"
+
+
+def preserved_cycle_work(
+    repo: Path,
+    main_branch: str,
+    records: Sequence[Mapping[str, object]],
+) -> tuple[dict[str, object], ...]:
+    claims: dict[str, Mapping[str, object]] = {}
+    for record in records:
+        if record.get("record_type") != WORKSPACE_CLAIM_RECORD_TYPE:
+            continue
+        branch = str(record.get("branch") or "")
+        if branch:
+            claims[branch] = record
+
+    preserved: list[dict[str, object]] = []
+    main_ref = f"refs/heads/{main_branch}"
+    for branch, record in sorted(claims.items()):
+        branch_ref = f"refs/heads/{branch}"
+        result = subprocess.run(
+            [
+                "git",
+                "rev-list",
+                "--count",
+                f"{main_ref}..{branch_ref}",
+            ],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            continue
+        try:
+            commit_count = int(result.stdout.strip())
+        except ValueError:
+            continue
+        if commit_count <= 0:
+            continue
+        preserved.append(
+            {
+                "task_id": str(record.get("task_id") or ""),
+                "branch": branch,
+                "commit_count": commit_count,
+            }
+        )
+    return tuple(preserved)
+
+
 PROVIDER_LIMIT_SCAN_MAX_RESULTS = 50
 
 
@@ -6956,6 +7081,8 @@ def execute_autopilot_cycle(
     actions: list[str] = []
     child_pid: int | None = None
     child_log: Path | None = None
+    cycle_reason = ""
+    preserved_work: tuple[dict[str, object], ...] = ()
     cleanup_errors = 0
     planning_provider_limit_pause: float | None = None
     planning_backoff_pause: float | None = None
@@ -7377,6 +7504,7 @@ def execute_autopilot_cycle(
         )
         child_pid = observed_pid.get("pid")
         records_after_launch = run_store.read_records()
+        cycle_records = records_after_launch[len(records_before_launch) :]
         run_started_after = sum(
             1
             for record in records_after_launch
@@ -7384,6 +7512,16 @@ def execute_autopilot_cycle(
         )
         dispatched_runs = max(0, run_started_after - run_started_before)
         cycle_status = classify_child_exit(exit_code)
+        cycle_reason = (
+            restartable_cycle_reason(exit_code, cycle_records)
+            if cycle_status in {"restartable", "terminated"}
+            else ""
+        )
+        preserved_work = preserved_cycle_work(
+            config.repo,
+            config.main_branch,
+            cycle_records,
+        )
         actions.append(f"child_exit:{exit_code}")
         actions.append(f"dispatched_runs:{dispatched_runs}")
         if cycle_status == "completed" and dispatched_runs == 0:
@@ -7423,8 +7561,10 @@ def execute_autopilot_cycle(
         status=cycle_status,
         occurred_at=utc_now_iso(),
         project_status=status,
+        reason=cycle_reason,
         actions=tuple(actions),
         blockers=blockers,
+        preserved_work=preserved_work,
         child_pid=child_pid,
         child_log=child_log,
         provider_limit_pause_seconds=pause_seconds,

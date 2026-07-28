@@ -1977,8 +1977,18 @@ def render_autopilot_status(status: ProjectStatus) -> str:
     if status.last_cycle is not None:
         cycle = status.last_cycle
         lines.append(
-            f"last cycle: {cycle.cycle_id} {cycle.status} @ {cycle.occurred_at}"
+            f"last cycle: {cycle.cycle_id} {cycle.status}"
+            + (f" reason={cycle.reason}" if cycle.reason else "")
+            + f" @ {cycle.occurred_at}"
         )
+        if cycle.preserved_work:
+            lines.append("last cycle preserved work:")
+            lines.extend(
+                f"  - {item.get('task_id') or 'unknown'} "
+                f"branch={item.get('branch') or 'unknown'} "
+                f"commits={item.get('commit_count') or 0}"
+                for item in cycle.preserved_work
+            )
         health_blockers = tuple(
             blocker
             for blocker in cycle.blockers

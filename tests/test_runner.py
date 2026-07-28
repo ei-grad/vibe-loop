@@ -11958,6 +11958,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             # published to the backend, so both views agree after the fact.
             self.assertEqual(released[0].get("outcome"), "completed")
             self.assertEqual(released[0].get("classification"), "completed")
+            self.assertEqual(released[0].get("reason"), "worker_report")
 
     def test_parallel_jobs_settle_each_run_independently(self) -> None:
         tasks = [

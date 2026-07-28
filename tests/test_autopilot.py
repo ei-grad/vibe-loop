@@ -70,6 +70,8 @@ from vibe_loop.autopilot import (
     planning_outcome_record,
     planning_provider_launched,
     planning_source_fingerprint,
+    preserved_cycle_work,
+    restartable_cycle_reason,
     NativePlanningWorkerInterrupted,
     ProjectEntry,
     ProjectRegistry,
@@ -488,6 +490,35 @@ class AutopilotStatusTests(unittest.TestCase):
 
         self.assertFalse(updated["git"]["dirty"])
         self.assertNotIn("repo_dirty", updated["blockers"])
+
+    def test_restartable_cycle_reason_surfaces_in_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            status = collect_project_status(config)
+            AutopilotCycleResult(
+                cycle_id="cycle-restartable",
+                repo=config.repo,
+                status="restartable",
+                reason="restart_budget_exhausted",
+                occurred_at="2026-07-28T06:05:22+00:00",
+                project_status=status,
+            ).append_to(run_store)
+
+            updated = collect_project_status(config)
+            payload = updated.to_json()
+            rendered = render_autopilot_status(updated)
+
+        self.assertEqual(
+            payload["last_cycle"]["reason"],
+            "restart_budget_exhausted",
+        )
+        self.assertIn(
+            "restartable reason=restart_budget_exhausted",
+            rendered,
+        )
 
     def test_collect_project_status_reports_unavailable_agent_as_blocker(
         self,
@@ -6129,6 +6160,109 @@ class AutopilotRecheckTests(unittest.TestCase):
         self.assertEqual(first.dispatched_runs, 0)
         self.assertFalse(cycle_should_recheck(first))
         self.assertEqual(sleeps, [10.0, 20.0, 40.0, 30.0])
+
+    def test_restartable_cycle_records_distinct_journal_reasons(self) -> None:
+        route_records = (
+            (
+                "restart_budget_exhausted",
+                {
+                    "record_type": "task_restart",
+                    "run_id": "retry-run",
+                    "task_id": "TASK-01",
+                    "exhausted": True,
+                    "reason": "restart_budget_exhausted",
+                },
+            ),
+            (
+                "runtime_stage_failed",
+                RunResult(
+                    run_id="post-run",
+                    task_id="TASK-01",
+                    classification="failed",
+                    classification_source="runtime_stage_failed",
+                    exit_code=1,
+                    log_path=Path("/tmp/post.log"),
+                    start_main="base",
+                    end_main="candidate",
+                    worker_report=WorkerReport(
+                        run_id="post-run",
+                        task_id="TASK-01",
+                        status="completed",
+                    ).to_json(),
+                ).to_record(),
+            ),
+        )
+        observed: list[str] = []
+        for expected_reason, route_record in route_records:
+            with tempfile.TemporaryDirectory() as directory:
+                repo = Path(directory)
+                configured_repo(repo, [("TASK-01", "Next", "", "ready scope")])
+                config = load_config(repo)
+
+                def launcher(*args, **kwargs):
+                    RunStore(config.state_path / "runs.jsonl").append_record(
+                        route_record
+                    )
+                    return 1
+
+                summary = run_autopilot(config, once=True, launcher=launcher)
+                cycle_record = next(
+                    record
+                    for record in RunStore(
+                        config.state_path / "runs.jsonl"
+                    ).read_records()
+                    if record.get("record_type") == AUTOPILOT_CYCLE_RECORD_TYPE
+                )
+
+            observed.append(summary.cycles[0].reason)
+            self.assertEqual(summary.cycles[0].reason, expected_reason)
+            self.assertEqual(cycle_record["reason"], expected_reason)
+
+        self.assertEqual(
+            observed,
+            ["restart_budget_exhausted", "runtime_stage_failed"],
+        )
+        self.assertEqual(
+            restartable_cycle_reason(1, []),
+            "child_exit_nonzero",
+        )
+
+    def test_restartable_cycle_records_preserved_branch_commit_count(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            init_repo(repo)
+            (repo / "base.txt").write_text("base\n", encoding="utf-8")
+            run(repo, "git", "add", "base.txt")
+            run(repo, "git", "commit", "-m", "add base")
+            run(repo, "git", "switch", "-c", "vibe-loop/TASK-01")
+            (repo / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+            run(repo, "git", "add", "candidate.txt")
+            run(repo, "git", "commit", "-m", "add candidate")
+            run(repo, "git", "switch", "main")
+
+            preserved = preserved_cycle_work(
+                repo,
+                "main",
+                [
+                    {
+                        "record_type": "workspace_claim",
+                        "run_id": "run-1",
+                        "task_id": "TASK-01",
+                        "branch": "vibe-loop/TASK-01",
+                    }
+                ],
+            )
+
+        self.assertEqual(
+            preserved,
+            (
+                {
+                    "task_id": "TASK-01",
+                    "branch": "vibe-loop/TASK-01",
+                    "commit_count": 1,
+                },
+            ),
+        )
 
     def test_task_source_polling_includes_restartable_backoff(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
