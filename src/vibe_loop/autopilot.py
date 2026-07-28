@@ -103,6 +103,7 @@ from vibe_loop.runs import (
     AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE,
     AUTOPILOT_TROUBLESHOOT_RECORD_TYPE,
     AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
+    INTEGRATION_RESULT_RECORD_TYPE,
     REVIEW_VERDICT_RECORD_TYPE,
     RUN_CONTRACT_RESOLVED_RECORD_TYPE,
     RUN_RECORD_TYPE,
@@ -440,6 +441,9 @@ class ProjectStatus:
     non_closure: NonClosureSummary = dataclasses.field(
         default_factory=NonClosureSummary
     )
+    latest_main_verification_failure: dict[str, object] = dataclasses.field(
+        default_factory=dict
+    )
     next_wake: str = ""
     attempt_circuit_breakers: tuple[dict[str, object], ...] = ()
     runtime_context: tuple[tuple[str, str], ...] = ()
@@ -485,6 +489,9 @@ class ProjectStatus:
                 self.last_cycle.to_json() if self.last_cycle is not None else None
             ),
             "non_closure": self.non_closure.to_json(),
+            "latest_main_verification_failure": dict(
+                self.latest_main_verification_failure
+            ),
             "next_wake": self.next_wake,
             "attempt_circuit_breakers": [
                 dict(breaker) for breaker in self.attempt_circuit_breakers
@@ -576,6 +583,7 @@ def collect_project_status(
     contract_blockers = config_contract_blockers(config)
     run_store = RunStore(config.state_path / "runs.jsonl")
     non_closure = summarize_non_closures(run_store)
+    latest_verification_failure = latest_main_verification_failure(run_store)
     troubleshoot = latest_native_troubleshoot(run_store)
     if disk_health_result is None:
         disk_health_result = run_disk_health(config, cycle_id="status")
@@ -612,6 +620,7 @@ def collect_project_status(
             ),
             last_cycle=latest_cycle_summary(run_store),
             non_closure=non_closure,
+            latest_main_verification_failure=latest_verification_failure,
             blockers=(
                 *(item.code for item in project_binding.diagnostics),
                 *(item.code for item in contract_blockers),
@@ -787,6 +796,7 @@ def collect_project_status(
         stranded_review_tasks=stranded_reviews,
         last_cycle=last_cycle,
         non_closure=non_closure,
+        latest_main_verification_failure=latest_verification_failure,
         next_wake=next_wake,
         attempt_circuit_breakers=attempt_circuit_breakers,
         runtime_context=config.runtime_context,
@@ -2213,6 +2223,63 @@ def summarize_non_closures(
         alarm_threshold=alarm_threshold,
         reasons=ordered_reasons,
     )
+
+
+def latest_main_verification_failure(
+    run_store: RunStore,
+) -> dict[str, object]:
+    records = run_store.read_records()
+    terminal = next(
+        (
+            record
+            for record in reversed(records)
+            if record.get("record_type") in {None, RUN_RECORD_TYPE}
+        ),
+        None,
+    )
+    if terminal is None or str(terminal.get("classification_source") or "") != (
+        "main_verification_failed"
+    ):
+        return {}
+    run_id = str(terminal.get("run_id") or "")
+    task_id = str(terminal.get("task_id") or "")
+    integration = next(
+        (
+            record
+            for record in reversed(records)
+            if record.get("record_type") == INTEGRATION_RESULT_RECORD_TYPE
+            and str(record.get("run_id") or "") == run_id
+            and str(record.get("task_id") or "") == task_id
+            and record.get("reason") == "main_verification_failed"
+        ),
+        None,
+    )
+    if integration is None:
+        return {}
+    verification = integration.get("verification")
+    checks = verification if isinstance(verification, list) else []
+    failed_check = next(
+        (
+            check
+            for check in reversed(checks)
+            if isinstance(check, Mapping)
+            and check.get("phase") == "main"
+            and check.get("exit_class") != "passed"
+        ),
+        None,
+    )
+    if failed_check is None:
+        return {}
+    output_tail = failed_check.get("output_tail")
+    return {
+        "reason": "main_verification_failed",
+        "run_id": run_id,
+        "task_id": task_id,
+        "command_key": str(failed_check.get("command_key") or ""),
+        "exit_class": str(failed_check.get("exit_class") or ""),
+        "exit_code": failed_check.get("exit_code"),
+        "output_tail": output_tail if isinstance(output_tail, str) else "",
+    }
 
 
 def non_closure_alarm(summary: NonClosureSummary) -> str:

@@ -86,6 +86,7 @@ MALFORMED_REVIEW_OUTPUT_MAX_CHARS = 4096
 MALFORMED_REVIEW_OUTPUT_LINE_MAX_CHARS = 1024
 MALFORMED_REVIEW_OUTPUT_RAW_WINDOW_CHARS = 8192
 MALFORMED_REVIEW_OUTPUT_ELISION = "<elided>"
+VERIFICATION_OUTPUT_READ_BYTES = 8192
 FINDING_SEVERITIES = ("P0", "P1", "P2", "P3")
 FINDING_STATES = ("open", "remediated", "accepted", "rejected")
 CONTINUATION_FALLBACK_REASONS = (
@@ -3693,17 +3694,24 @@ class IntegrationCheckResult:
     duration_seconds: float
     log_reference: str
     evidence_digest: str
+    output_tail: str = ""
 
     @property
     def passed(self) -> bool:
         return self.exit_class == "passed"
 
     def to_payload(self) -> dict[str, object]:
-        return dataclasses.asdict(self)
+        payload = dataclasses.asdict(self)
+        if not self.output_tail:
+            payload.pop("output_tail")
+        return payload
 
     @classmethod
     def from_payload(cls, value: object) -> IntegrationCheckResult | None:
         if not isinstance(value, Mapping):
+            return None
+        output_tail = value.get("output_tail", "")
+        if not isinstance(output_tail, str):
             return None
         try:
             return cls(
@@ -3718,9 +3726,32 @@ class IntegrationCheckResult:
                 duration_seconds=float(value["duration_seconds"]),
                 log_reference=str(value["log_reference"]),
                 evidence_digest=str(value["evidence_digest"]),
+                output_tail=output_tail,
             )
         except (KeyError, TypeError, ValueError):
             return None
+
+
+def verification_output_tail(log_path: Path) -> str:
+    try:
+        with log_path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            offset = max(0, size - VERIFICATION_OUTPUT_READ_BYTES)
+            stream.seek(offset)
+            raw = stream.read()
+    except OSError:
+        return ""
+    text = raw.decode("utf-8", errors="replace")
+    if offset:
+        newline = text.find("\n")
+        if newline < 0:
+            return ""
+        text = text[newline + 1 :]
+    bounded = bound_error_stream_for_redaction(text)
+    redacted = redact_evidence_text(bounded)
+    redacted = redact_fencing_token_diagnostic(redacted, {})
+    return bounded_error_stream(redacted)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4520,6 +4551,9 @@ class Integrator:
                 evidence_digest=(
                     "sha256:" + hashlib.sha256(log_path.read_bytes()).hexdigest()
                 ),
+                output_tail=(
+                    "" if exit_class == "passed" else verification_output_tail(log_path)
+                ),
             )
             results.append(result)
             if not result.passed:
@@ -4633,6 +4667,7 @@ class Integrator:
                 evidence_digest=(
                     "sha256:" + hashlib.sha256(log_path.read_bytes()).hexdigest()
                 ),
+                output_tail=verification_output_tail(log_path),
             ),
         )
 

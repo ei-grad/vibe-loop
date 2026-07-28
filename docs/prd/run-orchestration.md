@@ -330,6 +330,11 @@ verification retains the configured environment without observing concurrent
 runtime ref or worktree changes. Failure to prepare that checkout is recorded
 as an `execution_error`, distinct from a command failure.
 
+Each failed integration or main verification entry records the command key and
+the combined command-output tail. The tail uses the task-source adapter's
+pre-redaction line and window bounds, secret scrubbing, and final persisted
+bound. Passing verification entries omit command output.
+
 If main verification fails after a fast-forward, the runtime restores
 `main_before` with Git's keep-local-changes semantics. Unrelated tracked edits
 in the primary checkout survive the rollback; an overlapping edit makes

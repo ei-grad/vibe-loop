@@ -355,6 +355,74 @@ class AutopilotStatusTests(unittest.TestCase):
             )
         )
 
+    def test_status_surfaces_latest_main_verification_failure_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.integration_result(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    payload={
+                        "outcome": "failed",
+                        "status": "failed",
+                        "reason": "main_verification_failed",
+                        "branch": "worker/TASK-01",
+                        "candidate_head": "candidate",
+                        "refreshed_head": "candidate",
+                        "main_before": "base",
+                        "main_after": "base",
+                        "verification": [
+                            {
+                                "phase": "main",
+                                "command_key": "completion.commands[0]",
+                                "exit_class": "failed",
+                                "exit_code": 1,
+                                "duration_seconds": 0.25,
+                                "log_reference": "main-1.log",
+                                "evidence_digest": "sha256:digest",
+                                "output_tail": "backup lock unavailable",
+                            }
+                        ],
+                        "recovered": True,
+                        "diagnostics": {"main_recovery": "restored"},
+                    },
+                )
+            )
+            run_store.append_result(
+                RunResult(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    classification="failed",
+                    classification_source="main_verification_failed",
+                    exit_code=1,
+                    log_path=config.state_path / "runs" / "run-1.log",
+                    start_main="base",
+                    end_main="base",
+                )
+            )
+
+            status = collect_project_status(config)
+            payload = status.to_json()
+            rendered = render_autopilot_status(status)
+
+        self.assertEqual(
+            payload["latest_main_verification_failure"]["command_key"],
+            "completion.commands[0]",
+        )
+        self.assertEqual(
+            payload["latest_main_verification_failure"]["output_tail"],
+            "backup lock unavailable",
+        )
+        self.assertIn(
+            "main_verification_failed: task=TASK-01 run=run-1 "
+            "command=completion.commands[0] exit=1",
+            rendered,
+        )
+        self.assertIn("output tail:\n    backup lock unavailable", rendered)
+
     def test_unapproved_run_does_not_reset_approved_non_closure_streak(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

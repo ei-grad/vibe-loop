@@ -1846,6 +1846,20 @@ def render_autopilot_status(status: ProjectStatus) -> str:
         f"consecutive={non_closure.consecutive}/"
         f"{non_closure.alarm_threshold}{alarm}; reasons: {reasons}"
     )
+    verification_failure = status.latest_main_verification_failure
+    if verification_failure:
+        exit_code = verification_failure.get("exit_code")
+        lines.append(
+            "main_verification_failed: "
+            f"task={verification_failure.get('task_id') or '-'} "
+            f"run={verification_failure.get('run_id') or '-'} "
+            f"command={verification_failure.get('command_key') or '-'} "
+            f"exit={exit_code if exit_code is not None else '-'}"
+        )
+        output_tail = verification_failure.get("output_tail")
+        if isinstance(output_tail, str) and output_tail:
+            lines.append("  output tail:")
+            lines.extend(f"    {line}" for line in output_tail.splitlines())
     if status.alarms:
         lines.append("alarms:")
         lines.extend(f"  - {alarm}" for alarm in status.alarms)

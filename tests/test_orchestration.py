@@ -3754,6 +3754,33 @@ class RuntimeIntegrationTests(unittest.TestCase):
         )
         self.assertFalse(self.manager.main_integration_status().locked)
 
+    def test_failed_main_verification_persists_bounded_scrubbed_output(self) -> None:
+        self.advance_main()
+        result = self.integrator(
+            commands=(
+                "true",
+                "printf '%03000d\\nmigration failed: lock contention\\n"
+                "token=do-not-retain\\n' 0 >&2; exit 1",
+            ),
+        ).run()
+
+        self.assertEqual(result.reason, "main_verification_failed")
+        failed = result.verification[-1]
+        self.assertEqual(failed.command_key, "completion.commands[1]")
+        self.assertIn("migration failed: lock contention", failed.output_tail)
+        self.assertNotIn("do-not-retain", failed.output_tail)
+        self.assertLessEqual(len(failed.output_tail), 2000)
+        record = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "integration_result"
+        )
+        self.assertNotIn("output_tail", record["verification"][0])
+        self.assertEqual(
+            record["verification"][-1]["output_tail"],
+            failed.output_tail,
+        )
+
     def test_main_recovery_refuses_to_overwrite_overlapping_worktree_change(
         self,
     ) -> None:
