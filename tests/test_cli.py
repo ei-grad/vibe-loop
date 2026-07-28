@@ -6208,7 +6208,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertEqual(payload["classification"], "blocked")
         self.assertEqual(payload["classification_source"], "worker_report")
-        self.assertEqual(payload["message"], "")
+        self.assertEqual(payload["reason"], "worker_report_blocked")
+        self.assertEqual(payload["message"], "blocked by dependency")
         self.assertFalse((repo / "completion-ran").exists())
 
     def test_run_next_records_active_worker_metadata_in_task_lock(self) -> None:
