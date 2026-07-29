@@ -74,6 +74,8 @@ CANDIDATE_BASE_ANCHOR_OUTCOMES = (
     "refused-retry-bound",
 )
 GATE_EXIT_CLASSES = ("passed", "failed", "candidate_changed", "execution_error")
+GATE_FAILURE_CLASSES = ("none", "candidate", "environment")
+GATE_BUDGET_CHARGES = ("none", "remediation")
 REVIEW_VERDICTS = ("approve", "findings", "error")
 REVIEW_CONTROL_VERDICTS = ("clean", "findings", "blocked")
 REVIEW_DIAGNOSTIC_OUTPUT_CLASSIFICATIONS = frozenset({"malformed", "unavailable"})
@@ -263,6 +265,16 @@ class CandidateReanchorRetryExhausted(CandidateCollectionError):
 
 class GateExecutionError(RuntimeError):
     pass
+
+
+class GateEnvironmentFailure(GateExecutionError):
+    def __init__(self, failed_gate_keys: Sequence[str]) -> None:
+        self.failed_gate_keys = tuple(failed_gate_keys)
+        super().__init__(
+            "gate failure reproduced on the unmodified base; "
+            "remediation budget charged: none; failed gates: "
+            + ", ".join(self.failed_gate_keys)
+        )
 
 
 class ReviewExecutionError(RuntimeError):
@@ -1444,7 +1456,30 @@ class GateResult:
     log_reference: str
     evidence_digest: str
     candidate_fingerprint: str
+    failure_class: str = "none"
+    budget_charge: str = "none"
+    base_exit_class: str = ""
+    base_exit_code: int | None = None
+    base_log_reference: str = ""
+    base_evidence_digest: str = ""
+    comparison_base: str = ""
     resumed: bool = False
+
+    def __post_init__(self) -> None:
+        if self.failure_class not in GATE_FAILURE_CLASSES:
+            raise ValueError(f"unsupported gate failure class: {self.failure_class}")
+        if self.budget_charge not in GATE_BUDGET_CHARGES:
+            raise ValueError(f"unsupported gate budget charge: {self.budget_charge}")
+        if self.passed:
+            if self.failure_class != "none" or self.budget_charge != "none":
+                raise ValueError("passing gate evidence cannot carry a failure charge")
+            return
+        if self.failure_class == "none":
+            object.__setattr__(self, "failure_class", "candidate")
+        if self.budget_charge == "none" and self.failure_class == "candidate":
+            object.__setattr__(self, "budget_charge", "remediation")
+        if self.failure_class == "environment" and self.budget_charge != "none":
+            raise ValueError("environment gate failures cannot charge remediation")
 
     @property
     def passed(self) -> bool:
@@ -1459,9 +1494,18 @@ class GateResult:
             "log_reference": self.log_reference,
             "evidence_digest": self.evidence_digest,
             "candidate_fingerprint": self.candidate_fingerprint,
+            "failure_class": self.failure_class,
+            "budget_charge": self.budget_charge,
         }
         if self.exit_code is not None:
             payload["exit_code"] = self.exit_code
+        if self.base_exit_class:
+            payload["base_exit_class"] = self.base_exit_class
+            payload["base_log_reference"] = self.base_log_reference
+            payload["base_evidence_digest"] = self.base_evidence_digest
+            payload["comparison_base"] = self.comparison_base
+            if self.base_exit_code is not None:
+                payload["base_exit_code"] = self.base_exit_code
         return payload
 
     @classmethod
@@ -1475,6 +1519,17 @@ class GateResult:
         evidence_digest = record.get("evidence_digest")
         fingerprint = record.get("candidate_fingerprint")
         exit_code = record.get("exit_code")
+        failure_class = record.get("failure_class")
+        budget_charge = record.get("budget_charge")
+        base_exit_class = record.get("base_exit_class", "")
+        base_exit_code = record.get("base_exit_code")
+        base_log_reference = record.get("base_log_reference", "")
+        base_evidence_digest = record.get("base_evidence_digest", "")
+        comparison_base = record.get("comparison_base", "")
+        if failure_class is None:
+            failure_class = "none" if exit_class == "passed" else "candidate"
+        if budget_charge is None:
+            budget_charge = "none" if exit_class == "passed" else "remediation"
         if (
             not isinstance(config_key, str)
             or exit_class not in GATE_EXIT_CLASSES
@@ -1485,6 +1540,24 @@ class GateResult:
             or not isinstance(fingerprint, str)
             or isinstance(exit_code, bool)
             or (exit_code is not None and not isinstance(exit_code, int))
+            or failure_class not in GATE_FAILURE_CLASSES
+            or budget_charge not in GATE_BUDGET_CHARGES
+            or (base_exit_class and base_exit_class not in GATE_EXIT_CLASSES)
+            or not isinstance(base_exit_class, str)
+            or isinstance(base_exit_code, bool)
+            or (base_exit_code is not None and not isinstance(base_exit_code, int))
+            or not isinstance(base_log_reference, str)
+            or not isinstance(base_evidence_digest, str)
+            or not isinstance(comparison_base, str)
+            or (
+                failure_class == "environment"
+                and (
+                    base_exit_class != "failed"
+                    or not base_log_reference
+                    or not base_evidence_digest
+                    or not comparison_base
+                )
+            )
         ):
             return None
         return cls(
@@ -1495,6 +1568,13 @@ class GateResult:
             log_reference=log_reference,
             evidence_digest=evidence_digest,
             candidate_fingerprint=fingerprint,
+            failure_class=str(failure_class),
+            budget_charge=str(budget_charge),
+            base_exit_class=base_exit_class,
+            base_exit_code=base_exit_code,
+            base_log_reference=base_log_reference,
+            base_evidence_digest=base_evidence_digest,
+            comparison_base=comparison_base,
             resumed=True,
         )
 
@@ -1512,6 +1592,14 @@ class GateRunSummary:
     @property
     def failed_gate_keys(self) -> tuple[str, ...]:
         return tuple(result.config_key for result in self.results if not result.passed)
+
+    @property
+    def environment_failed_gate_keys(self) -> tuple[str, ...]:
+        return tuple(
+            result.config_key
+            for result in self.results
+            if result.failure_class == "environment"
+        )
 
     def require_review_ready(self) -> None:
         if (
@@ -3407,6 +3495,13 @@ class GateRunner:
                     break
                 continue
             result = self._run_gate(index, config_key, candidate)
+            if result.exit_class == "failed":
+                result = self._classify_failed_gate(
+                    index=index,
+                    command=self._command(config_key),
+                    candidate=candidate,
+                    result=result,
+                )
             self._record(result)
             results.append(result)
             if not result.passed:
@@ -3492,7 +3587,159 @@ class GateRunner:
             log_reference=str(log_path),
             evidence_digest=evidence_digest,
             candidate_fingerprint=candidate.fingerprint,
+            failure_class="none" if exit_class == "passed" else "candidate",
+            budget_charge="none" if exit_class == "passed" else "remediation",
         )
+
+    def _classify_failed_gate(
+        self,
+        *,
+        index: int,
+        command: str,
+        candidate: CandidateRecord,
+        result: GateResult,
+    ) -> GateResult:
+        fingerprint = candidate.fingerprint.removeprefix("sha256:")[:16]
+        log_path = self.log_dir / f"gate-{fingerprint}-{index + 1}-base.log"
+        exit_class, exit_code = self._run_base_control(
+            command=command,
+            candidate=candidate,
+            log_path=log_path,
+        )
+        reproduced = exit_class == "failed"
+        return dataclasses.replace(
+            result,
+            failure_class="environment" if reproduced else "candidate",
+            budget_charge="none" if reproduced else "remediation",
+            base_exit_class=exit_class,
+            base_exit_code=exit_code,
+            base_log_reference=str(log_path),
+            base_evidence_digest=(
+                "sha256:" + hashlib.sha256(log_path.read_bytes()).hexdigest()
+            ),
+            comparison_base=candidate.comparison_base or candidate.base_main,
+        )
+
+    def _run_base_control(
+        self,
+        *,
+        command: str,
+        candidate: CandidateRecord,
+        log_path: Path,
+    ) -> tuple[str, int | None]:
+        comparison_base = candidate.comparison_base or candidate.base_main
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="vibe-loop-gate-base-"
+            ) as directory:
+                checkout = Path(directory) / "repo"
+                clone = subprocess.run(
+                    [
+                        "git",
+                        "clone",
+                        "--no-checkout",
+                        "--quiet",
+                        str(self.candidate_collector.worktree),
+                        str(checkout),
+                    ],
+                    cwd=self.candidate_collector.worktree,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                if clone.returncode != 0:
+                    log_path.write_text(
+                        "base control checkout could not be prepared\n",
+                        encoding="utf-8",
+                    )
+                    return "execution_error", None
+                checked_out = subprocess.run(
+                    ["git", "checkout", "--detach", "--quiet", comparison_base],
+                    cwd=checkout,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                if checked_out.returncode != 0:
+                    log_path.write_text(
+                        "base control checkout could not be prepared\n",
+                        encoding="utf-8",
+                    )
+                    return "execution_error", None
+                if not self._link_ignored_state(checkout):
+                    log_path.write_text(
+                        "base control local environment could not be prepared\n",
+                        encoding="utf-8",
+                    )
+                    return "execution_error", None
+                try:
+                    with log_path.open("w", encoding="utf-8") as log:
+                        completed = run_configured_command(
+                            command,
+                            worktree=checkout,
+                            log=log,
+                            executor=self.executor,
+                        )
+                except OSError:
+                    log_path.write_text(
+                        "base control gate command could not be executed\n",
+                        encoding="utf-8",
+                    )
+                    return "execution_error", None
+                return (
+                    "passed" if completed.returncode == 0 else "failed",
+                    completed.returncode,
+                )
+        except OSError:
+            log_path.write_text(
+                "base control checkout could not be prepared\n",
+                encoding="utf-8",
+            )
+            return "execution_error", None
+
+    def _link_ignored_state(self, checkout: Path) -> bool:
+        ignored = subprocess.run(
+            [
+                "git",
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "--no-empty-directory",
+                "-z",
+            ],
+            cwd=self.candidate_collector.worktree,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if ignored.returncode != 0:
+            return False
+        try:
+            for raw_path in ignored.stdout.split("\0"):
+                if not raw_path:
+                    continue
+                relative = Path(raw_path.rstrip("/"))
+                if (
+                    relative.is_absolute()
+                    or ".." in relative.parts
+                    or relative.parts[0] == ".vibe-loop"
+                ):
+                    continue
+                source = self.candidate_collector.worktree / relative
+                target = checkout / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.symlink_to(source, target_is_directory=source.is_dir())
+        except OSError:
+            return False
+        return True
 
     def _prior_results(self, candidate: CandidateRecord) -> dict[str, GateResult]:
         prior: dict[str, GateResult] = {}
@@ -3565,7 +3812,18 @@ def gate_evidence_is_valid(result: GateResult) -> bool:
         )
     except OSError:
         return False
-    return digest == result.evidence_digest
+    if digest != result.evidence_digest:
+        return False
+    if not result.base_log_reference:
+        return True
+    try:
+        base_digest = (
+            "sha256:"
+            + hashlib.sha256(Path(result.base_log_reference).read_bytes()).hexdigest()
+        )
+    except OSError:
+        return False
+    return base_digest == result.base_evidence_digest
 
 
 class RuntimeGateController:
@@ -3636,6 +3894,16 @@ class RuntimeGateController:
             if summary.passed:
                 summary.require_review_ready()
                 return summary
+            if summary.environment_failed_gate_keys:
+                self.stage_machine.fail(
+                    StageFailure.STAGE_FAILED,
+                    reason=(
+                        "gate_environment_failure:"
+                        "remediation_rounds_charged=0:"
+                        "budget=none"
+                    ),
+                )
+                raise GateEnvironmentFailure(summary.environment_failed_gate_keys)
             if remediation_round >= self.max_remediation_rounds:
                 self.stage_machine.fail(
                     StageFailure.STAGE_FAILED,

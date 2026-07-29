@@ -38,6 +38,7 @@ from vibe_loop.orchestration import (
     CandidateCollector,
     CandidateReanchorRetryExhausted,
     CandidateScopePolicy,
+    GateEnvironmentFailure,
     GateExecutionError,
     GateRemediationExhausted,
     GateResult,
@@ -2199,6 +2200,81 @@ class RuntimeGateTests(unittest.TestCase):
         self.assertFalse(replay.passed)
         self.assertTrue(replay.results[0].resumed)
 
+    def test_base_reproduced_failure_charges_no_remediation_budget(self) -> None:
+        candidate = self.collector.collect_derived()
+        stage_records: list[dict[str, object]] = []
+        machine = RunLifecycleStateMachine(
+            lambda transition: stage_records.append(transition.to_payload())
+        )
+        for stage in (RunStage.ACTIVATION, RunStage.WORKSPACE, RunStage.IMPLEMENTING):
+            machine.transition(stage, reason="setup")
+        remediation_calls: list[int] = []
+        controller = RuntimeGateController(
+            candidate_collector=self.collector,
+            gate_runner=GateRunner(
+                completion_commands=("false",),
+                gate_keys=("completion.commands[0]",),
+                candidate_collector=self.collector,
+                run_store=self.store,
+                run_id="run-1",
+                task_id="TASK-01",
+                log_dir=self.repo / ".vibe-loop" / "environment-gates",
+            ),
+            stage_machine=machine,
+            max_remediation_rounds=2,
+            remediation_launcher=lambda round_number, _summary: (
+                remediation_calls.append(round_number)
+            ),
+        )
+
+        with self.assertRaises(GateEnvironmentFailure) as raised:
+            controller.run(candidate)
+
+        self.assertEqual(
+            raised.exception.failed_gate_keys,
+            ("completion.commands[0]",),
+        )
+        self.assertEqual(remediation_calls, [])
+        gate_record = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "gate_result"
+        )
+        self.assertEqual(gate_record["failure_class"], "environment")
+        self.assertEqual(gate_record["budget_charge"], "none")
+        self.assertEqual(gate_record["base_exit_class"], "failed")
+        self.assertEqual(gate_record["comparison_base"], self.base)
+        self.assertEqual(
+            stage_records[-1]["reason"],
+            "gate_environment_failure:remediation_rounds_charged=0:budget=none",
+        )
+
+    def test_base_control_launch_failure_fails_closed_to_remediation(self) -> None:
+        candidate = self.collector.collect_derived()
+
+        def fail_base_launch(command, **kwargs):
+            if Path(kwargs["cwd"]) == self.repo:
+                return subprocess.CompletedProcess(command, 1)
+            raise OSError("base command unavailable")
+
+        runner = GateRunner(
+            completion_commands=("false",),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=self.collector,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "inconclusive-base-gates",
+            executor=fail_base_launch,
+        )
+
+        summary = runner.run(candidate)
+
+        result = summary.results[0]
+        self.assertEqual(result.failure_class, "candidate")
+        self.assertEqual(result.budget_charge, "remediation")
+        self.assertEqual(result.base_exit_class, "execution_error")
+
     def test_remediation_budget_is_journaled_and_exhaustion_is_typed(self) -> None:
         candidate = self.collector.collect_derived()
         stage_records: list[dict[str, object]] = []
@@ -2208,7 +2284,7 @@ class RuntimeGateTests(unittest.TestCase):
         for stage in (RunStage.ACTIVATION, RunStage.WORKSPACE, RunStage.IMPLEMENTING):
             machine.transition(stage, reason="setup")
         runner = GateRunner(
-            completion_commands=("false",),
+            completion_commands=("test ! -f tracked.txt",),
             gate_keys=("completion.commands[0]",),
             candidate_collector=self.collector,
             run_store=self.store,
@@ -2236,6 +2312,15 @@ class RuntimeGateTests(unittest.TestCase):
             controller.run(candidate)
 
         self.assertEqual(raised.exception.max_rounds, 1)
+        gate_records = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "gate_result"
+        ]
+        self.assertTrue(gate_records)
+        self.assertEqual(gate_records[0]["failure_class"], "candidate")
+        self.assertEqual(gate_records[0]["budget_charge"], "remediation")
+        self.assertEqual(gate_records[0]["base_exit_class"], "passed")
         self.assertEqual(
             [record["to_stage"] for record in stage_records],
             [
@@ -2395,7 +2480,7 @@ class RuntimeGateTests(unittest.TestCase):
         ):
             machine.transition(stage, reason="setup")
         failing_runner = GateRunner(
-            completion_commands=("false",),
+            completion_commands=("test ! -f tracked.txt",),
             gate_keys=("completion.commands[0]",),
             candidate_collector=collector,
             run_store=failure_store,
@@ -2420,7 +2505,7 @@ class RuntimeGateTests(unittest.TestCase):
             RuntimeGateController(
                 candidate_collector=collector,
                 gate_runner=GateRunner(
-                    completion_commands=("false",),
+                    completion_commands=("test ! -f tracked.txt",),
                     gate_keys=("completion.commands[0]",),
                     candidate_collector=collector,
                     run_store=failure_store,

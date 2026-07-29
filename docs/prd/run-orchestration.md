@@ -145,8 +145,17 @@ missing or unrelated. Changed paths are computed relative to that comparison
 base. Matching and downstream diff consumers reuse the persisted comparison
 base for that recorded candidate. Gate results are recorded as typed evidence
 referencing the gate's configuration key, exit class, duration, and log. Gate
-failure routes to bounded remediation, not to silent completion; gate evidence
-is part of the review request.
+failure classification uses a control run, never stderr or exit-code heuristics:
+an ordinary command failure is rerun once in an isolated checkout of the
+candidate's persisted comparison base. A failure reproduced there is classified
+as environmental, charges no remediation round, and terminates the gate stage
+with that zero-budget charge recorded explicitly. A base control that passes
+classifies the candidate failure as candidate-caused and charges one bounded
+remediation round. If the isolated checkout or base command cannot execute, the
+classification fails closed to candidate-caused and still charges remediation.
+Candidate mutation and other non-passing gate outcomes also retain that
+remediation charge. Gate evidence records the failure class, charged budget,
+comparison base, and base-control result and is part of the review request.
 
 Conflict-domain fields remain optional in the
 [normalized task contract](task-discovery.md#prd-tsk-001-normalized-task-model).
