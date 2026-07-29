@@ -452,18 +452,22 @@ records exactly one `output_classification`:
   whether because JSON could not be read, the schema was invalid, or a readable
   result violated a verdict, finding-ledger, session, continuation, or retry
   contract;
-- `unavailable`: no review result was available to parse, including launch
-  errors, non-zero reviewer exits, provider walls, and nested delegation
+- `failed`: a non-zero reviewer exit produced non-empty captured output;
+- `empty`: a non-zero reviewer exit produced no captured output;
+- `unavailable`: reviewer output evidence was not persisted, including launch
+  errors, session-expired continuations, provider walls, and nested delegation
   violations.
 
 Each malformed attempt records a bounded, secret-redacted output tail. Reviewer
-stdout is capped per line and windowed to a bounded tail *before* redaction,
-because the evidence redactor is superlinear in line length and an unbounded
-prose answer would otherwise stall the run while holding the task lock.
-Many maximum-length lines can still make the fixed-size redaction window take
-several seconds, but the cost is bounded by the window rather than total output
-size. Redaction still runs before the final truncation so no unredacted fragment
-is stored.
+failures with output record a bounded, secret-redacted leading-and-trailing
+excerpt under `reviewer_output`; failures without output record an explicitly
+empty `reviewer_output`. Reviewer stdout is capped per line and windowed
+*before* redaction, because the evidence redactor is superlinear in line length
+and an unbounded prose answer would otherwise stall the run while holding the
+task lock. Many maximum-length lines can still make the fixed-size redaction
+window take several seconds, but the cost is bounded by the window rather than
+total output size. Redaction still runs before the final truncation so no
+unredacted fragment is stored.
 
 Cross-run attempt circuit-breaker eligibility is authoritative in
 [PRD-AUT-002a](prd/autopilot.md#prd-aut-002a-cross-run-attempt-circuit-breaker).

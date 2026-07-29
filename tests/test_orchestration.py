@@ -6600,6 +6600,48 @@ class ReviewRouterTests(unittest.TestCase):
         )
         self.assertIn("usually temporary", verdicts[0]["reviewer_output"]["text"])
 
+    def test_transient_retry_does_not_consume_malformed_reask(self) -> None:
+        outputs = iter(
+            (
+                (1, "API Error: 529 Overloaded; try again later"),
+                (0, "not json"),
+                (0, "still not json"),
+            )
+        )
+        commands: list[str] = []
+
+        def execute(command: str, **kwargs):
+            commands.append(command)
+            returncode, output = next(outputs)
+            return subprocess.CompletedProcess(command, returncode, stdout=output)
+
+        with self.assertRaises(ReviewOutputMalformed) as raised:
+            self.router("codex", execute).review(self.gates)
+
+        self.assertEqual(raised.exception.attempts, 2)
+        self.assertEqual(len(commands), 3)
+        self.assertNotIn("previous response was malformed", commands[0])
+        self.assertNotIn("previous response was malformed", commands[1])
+        self.assertIn("previous response was malformed", commands[2])
+        self.assertIn("missing JSON verdict", commands[2])
+        verdicts = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_verdict"
+        ]
+        self.assertEqual(
+            [record["attempt_ordinal"] for record in verdicts],
+            [1, 2, 3],
+        )
+        self.assertEqual(
+            [record["output_classification"] for record in verdicts],
+            ["failed", "malformed", "malformed"],
+        )
+        self.assertEqual(
+            [record["retry_classification"] for record in verdicts],
+            ["transient", "transient", "fatal"],
+        )
+
     def test_repeated_transient_reviewer_overload_terminates_as_provider_failure(
         self,
     ) -> None:

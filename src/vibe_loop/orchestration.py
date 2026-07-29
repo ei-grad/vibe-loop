@@ -2242,10 +2242,12 @@ class ReviewRouter:
             else self.max_closure_passes
         )
         self._transition_to_review(request)
-        malformed: ReviewExecutionError | None = None
+        transient_retry_used = False
+        malformed_reask_used = False
+        malformed_attempts = 0
         reask_reason = ""
         continuation = self._continuation_context(request)
-        for attempt_ordinal in (1, 2):
+        for attempt_ordinal in (1, 2, 3):
             try:
                 try:
                     result = self._launch(
@@ -2277,7 +2279,8 @@ class ReviewRouter:
                         continuation=continuation,
                     )
             except ReviewTransientProviderError as exc:
-                if attempt_ordinal == 1:
+                if not transient_retry_used:
+                    transient_retry_used = True
                     continuation = self._continuation_context(
                         request, previous=continuation
                     )
@@ -2288,22 +2291,23 @@ class ReviewRouter:
                     detail=str(exc),
                 ) from exc
             except ReviewExecutionError as exc:
-                malformed = exc
-                if attempt_ordinal == 1 and str(exc).startswith("malformed review"):
-                    # Feed the specific parse violation back to the reviewer;
-                    # a bare "that was malformed" makes it re-emit the same shape.
-                    reask_reason = str(exc)
-                    continuation = self._continuation_context(
-                        request, previous=continuation
-                    )
-                    continue
                 if str(exc).startswith("malformed review"):
+                    malformed_attempts += 1
+                    if not malformed_reask_used:
+                        malformed_reask_used = True
+                        # Feed the specific parse violation back to the reviewer;
+                        # a bare "that was malformed" makes it re-emit the same shape.
+                        reask_reason = str(exc)
+                        continuation = self._continuation_context(
+                            request, previous=continuation
+                        )
+                        continue
                     if self.stage_machine is not None:
                         self.stage_machine.fail(
                             StageFailure.BLOCKED,
                             reason="review_output_malformed",
                         )
-                    raise ReviewOutputMalformed(str(exc), attempt_ordinal) from exc
+                    raise ReviewOutputMalformed(str(exc), malformed_attempts) from exc
                 raise
             pass_ordinal = result.pass_ordinal
             self._record_findings(request, result.findings)
@@ -2318,8 +2322,7 @@ class ReviewRouter:
                 candidate_fingerprint=request.candidate.fingerprint,
             )
             return result
-        assert malformed is not None
-        raise malformed
+        raise AssertionError("review retry allowances did not terminate")
 
     def _launch(
         self,
