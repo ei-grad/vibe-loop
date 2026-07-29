@@ -78,7 +78,9 @@ GATE_FAILURE_CLASSES = ("none", "candidate", "environment")
 GATE_BUDGET_CHARGES = ("none", "remediation")
 REVIEW_VERDICTS = ("approve", "findings", "error")
 REVIEW_CONTROL_VERDICTS = ("clean", "findings", "blocked")
-REVIEW_DIAGNOSTIC_OUTPUT_CLASSIFICATIONS = frozenset({"malformed", "unavailable"})
+REVIEW_DIAGNOSTIC_OUTPUT_CLASSIFICATIONS = frozenset(
+    {"empty", "failed", "malformed", "unavailable"}
+)
 REVIEW_RETRY_CLASSIFICATIONS = ("ok", "transient", "provider_limit", "timeout", "fatal")
 MALFORMED_REVIEW_OUTPUT_MAX_CHARS = 4096
 # ``redact_evidence_text`` is superlinear in line length, so reviewer stdout is
@@ -2101,6 +2103,37 @@ def bound_malformed_review_output(output: str) -> str:
     return window
 
 
+def bound_failed_review_output(
+    output: str,
+    *,
+    limit: int = MALFORMED_REVIEW_OUTPUT_RAW_WINDOW_CHARS,
+) -> str:
+    """Keep bounded whole-line evidence from both ends of failed reviewer output."""
+    lines = output.split("\n")
+    capped = "\n".join(
+        (
+            line
+            if len(line) <= MALFORMED_REVIEW_OUTPUT_LINE_MAX_CHARS
+            else line[:MALFORMED_REVIEW_OUTPUT_LINE_MAX_CHARS]
+            + MALFORMED_REVIEW_OUTPUT_ELISION
+        )
+        for line in lines
+    )
+    if len(capped) <= limit:
+        return capped
+    marker = f"\n{MALFORMED_REVIEW_OUTPUT_ELISION}\n"
+    side_limit = max(0, (limit - len(marker)) // 2)
+    leading = capped[:side_limit]
+    trailing = capped[-side_limit:] if side_limit else ""
+    leading_newline = leading.rfind("\n")
+    if leading_newline >= 0:
+        leading = leading[:leading_newline]
+    trailing_newline = trailing.find("\n")
+    if trailing_newline >= 0:
+        trailing = trailing[trailing_newline + 1 :]
+    return leading + marker + trailing
+
+
 ReviewExecutor = Callable[..., subprocess.CompletedProcess[str]]
 ContinuationAvailability = Callable[[str, str, str], str]
 
@@ -2440,6 +2473,20 @@ class ReviewRouter:
                     "session expired",
                 )
             )
+            if session_expired:
+                self._record_error(
+                    request,
+                    route,
+                    pass_ordinal,
+                    attempt_ordinal,
+                    "fatal",
+                    duration,
+                    usage,
+                    continuation=continuation,
+                )
+                raise ReviewSessionExpired("reviewer session expired")
+            output_classification = "failed" if output else "empty"
+            reviewer_output = self._failed_output_evidence(output)
             self._record_error(
                 request,
                 route,
@@ -2449,12 +2496,20 @@ class ReviewRouter:
                 duration,
                 usage,
                 continuation=continuation,
+                output_classification=output_classification,
+                reviewer_output=reviewer_output,
             )
-            if session_expired:
-                raise ReviewSessionExpired("reviewer session expired")
             self._fail_stage_for_result("fatal")
+            output_location = "review_verdict.reviewer_output"
+            if not output:
+                raise ReviewExecutionError(
+                    f"reviewer command failed with exit code {completed.returncode}; "
+                    f"reviewer output was empty; recorded in {output_location}"
+                )
             raise ReviewExecutionError(
-                f"reviewer command failed with exit code {completed.returncode}"
+                f"reviewer command failed with exit code {completed.returncode}; "
+                f"captured output recorded in {output_location}; "
+                f"excerpt: {reviewer_output['text']}"
             )
         try:
             result = self._parse_result(
@@ -2754,6 +2809,22 @@ class ReviewRouter:
             "original_chars": len(output),
             "redacted_chars": len(redacted),
             "truncated": truncated,
+            "redacted": redacted != bounded,
+        }
+
+    def _failed_output_evidence(self, output: str) -> dict[str, object]:
+        bounded = bound_failed_review_output(output)
+        redacted = redact_evidence_text(bounded)
+        redacted = redact_fencing_token_diagnostic(redacted, {})
+        excerpt = bound_failed_review_output(
+            redacted,
+            limit=MALFORMED_REVIEW_OUTPUT_MAX_CHARS,
+        )
+        return {
+            "text": excerpt,
+            "original_chars": len(output),
+            "redacted_chars": len(redacted),
+            "truncated": bounded != output or excerpt != redacted,
             "redacted": redacted != bounded,
         }
 
@@ -3195,6 +3266,7 @@ class ReviewRouter:
         policy_violation: str = "",
         output_classification: str = "unavailable",
         malformed_output: Mapping[str, object] | None = None,
+        reviewer_output: Mapping[str, object] | None = None,
         parse_error: str = "",
     ) -> None:
         context = continuation or ContinuationContext()
@@ -3229,6 +3301,8 @@ class ReviewRouter:
             payload["policy_violation"] = policy_violation
         if malformed_output is not None:
             payload["malformed_output"] = dict(malformed_output)
+        if reviewer_output is not None:
+            payload["reviewer_output"] = dict(reviewer_output)
         if parse_error:
             payload["parse_error"] = parse_error
         self._append_event(

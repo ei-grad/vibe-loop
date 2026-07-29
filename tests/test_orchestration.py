@@ -6488,6 +6488,68 @@ class ReviewRouterTests(unittest.TestCase):
         self.assertNotIn("lock-token-9f3a", evidence["text"])
         self.assertTrue(evidence["redacted"])
 
+    def test_failed_reviewer_records_bounded_redacted_output_and_reason(self) -> None:
+        output = "\n".join(
+            (
+                "leading diagnostic",
+                *("filler" for _ in range(2000)),
+                "api_token=super-secret",
+                "trailing diagnostic",
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(command, 7, stdout=output)
+
+        with self.assertRaises(ReviewExecutionError) as raised:
+            self.router("codex", execute).review(self.gates)
+
+        message = str(raised.exception)
+        self.assertIn("exit code 7", message)
+        self.assertIn("review_verdict.reviewer_output", message)
+        self.assertIn("leading diagnostic", message)
+        self.assertIn("trailing diagnostic", message)
+        self.assertNotIn("super-secret", message)
+        verdict = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_verdict"
+        )
+        self.assertEqual(verdict["output_classification"], "failed")
+        evidence = verdict["reviewer_output"]
+        self.assertTrue(evidence["truncated"])
+        self.assertTrue(evidence["redacted"])
+        self.assertLessEqual(len(evidence["text"]), 4096)
+        self.assertIn("leading diagnostic", evidence["text"])
+        self.assertIn("trailing diagnostic", evidence["text"])
+        self.assertNotIn("super-secret", evidence["text"])
+
+    def test_failed_reviewer_records_empty_output_distinctly(self) -> None:
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(command, 9, stdout="")
+
+        with self.assertRaises(ReviewExecutionError) as raised:
+            self.router("codex", execute).review(self.gates)
+
+        self.assertIn("reviewer output was empty", str(raised.exception))
+        self.assertIn("review_verdict.reviewer_output", str(raised.exception))
+        verdict = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_verdict"
+        )
+        self.assertEqual(verdict["output_classification"], "empty")
+        self.assertEqual(
+            verdict["reviewer_output"],
+            {
+                "text": "",
+                "original_chars": 0,
+                "redacted_chars": 0,
+                "truncated": False,
+                "redacted": False,
+            },
+        )
+
     def test_bound_malformed_review_output_drops_cut_leading_line(self) -> None:
         # A mid-line cut can orphan a secret value from the key= label the
         # redactor keys on, so the partial leading line is dropped entirely.
@@ -7547,6 +7609,15 @@ class ReviewRouterTests(unittest.TestCase):
         )
         self.assertEqual(fallback["reason"], "session_expired")
         self.assertEqual(fallback["prior_session_id"], "old-session")
+        expired_verdict = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_verdict"
+            and record["pass_kind"] == "closure:1"
+            and record["retry_classification"] == "fatal"
+        )
+        self.assertEqual(expired_verdict["output_classification"], "unavailable")
+        self.assertNotIn("reviewer_output", expired_verdict)
         require_candidate_review_clear(
             self.store.read_records(),
             run_id="run-1",
