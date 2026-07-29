@@ -1463,6 +1463,7 @@ class GateResult:
     base_log_reference: str = ""
     base_evidence_digest: str = ""
     comparison_base: str = ""
+    base_control_resumed: bool = False
     resumed: bool = False
 
     def __post_init__(self) -> None:
@@ -1480,6 +1481,16 @@ class GateResult:
             object.__setattr__(self, "budget_charge", "remediation")
         if self.failure_class == "environment" and self.budget_charge != "none":
             raise ValueError("environment gate failures cannot charge remediation")
+        if self.failure_class == "environment" and (
+            self.exit_class != "failed" or self.base_exit_class != "failed"
+        ):
+            raise ValueError(
+                "environment gate failures require a reproduced command failure"
+            )
+        if self.base_exit_class == "failed" and self.failure_class != "environment":
+            raise ValueError(
+                "a reproduced base failure requires environment classification"
+            )
 
     @property
     def passed(self) -> bool:
@@ -1504,6 +1515,7 @@ class GateResult:
             payload["base_log_reference"] = self.base_log_reference
             payload["base_evidence_digest"] = self.base_evidence_digest
             payload["comparison_base"] = self.comparison_base
+            payload["base_control_resumed"] = self.base_control_resumed
             if self.base_exit_code is not None:
                 payload["base_exit_code"] = self.base_exit_code
         return payload
@@ -1526,6 +1538,7 @@ class GateResult:
         base_log_reference = record.get("base_log_reference", "")
         base_evidence_digest = record.get("base_evidence_digest", "")
         comparison_base = record.get("comparison_base", "")
+        base_control_resumed = record.get("base_control_resumed", False)
         if failure_class is None:
             failure_class = "none" if exit_class == "passed" else "candidate"
         if budget_charge is None:
@@ -1549,6 +1562,7 @@ class GateResult:
             or not isinstance(base_log_reference, str)
             or not isinstance(base_evidence_digest, str)
             or not isinstance(comparison_base, str)
+            or not isinstance(base_control_resumed, bool)
             or (
                 failure_class == "environment"
                 and (
@@ -1560,23 +1574,27 @@ class GateResult:
             )
         ):
             return None
-        return cls(
-            config_key=config_key,
-            exit_class=str(exit_class),
-            exit_code=exit_code,
-            duration_seconds=float(duration),
-            log_reference=log_reference,
-            evidence_digest=evidence_digest,
-            candidate_fingerprint=fingerprint,
-            failure_class=str(failure_class),
-            budget_charge=str(budget_charge),
-            base_exit_class=base_exit_class,
-            base_exit_code=base_exit_code,
-            base_log_reference=base_log_reference,
-            base_evidence_digest=base_evidence_digest,
-            comparison_base=comparison_base,
-            resumed=True,
-        )
+        try:
+            return cls(
+                config_key=config_key,
+                exit_class=str(exit_class),
+                exit_code=exit_code,
+                duration_seconds=float(duration),
+                log_reference=log_reference,
+                evidence_digest=evidence_digest,
+                candidate_fingerprint=fingerprint,
+                failure_class=str(failure_class),
+                budget_charge=str(budget_charge),
+                base_exit_class=base_exit_class,
+                base_exit_code=base_exit_code,
+                base_log_reference=base_log_reference,
+                base_evidence_digest=base_evidence_digest,
+                comparison_base=comparison_base,
+                base_control_resumed=base_control_resumed,
+                resumed=True,
+            )
+        except ValueError:
+            return None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3599,6 +3617,23 @@ class GateRunner:
         candidate: CandidateRecord,
         result: GateResult,
     ) -> GateResult:
+        comparison_base = candidate.comparison_base or candidate.base_main
+        prior = self._prior_base_control(
+            config_key=result.config_key,
+            comparison_base=comparison_base,
+        )
+        if prior is not None:
+            return dataclasses.replace(
+                result,
+                failure_class=prior.failure_class,
+                budget_charge=prior.budget_charge,
+                base_exit_class=prior.base_exit_class,
+                base_exit_code=prior.base_exit_code,
+                base_log_reference=prior.base_log_reference,
+                base_evidence_digest=prior.base_evidence_digest,
+                comparison_base=comparison_base,
+                base_control_resumed=True,
+            )
         fingerprint = candidate.fingerprint.removeprefix("sha256:")[:16]
         log_path = self.log_dir / f"gate-{fingerprint}-{index + 1}-base.log"
         exit_class, exit_code = self._run_base_control(
@@ -3617,7 +3652,7 @@ class GateRunner:
             base_evidence_digest=(
                 "sha256:" + hashlib.sha256(log_path.read_bytes()).hexdigest()
             ),
-            comparison_base=candidate.comparison_base or candidate.base_main,
+            comparison_base=comparison_base,
         )
 
     def _run_base_control(
@@ -3670,12 +3705,6 @@ class GateRunner:
                         encoding="utf-8",
                     )
                     return "execution_error", None
-                if not self._link_ignored_state(checkout):
-                    log_path.write_text(
-                        "base control local environment could not be prepared\n",
-                        encoding="utf-8",
-                    )
-                    return "execution_error", None
                 try:
                     with log_path.open("w", encoding="utf-8") as log:
                         completed = run_configured_command(
@@ -3701,46 +3730,6 @@ class GateRunner:
             )
             return "execution_error", None
 
-    def _link_ignored_state(self, checkout: Path) -> bool:
-        ignored = subprocess.run(
-            [
-                "git",
-                "ls-files",
-                "--others",
-                "--ignored",
-                "--exclude-standard",
-                "--directory",
-                "--no-empty-directory",
-                "-z",
-            ],
-            cwd=self.candidate_collector.worktree,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        if ignored.returncode != 0:
-            return False
-        try:
-            for raw_path in ignored.stdout.split("\0"):
-                if not raw_path:
-                    continue
-                relative = Path(raw_path.rstrip("/"))
-                if (
-                    relative.is_absolute()
-                    or ".." in relative.parts
-                    or relative.parts[0] == ".vibe-loop"
-                ):
-                    continue
-                source = self.candidate_collector.worktree / relative
-                target = checkout / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.symlink_to(source, target_is_directory=source.is_dir())
-        except OSError:
-            return False
-        return True
-
     def _prior_results(self, candidate: CandidateRecord) -> dict[str, GateResult]:
         prior: dict[str, GateResult] = {}
         for record in self.run_store.read_records():
@@ -3756,6 +3745,31 @@ class GateRunner:
                 continue
             prior[result.config_key] = result
         return prior
+
+    def _prior_base_control(
+        self,
+        *,
+        config_key: str,
+        comparison_base: str,
+    ) -> GateResult | None:
+        for record in reversed(self.run_store.read_records()):
+            if (
+                record.get("run_id") != self.run_id
+                or record.get("task_id") != self.task_id
+            ):
+                continue
+            result = GateResult.from_record(record)
+            if (
+                result is None
+                or result.config_key != config_key
+                or result.exit_class != "failed"
+                or result.comparison_base != comparison_base
+                or result.base_exit_class not in {"passed", "failed"}
+                or not base_gate_evidence_is_valid(result)
+            ):
+                continue
+            return result
+        return None
 
     def _command(self, config_key: str) -> str:
         match = re.fullmatch(r"completion\.commands\[(\d+)]", config_key)
@@ -3814,8 +3828,12 @@ def gate_evidence_is_valid(result: GateResult) -> bool:
         return False
     if digest != result.evidence_digest:
         return False
-    if not result.base_log_reference:
-        return True
+    return not result.base_log_reference or base_gate_evidence_is_valid(result)
+
+
+def base_gate_evidence_is_valid(result: GateResult) -> bool:
+    if not result.base_log_reference or not result.base_evidence_digest:
+        return False
     try:
         base_digest = (
             "sha256:"

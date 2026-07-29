@@ -135,6 +135,7 @@ stateDiagram-v2
     candidate_ready --> gates_running
     gates_running --> review_pending : all gates pass
     gates_running --> remediating : gate failure (budget left)
+    gates_running --> classified : environment failure (see PRD-ORC-004)
     review_pending --> reviewing : launch routed reviewer
     reviewing --> review_verdict
     review_verdict --> integrating : approved / no material findings
@@ -149,12 +150,17 @@ stateDiagram-v2
 
 Failure transitions exist from every stage and are typed, not collapsed:
 
+Runtime gate-failure classification, routing, and budget charging are
+authoritative in
+[PRD-ORC-004](prd/run-orchestration.md#prd-orc-004-runtime-gates-and-candidate-stabilization).
+
 - `provider_limit(stage, route)` — provider quota exhaustion on the implementer
   or reviewer route; pauses only that route, never converts into blind retries.
 - `timed_out(stage)` — stage wall-clock timeout; kills the stage process
   group, preserves the workspace, returns the task per current semantics.
-- `stage_failed(stage, reason)` — deterministic failure (gate exhausted,
-  malformed reviewer output after bounded re-ask, integration conflict).
+- `stage_failed(stage, reason)` — deterministic failure (gate exhaustion or its
+  PRD-defined environment-class exit, malformed reviewer output after bounded
+  re-ask, integration conflict).
 - `blocked(reason)` — worker-reported or runtime-detected external gate.
 - `cancelled` — SIGTERM/SIGINT: terminate stage subprocess group, journal,
   fenced release, workspace preserved.

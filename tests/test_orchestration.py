@@ -2200,6 +2200,117 @@ class RuntimeGateTests(unittest.TestCase):
         self.assertFalse(replay.passed)
         self.assertTrue(replay.results[0].resumed)
 
+    def test_inconsistent_gate_record_is_rejected_and_rerun(self) -> None:
+        candidate = self.collector.collect_derived()
+        log_path = self.repo / ".vibe-loop" / "invalid-gate.log"
+        log_path.write_text("invalid\n", encoding="utf-8")
+        self.store.append_lifecycle_event(
+            RunLifecycleEvent.gate_result(
+                run_id="run-1",
+                task_id="TASK-01",
+                payload={
+                    "command_key": "completion.commands[0]",
+                    "exit_class": "passed",
+                    "exit_code": 0,
+                    "duration_seconds": 1.0,
+                    "log_reference": str(log_path),
+                    "evidence_digest": (
+                        "sha256:" + hashlib.sha256(log_path.read_bytes()).hexdigest()
+                    ),
+                    "candidate_fingerprint": candidate.fingerprint,
+                    "failure_class": "candidate",
+                    "budget_charge": "remediation",
+                },
+            )
+        )
+        calls: list[str] = []
+
+        def pass_gate(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        summary = GateRunner(
+            completion_commands=("check",),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=self.collector,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "inconsistent-record-gates",
+            executor=pass_gate,
+        ).run(candidate)
+
+        self.assertTrue(summary.passed)
+        self.assertEqual(calls, ["check"])
+
+    def test_base_control_does_not_share_live_ignored_state(self) -> None:
+        candidate = self.collector.collect_derived()
+        live_probe = self.repo / ".venv" / "lib" / "vibe_loop.pth"
+        live_probe.parent.mkdir(parents=True)
+        live_probe.write_text(f"{self.repo}/src\n", encoding="utf-8")
+
+        def fail_candidate_pass_base(command, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            if cwd == self.repo:
+                return subprocess.CompletedProcess(command, 1)
+            isolated_probe = cwd / ".venv" / "lib" / "vibe_loop.pth"
+            isolated_probe.parent.mkdir(parents=True)
+            isolated_probe.write_text(f"{cwd}/src\n", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0)
+
+        result = (
+            GateRunner(
+                completion_commands=("check",),
+                gate_keys=("completion.commands[0]",),
+                candidate_collector=self.collector,
+                run_store=self.store,
+                run_id="run-1",
+                task_id="TASK-01",
+                log_dir=self.repo / ".vibe-loop" / "isolated-base-gates",
+                executor=fail_candidate_pass_base,
+            )
+            .run(candidate)
+            .results[0]
+        )
+
+        self.assertEqual(result.base_exit_class, "passed")
+        self.assertEqual(live_probe.read_text(encoding="utf-8"), f"{self.repo}/src\n")
+
+    def test_conclusive_base_control_is_reused_across_candidates(self) -> None:
+        candidate = self.collector.collect_derived()
+        base_calls: list[Path] = []
+
+        def fail_candidate_pass_base(command, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            if cwd == self.repo:
+                return subprocess.CompletedProcess(command, 1)
+            base_calls.append(cwd)
+            return subprocess.CompletedProcess(command, 0)
+
+        runner = GateRunner(
+            completion_commands=("check",),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=self.collector,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "reused-base-gates",
+            executor=fail_candidate_pass_base,
+        )
+        first = runner.run(candidate).results[0]
+        (self.repo / "tracked.txt").write_text("remediated\n", encoding="utf-8")
+        git(self.repo, "add", "tracked.txt")
+        git(self.repo, "commit", "-m", "remediate candidate")
+        second_candidate = self.collector.collect_derived()
+
+        second = runner.run(second_candidate).results[0]
+
+        self.assertEqual(len(base_calls), 1)
+        self.assertFalse(first.base_control_resumed)
+        self.assertTrue(second.base_control_resumed)
+        self.assertEqual(second.base_log_reference, first.base_log_reference)
+        self.assertEqual(second.base_evidence_digest, first.base_evidence_digest)
+
     def test_base_reproduced_failure_charges_no_remediation_budget(self) -> None:
         candidate = self.collector.collect_derived()
         stage_records: list[dict[str, object]] = []
@@ -2251,10 +2362,13 @@ class RuntimeGateTests(unittest.TestCase):
 
     def test_base_control_launch_failure_fails_closed_to_remediation(self) -> None:
         candidate = self.collector.collect_derived()
+        base_attempts = 0
 
         def fail_base_launch(command, **kwargs):
+            nonlocal base_attempts
             if Path(kwargs["cwd"]) == self.repo:
                 return subprocess.CompletedProcess(command, 1)
+            base_attempts += 1
             raise OSError("base command unavailable")
 
         runner = GateRunner(
@@ -2268,12 +2382,19 @@ class RuntimeGateTests(unittest.TestCase):
             executor=fail_base_launch,
         )
 
-        summary = runner.run(candidate)
+        first = runner.run(candidate).results[0]
+        (self.repo / "tracked.txt").write_text("remediated\n", encoding="utf-8")
+        git(self.repo, "add", "tracked.txt")
+        git(self.repo, "commit", "-m", "remediate candidate")
+        second_candidate = self.collector.collect_derived()
 
-        result = summary.results[0]
-        self.assertEqual(result.failure_class, "candidate")
-        self.assertEqual(result.budget_charge, "remediation")
-        self.assertEqual(result.base_exit_class, "execution_error")
+        second = runner.run(second_candidate).results[0]
+
+        self.assertEqual(first.failure_class, "candidate")
+        self.assertEqual(first.budget_charge, "remediation")
+        self.assertEqual(first.base_exit_class, "execution_error")
+        self.assertEqual(base_attempts, 2)
+        self.assertFalse(second.base_control_resumed)
 
     def test_remediation_budget_is_journaled_and_exhaustion_is_typed(self) -> None:
         candidate = self.collector.collect_derived()
