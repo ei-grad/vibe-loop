@@ -115,7 +115,7 @@ class MarkdownPlanTests(unittest.TestCase):
                 "TASK-EXACT",
                 "Add helper",
                 "Next",
-                scope="Deliver `tools/existing-helper.sh` for shared checks.",
+                scope="Deliver tools/existing-helper.sh.",
             )
 
             collisions = task_deliverable_path_collisions(repo, task)
@@ -136,7 +136,7 @@ class MarkdownPlanTests(unittest.TestCase):
                 "Add startup guard",
                 "Next",
                 acceptance=(
-                    "Create `tools/qemu-proof-startup-guard.sh` and source it "
+                    "Create tools/qemu-proof-startup-guard.sh and source it "
                     "from proof harnesses."
                 ),
             )
@@ -167,17 +167,45 @@ class MarkdownPlanTests(unittest.TestCase):
 
         self.assertEqual(collisions, ())
 
-    def test_command_task_uses_body_for_planning_validation_context(self) -> None:
-        task = task_from_mapping(
-            {
-                "id": "TASK-BODY",
-                "status": "ready",
-                "body": "Create `tools/new-helper.sh`.",
-            },
-            0,
-        )
+    def test_deliverable_collision_ignores_existing_modification_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "src").mkdir()
+            (repo / "src" / "existing.py").write_text("")
+            task = Task(
+                "TASK-MODIFY",
+                "Add validation",
+                "Next",
+                scope=(
+                    "Add a bounded validator to src/existing.py and wire the "
+                    "new gate through src/existing.py."
+                ),
+            )
 
-        self.assertEqual(task.scope, "Create `tools/new-helper.sh`.")
+            collisions = task_deliverable_path_collisions(repo, task)
+
+        self.assertEqual(collisions, ())
+
+    def test_command_task_uses_body_for_planning_validation_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "tools").mkdir()
+            (repo / "tools" / "new-helper.sh").write_text("#!/bin/sh\n")
+            task = task_from_mapping(
+                {
+                    "id": "TASK-BODY",
+                    "status": "ready",
+                    "body": "Create tools/new-helper.sh.",
+                },
+                0,
+            )
+
+            collisions = task_deliverable_path_collisions(repo, task)
+
+        self.assertEqual(task.scope, "")
+        self.assertEqual(task.body, "Create tools/new-helper.sh.")
+        self.assertNotIn("body", task.to_json())
+        self.assertEqual(collisions[0]["existing_path"], "tools/new-helper.sh")
 
     def test_task_json_omits_empty_traceability_fields(self) -> None:
         payload = Task("TASK-01", "Plain task", "Next").to_json()

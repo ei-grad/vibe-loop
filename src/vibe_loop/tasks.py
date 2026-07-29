@@ -178,10 +178,14 @@ TRACEABILITY_LIST_FIELDS = {
 DELIVERABLE_PATH_RE = re.compile(
     r"(?<![\w./-])"
     r"(?P<path>(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+)"
-    r"(?![\w./-])"
+    r"(?![\w/-])"
 )
 DELIVERABLE_INTENT_RE = re.compile(
-    r"\b(?:add|build|create|deliver|generate|implement|introduce|new|write)\b",
+    r"\b(?:add|build|create|deliver|generate|implement|introduce|write)\b",
+    re.IGNORECASE,
+)
+DELIVERABLE_MODIFICATION_TARGET_RE = re.compile(
+    r"\b(?:against|from|in|into|through|to|using|via|within)\s*[`'\"(]*\s*$",
     re.IGNORECASE,
 )
 GENERIC_FILENAME_TOKENS = frozenset(
@@ -240,6 +244,9 @@ class Task:
     status_reason: str = ""
     prior_findings: tuple[dict[str, object], ...] = ()
     review_budget_exhaustions: int = 0
+    # Raw command-source body is validation input, not normalized task metadata.
+    # Keeping it out of to_json prevents unbounded prompt and fingerprint growth.
+    body: str = ""
 
     @property
     def done(self) -> bool:
@@ -344,11 +351,25 @@ def task_deliverable_path_collisions(
 
 def _task_deliverable_paths(task: Task) -> tuple[str, ...]:
     paths: list[str] = []
-    text = "\n".join((task.title, task.scope, task.acceptance, task.evidence))
+    text = "\n".join(
+        (task.title, task.scope, task.acceptance, task.evidence, task.body)
+    )
     for line in text.splitlines():
         for match in DELIVERABLE_PATH_RE.finditer(line):
             intent_window = line[max(0, match.start() - 160) : match.start()]
-            if DELIVERABLE_INTENT_RE.search(intent_window) is None:
+            clause_start = max(
+                (intent_window.rfind(boundary) for boundary in ".;!?"),
+                default=-1,
+            )
+            intent_window = intent_window[clause_start + 1 :]
+            intent_matches = tuple(DELIVERABLE_INTENT_RE.finditer(intent_window))
+            if not intent_matches:
+                continue
+            attachment = intent_window[intent_matches[-1].end() :]
+            if (
+                len(attachment) > 120
+                or DELIVERABLE_MODIFICATION_TARGET_RE.search(attachment) is not None
+            ):
                 continue
             candidate = PurePosixPath(match.group("path"))
             if candidate.is_absolute() or ".." in candidate.parts:
@@ -402,8 +423,8 @@ def _deliverable_collision(
         "match": match,
         "effect": "advisory_only",
         "precision": (
-            "high recall within creation-worded paths; exact files and close "
-            "same-directory filenames may include intentional rewrites"
+            "high recall for paths governed by a creation verb in the same "
+            "clause; paths attached by modification prepositions are excluded"
         ),
     }
 
@@ -2893,7 +2914,7 @@ def task_from_mapping(value: object, order: int) -> Task:
         conflict_domains_known=bool(value.get("conflict_domains_known"))
         or resources_present
         or paths_present,
-        scope=str(value.get("scope") or value.get("body") or ""),
+        scope=str(value.get("scope") or ""),
         acceptance=str(value.get("acceptance") or ""),
         evidence=str(value.get("evidence") or ""),
         source=str(value.get("source") or ""),
@@ -2913,6 +2934,7 @@ def task_from_mapping(value: object, order: int) -> Task:
         hazards=dedupe_preserving_order(
             hazard.strip() for hazard in hazards if hazard.strip()
         ),
+        body=str(value.get("body") or ""),
     )
 
 

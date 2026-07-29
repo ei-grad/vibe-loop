@@ -663,6 +663,20 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("recent log tail", prompt)
         self.assertIn("blocked or just failed", prompt)
 
+    def test_selection_prompt_omits_raw_command_task_body(self) -> None:
+        body = "Create tools/new-helper.sh.\n" + ("Detailed acceptance.\n" * 1000)
+        task = Task(
+            task_id="BODY-01",
+            title="Body-bearing task",
+            status="Next",
+            body=body,
+        )
+
+        prompt = build_selection_prompt([task], "recent logs")
+
+        self.assertNotIn("Create tools/new-helper.sh.", prompt)
+        self.assertNotIn("Detailed acceptance.", prompt)
+
     def test_batch_selection_prompt_includes_context(self) -> None:
         task = Task(task_id="LIVE-04", title="Realtime reconcile", status="Next")
 

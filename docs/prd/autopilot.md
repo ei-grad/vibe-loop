@@ -993,9 +993,10 @@ record against the current repository. An existing exact path or a close
 same-directory filename produces a `deliverable_path_collision` warning in the
 worker prompt naming both paths. The warning is advisory: intentional rewrites
 remain dispatchable. Detection deliberately favors recall, but bounds its
-noise by considering only file paths preceded by creation intent and by limiting
-fuzzy matches to the same directory and file extension; ordinary references and
-unrelated filenames do not warn.
+noise by considering only file paths governed by a creation verb in the same
+clause, excluding paths attached through modification prepositions such as
+`to` and `through`, and limiting fuzzy matches to the same directory and file
+extension.
 
 Project-authored `[autopilot]` maintenance commands (`PRD-AUT-005`) continue to
 override or augment the native behaviors; native behavior is the default, not a
