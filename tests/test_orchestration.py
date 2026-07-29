@@ -6550,6 +6550,133 @@ class ReviewRouterTests(unittest.TestCase):
             },
         )
 
+    def test_transient_reviewer_overload_retries_then_succeeds(self) -> None:
+        commands: list[str] = []
+        outputs = iter(
+            (
+                (
+                    1,
+                    "This is a server-side issue,\n"
+                    "usually temporary — try again in a moment.",
+                ),
+                (
+                    0,
+                    json.dumps(
+                        {
+                            "verdict": "approve",
+                            "findings": [],
+                            "session_id": "review-1",
+                            "session_id_source": "provider",
+                            "continuation_ordinal": 0,
+                        }
+                    ),
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            commands.append(command)
+            returncode, output = next(outputs)
+            return subprocess.CompletedProcess(command, returncode, stdout=output)
+
+        result = self.router("codex", execute).review(self.gates)
+
+        self.assertTrue(result.approved)
+        self.assertEqual(result.attempt_ordinal, 2)
+        self.assertEqual(len(commands), 2)
+        self.assertNotIn("The previous response was malformed", commands[1])
+        verdicts = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_verdict"
+        ]
+        self.assertEqual(
+            [record["retry_classification"] for record in verdicts],
+            ["transient", "ok"],
+        )
+        self.assertEqual(
+            [record["output_classification"] for record in verdicts],
+            ["failed", "parsed"],
+        )
+        self.assertIn("usually temporary", verdicts[0]["reviewer_output"]["text"])
+
+    def test_repeated_transient_reviewer_overload_terminates_as_provider_failure(
+        self,
+    ) -> None:
+        transitions: list[dict[str, object]] = []
+        machine = RunLifecycleStateMachine(
+            lambda transition: transitions.append(transition.to_payload())
+        )
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            machine.transition(stage, reason="setup")
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                stdout="API Error: 529 Overloaded; try again later",
+            )
+
+        router = self.router("codex", execute)
+        router.stage_machine = machine
+        with self.assertRaises(ReviewStageResultError) as raised:
+            router.review(self.gates)
+
+        self.assertEqual(raised.exception.retry_classification, "transient")
+        self.assertIn("reviewer provider transient failure", str(raised.exception))
+        self.assertIn("review_verdict.reviewer_output", str(raised.exception))
+        self.assertIn("529 Overloaded", str(raised.exception))
+        self.assertEqual(machine.stage, RunStage.CLASSIFICATION)
+        self.assertEqual(transitions[-1]["reason"], "reviewer_error:transient")
+        verdicts = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_verdict"
+        ]
+        self.assertEqual(len(verdicts), 2)
+        self.assertTrue(
+            all(
+                record["retry_classification"] == "transient"
+                and record["output_classification"] == "failed"
+                and "529 Overloaded" in record["reviewer_output"]["text"]
+                for record in verdicts
+            )
+        )
+
+    def test_quoted_overload_outside_terminal_output_does_not_trigger_retry(
+        self,
+    ) -> None:
+        launches = 0
+        output = "\n".join(
+            (
+                "The reviewed fixture contains API Error: 529 Overloaded.",
+                *("ordinary reviewer transcript" for _ in range(400)),
+                "fatal syntax error in reviewer command",
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            nonlocal launches
+            launches += 1
+            return subprocess.CompletedProcess(command, 7, stdout=output)
+
+        with self.assertRaises(ReviewExecutionError):
+            self.router("codex", execute).review(self.gates)
+
+        self.assertEqual(launches, 1)
+        verdict = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_verdict"
+        )
+        self.assertEqual(verdict["retry_classification"], "fatal")
+
     def test_bound_malformed_review_output_drops_cut_leading_line(self) -> None:
         # A mid-line cut can orphan a secret value from the key= label the
         # redactor keys on, so the partial leading line is dropped entirely.

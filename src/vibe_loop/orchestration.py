@@ -39,6 +39,7 @@ from vibe_loop.locks import fencing_token_value, redact_fencing_token_diagnostic
 from vibe_loop.retry import (
     ProviderLimitSignal,
     detect_provider_limit,
+    is_transient_stderr,
     normalize_provider_limit_classification,
 )
 from vibe_loop.tasks import (
@@ -91,6 +92,17 @@ MALFORMED_REVIEW_OUTPUT_MAX_CHARS = 4096
 MALFORMED_REVIEW_OUTPUT_LINE_MAX_CHARS = 1024
 MALFORMED_REVIEW_OUTPUT_RAW_WINDOW_CHARS = 8192
 MALFORMED_REVIEW_OUTPUT_ELISION = "<elided>"
+REVIEW_TRANSIENT_OUTPUT_TAIL_CHARS = 8000
+REVIEW_TRANSIENT_PROVIDER_PATTERNS = (
+    re.compile(
+        r"\bserver[-\s]+side\s+issue\b[\s\S]{0,160}\btemporary\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\busually\s+temporary\b[\s\S]{0,160}\btry\s+again\b",
+        re.IGNORECASE,
+    ),
+)
 VERIFICATION_OUTPUT_READ_BYTES = 8192
 FINDING_SEVERITIES = ("P0", "P1", "P2", "P3")
 FINDING_STATES = ("open", "remediated", "accepted", "rejected")
@@ -381,11 +393,15 @@ class ReviewProviderLimitError(ReviewExecutionError):
         )
 
 
+class ReviewTransientProviderError(ReviewExecutionError):
+    pass
+
+
 class ReviewStageResultError(ReviewExecutionError):
-    def __init__(self, retry_classification: str) -> None:
+    def __init__(self, retry_classification: str, *, detail: str = "") -> None:
         self.retry_classification = retry_classification
         super().__init__(
-            f"reviewer returned typed {retry_classification} error verdict"
+            detail or f"reviewer returned typed {retry_classification} error verdict"
         )
 
 
@@ -2134,6 +2150,14 @@ def bound_failed_review_output(
     return leading + marker + trailing
 
 
+def is_transient_review_failure(output: str) -> bool:
+    terminal_output = output[-REVIEW_TRANSIENT_OUTPUT_TAIL_CHARS:]
+    return is_transient_stderr(terminal_output) or any(
+        pattern.search(terminal_output)
+        for pattern in REVIEW_TRANSIENT_PROVIDER_PATTERNS
+    )
+
+
 ReviewExecutor = Callable[..., subprocess.CompletedProcess[str]]
 ContinuationAvailability = Callable[[str, str, str], str]
 
@@ -2228,7 +2252,7 @@ class ReviewRouter:
                         request,
                         pass_ordinal=pass_ordinal,
                         attempt_ordinal=attempt_ordinal,
-                        reask=attempt_ordinal == 2,
+                        reask=bool(reask_reason),
                         reask_reason=reask_reason,
                         continuation=continuation,
                     )
@@ -2248,10 +2272,21 @@ class ReviewRouter:
                         request,
                         pass_ordinal=pass_ordinal,
                         attempt_ordinal=attempt_ordinal,
-                        reask=attempt_ordinal == 2,
+                        reask=bool(reask_reason),
                         reask_reason=reask_reason,
                         continuation=continuation,
                     )
+            except ReviewTransientProviderError as exc:
+                if attempt_ordinal == 1:
+                    continuation = self._continuation_context(
+                        request, previous=continuation
+                    )
+                    continue
+                self._fail_stage_for_result("transient")
+                raise ReviewStageResultError(
+                    "transient",
+                    detail=str(exc),
+                ) from exc
             except ReviewExecutionError as exc:
                 malformed = exc
                 if attempt_ordinal == 1 and str(exc).startswith("malformed review"):
@@ -2487,20 +2522,30 @@ class ReviewRouter:
                 raise ReviewSessionExpired("reviewer session expired")
             output_classification = "failed" if output else "empty"
             reviewer_output = self._failed_output_evidence(output)
+            retry_classification = (
+                "transient" if is_transient_review_failure(output) else "fatal"
+            )
             self._record_error(
                 request,
                 route,
                 pass_ordinal,
                 attempt_ordinal,
-                "fatal",
+                retry_classification,
                 duration,
                 usage,
                 continuation=continuation,
                 output_classification=output_classification,
                 reviewer_output=reviewer_output,
             )
-            self._fail_stage_for_result("fatal")
             output_location = "review_verdict.reviewer_output"
+            if retry_classification == "transient":
+                raise ReviewTransientProviderError(
+                    "reviewer provider transient failure "
+                    f"(exit code {completed.returncode}); "
+                    f"captured output recorded in {output_location}; "
+                    f"excerpt: {reviewer_output['text']}"
+                )
+            self._fail_stage_for_result("fatal")
             if not output:
                 raise ReviewExecutionError(
                     f"reviewer command failed with exit code {completed.returncode}; "
