@@ -8490,6 +8490,18 @@ class NativePlanningTests(unittest.TestCase):
             "scheduler and next retry read the repair from the task itself",
             worker_calls[0]["command"],
         )
+        self.assertIn(
+            "creation-worded repository-relative deliverable paths",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "add an advisory planning-validation warning",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "do not warn on ordinary path references or unrelated filenames",
+            worker_calls[0]["command"],
+        )
         self.assertEqual(
             records[0]["record_type"], AUTOPILOT_PLANNING_DECISION_RECORD_TYPE
         )

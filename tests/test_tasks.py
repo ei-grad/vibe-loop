@@ -24,6 +24,7 @@ from vibe_loop.tasks import (
     run_json_command,
     run_reset_command,
     runnable_tasks,
+    task_deliverable_path_collisions,
     task_from_mapping,
     task_sort_key,
 )
@@ -105,6 +106,79 @@ class RespectSourceOrderTests(unittest.TestCase):
 
 
 class MarkdownPlanTests(unittest.TestCase):
+    def test_deliverable_collision_flags_exact_existing_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "tools").mkdir()
+            (repo / "tools" / "existing-helper.sh").write_text("#!/bin/sh\n")
+            task = Task(
+                "TASK-EXACT",
+                "Add helper",
+                "Next",
+                scope="Deliver `tools/existing-helper.sh` for shared checks.",
+            )
+
+            collisions = task_deliverable_path_collisions(repo, task)
+
+        self.assertEqual(len(collisions), 1)
+        self.assertEqual(collisions[0]["requested_path"], "tools/existing-helper.sh")
+        self.assertEqual(collisions[0]["existing_path"], "tools/existing-helper.sh")
+        self.assertEqual(collisions[0]["match"], "exact")
+        self.assertEqual(collisions[0]["effect"], "advisory_only")
+
+    def test_deliverable_collision_flags_close_same_directory_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "tools").mkdir()
+            (repo / "tools" / "qemu-proof-outcome.sh").write_text("#!/bin/sh\n")
+            task = Task(
+                "TASK-SIBLING",
+                "Add startup guard",
+                "Next",
+                acceptance=(
+                    "Create `tools/qemu-proof-startup-guard.sh` and source it "
+                    "from proof harnesses."
+                ),
+            )
+
+            collisions = task_deliverable_path_collisions(repo, task)
+
+        self.assertEqual(len(collisions), 1)
+        self.assertEqual(
+            collisions[0]["existing_path"],
+            "tools/qemu-proof-outcome.sh",
+        )
+        self.assertEqual(collisions[0]["match"], "same_directory_sibling")
+
+    def test_deliverable_collision_ignores_no_match_and_incidental_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "tools").mkdir()
+            (repo / "tools" / "unrelated.py").write_text("")
+            task = Task(
+                "TASK-CLEAR",
+                "Add focused helper",
+                "Next",
+                scope="Create `tools/qemu-proof-startup-guard.sh`.",
+                evidence="Existing behavior is documented in tools/unrelated.py.",
+            )
+
+            collisions = task_deliverable_path_collisions(repo, task)
+
+        self.assertEqual(collisions, ())
+
+    def test_command_task_uses_body_for_planning_validation_context(self) -> None:
+        task = task_from_mapping(
+            {
+                "id": "TASK-BODY",
+                "status": "ready",
+                "body": "Create `tools/new-helper.sh`.",
+            },
+            0,
+        )
+
+        self.assertEqual(task.scope, "Create `tools/new-helper.sh`.")
+
     def test_task_json_omits_empty_traceability_fields(self) -> None:
         payload = Task("TASK-01", "Plain task", "Next").to_json()
 

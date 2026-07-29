@@ -838,6 +838,26 @@ class RunnerTests(unittest.TestCase):
             f"$vibe-loop {task.task_id}{RUNTIME_OWNED_WORKER_ADDENDUM}",
         )
 
+    def test_worker_prompt_surfaces_advisory_deliverable_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "tools").mkdir()
+            (repo / "tools" / "qemu-proof-outcome.sh").write_text("#!/bin/sh\n")
+            task = Task(
+                task_id="PLANNING-01",
+                title="Add startup guard",
+                status="Next",
+                acceptance="Create `tools/qemu-proof-startup-guard.sh`.",
+            )
+
+            prompt = build_worker_prompt("$", task, VibeConfig(repo=repo))
+
+        self.assertIn("### Planning Validation Warnings", prompt)
+        self.assertIn('"planning_warnings": [', prompt)
+        self.assertIn('"effect": "advisory_only"', prompt)
+        self.assertIn('"requested_path": "tools/qemu-proof-startup-guard.sh"', prompt)
+        self.assertIn('"existing_path": "tools/qemu-proof-outcome.sh"', prompt)
+
     def test_runtime_owned_worker_prompt_uses_slim_addendum(self) -> None:
         task = Task(task_id="ORC-10", title="Runtime lifecycle", status="Next")
         config = VibeConfig(

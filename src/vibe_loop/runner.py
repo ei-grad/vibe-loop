@@ -180,6 +180,7 @@ from vibe_loop.tasks import (
     TaskSource,
     build_task_source,
     runnable_tasks_from_snapshot,
+    task_deliverable_path_collisions,
     task_source_error_diagnostics,
 )
 from vibe_loop.upstream import check_upstream_sync
@@ -6692,6 +6693,31 @@ def build_worker_prompt(
         else CLI_WORKER_ADDENDUM
     )
     prompt = f"{skill_prefix}vibe-loop {task.task_id}{addendum}"
+    planning_collisions = (
+        task_deliverable_path_collisions(config.repo, task)
+        if config is not None
+        else ()
+    )
+    if planning_collisions:
+        planning_record = json.dumps(
+            {
+                "id": task.task_id,
+                "planning_warnings": list(planning_collisions),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        prompt = (
+            f"{prompt}\n\n"
+            "### Planning Validation Warnings\n\n"
+            "A deterministic pre-dispatch repository check found possible "
+            "collisions with deliverable paths named by this task. These warnings "
+            "are advisory and do not prohibit an intentional rewrite. Inspect the "
+            "existing paths before implementing:\n\n"
+            "```json\n"
+            f"{planning_record}\n"
+            "```\n"
+        )
     if task.prior_findings:
         prompt = (
             f"{prompt}\n\n"

@@ -983,7 +983,19 @@ inspect the configured runtime state `runs.jsonl` for
 `candidate_scope_drift`, add every recorded `unmatched_paths` entry to the
 affected task's authoritative conflict domains, and re-read each created or
 repaired task to verify that its declared paths cover its acceptance and
-recorded scope evidence.
+recorded scope evidence. Before publishing a drafted task, the planning worker
+must run deliverable-collision validation and persist any advisory warning on
+the authoritative task record.
+
+Before an implementation worker launches, the runtime validates
+creation-worded repository-relative deliverable paths in the normalized task
+record against the current repository. An existing exact path or a close
+same-directory filename produces a `deliverable_path_collision` warning in the
+worker prompt naming both paths. The warning is advisory: intentional rewrites
+remain dispatchable. Detection deliberately favors recall, but bounds its
+noise by considering only file paths preceded by creation intent and by limiting
+fuzzy matches to the same directory and file extension; ordinary references and
+unrelated filenames do not warn.
 
 Project-authored `[autopilot]` maintenance commands (`PRD-AUT-005`) continue to
 override or augment the native behaviors; native behavior is the default, not a

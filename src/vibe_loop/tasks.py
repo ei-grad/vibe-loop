@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import difflib
 import json
 import os
 import re
@@ -174,6 +175,31 @@ TRACEABILITY_LIST_FIELDS = {
     "source_fingerprints",
     "spec_paths",
 }
+DELIVERABLE_PATH_RE = re.compile(
+    r"(?<![\w./-])"
+    r"(?P<path>(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+)"
+    r"(?![\w./-])"
+)
+DELIVERABLE_INTENT_RE = re.compile(
+    r"\b(?:add|build|create|deliver|generate|implement|introduce|new|write)\b",
+    re.IGNORECASE,
+)
+GENERIC_FILENAME_TOKENS = frozenset(
+    {
+        "helper",
+        "index",
+        "main",
+        "module",
+        "script",
+        "test",
+        "tests",
+        "tool",
+        "tools",
+        "util",
+        "utils",
+    }
+)
+DELIVERABLE_COLLISION_LIMIT = 3
 
 
 @dataclasses.dataclass(frozen=True)
@@ -276,6 +302,110 @@ class Task:
         if self.hazards:
             payload["hazards"] = list(self.hazards)
         return payload
+
+
+def task_deliverable_path_collisions(
+    repo: Path,
+    task: Task,
+) -> tuple[dict[str, str], ...]:
+    """Find advisory collisions for creation-worded task deliverable paths."""
+    repo = repo.resolve()
+    requested_paths = _task_deliverable_paths(task)
+    collisions: list[dict[str, str]] = []
+    for requested_path in requested_paths:
+        target = repo / requested_path
+        if target.is_file():
+            collisions.append(
+                _deliverable_collision(requested_path, requested_path, "exact")
+            )
+        elif target.parent.is_dir() and target.parent.resolve().is_relative_to(repo):
+            siblings = sorted(
+                (
+                    sibling
+                    for sibling in target.parent.iterdir()
+                    if sibling.is_file()
+                    and _close_deliverable_sibling(target.name, sibling.name)
+                ),
+                key=lambda sibling: sibling.name,
+            )
+            for sibling in siblings[:DELIVERABLE_COLLISION_LIMIT]:
+                existing_path = sibling.relative_to(repo).as_posix()
+                collisions.append(
+                    _deliverable_collision(
+                        requested_path,
+                        existing_path,
+                        "same_directory_sibling",
+                    )
+                )
+        if len(collisions) >= DELIVERABLE_COLLISION_LIMIT:
+            break
+    return tuple(collisions[:DELIVERABLE_COLLISION_LIMIT])
+
+
+def _task_deliverable_paths(task: Task) -> tuple[str, ...]:
+    paths: list[str] = []
+    text = "\n".join((task.title, task.scope, task.acceptance, task.evidence))
+    for line in text.splitlines():
+        for match in DELIVERABLE_PATH_RE.finditer(line):
+            intent_window = line[max(0, match.start() - 160) : match.start()]
+            if DELIVERABLE_INTENT_RE.search(intent_window) is None:
+                continue
+            candidate = PurePosixPath(match.group("path"))
+            if candidate.is_absolute() or ".." in candidate.parts:
+                continue
+            normalized = candidate.as_posix()
+            if normalized not in paths:
+                paths.append(normalized)
+    return tuple(paths)
+
+
+def _close_deliverable_sibling(requested_name: str, existing_name: str) -> bool:
+    requested = PurePosixPath(requested_name)
+    existing = PurePosixPath(existing_name)
+    if requested.suffix.casefold() != existing.suffix.casefold():
+        return False
+    requested_stem = requested.stem.casefold()
+    existing_stem = existing.stem.casefold()
+    requested_tokens = _meaningful_filename_tokens(requested_stem)
+    existing_tokens = _meaningful_filename_tokens(existing_stem)
+    if len(requested_tokens & existing_tokens) >= 2:
+        return True
+    common_prefix = os.path.commonprefix((requested_stem, existing_stem))
+    return (
+        len(common_prefix) >= 6
+        and difflib.SequenceMatcher(
+            None,
+            requested_stem,
+            existing_stem,
+        ).ratio()
+        >= 0.55
+    )
+
+
+def _meaningful_filename_tokens(stem: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", stem)
+        if len(token) >= 3 and token not in GENERIC_FILENAME_TOKENS
+    }
+
+
+def _deliverable_collision(
+    requested_path: str,
+    existing_path: str,
+    match: str,
+) -> dict[str, str]:
+    return {
+        "kind": "deliverable_path_collision",
+        "requested_path": requested_path,
+        "existing_path": existing_path,
+        "match": match,
+        "effect": "advisory_only",
+        "precision": (
+            "high recall within creation-worded paths; exact files and close "
+            "same-directory filenames may include intentional rewrites"
+        ),
+    }
 
 
 class TaskSource(Protocol):
@@ -2763,7 +2893,7 @@ def task_from_mapping(value: object, order: int) -> Task:
         conflict_domains_known=bool(value.get("conflict_domains_known"))
         or resources_present
         or paths_present,
-        scope=str(value.get("scope") or ""),
+        scope=str(value.get("scope") or value.get("body") or ""),
         acceptance=str(value.get("acceptance") or ""),
         evidence=str(value.get("evidence") or ""),
         source=str(value.get("source") or ""),
