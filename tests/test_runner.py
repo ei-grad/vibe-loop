@@ -6955,7 +6955,9 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
     @unittest.skipUnless(
         hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
     )
-    def test_accepted_report_teardown_refuses_descendant_outside_worker_group(self):
+    def test_accepted_report_teardown_refuses_descendant_that_survives_group_stop(
+        self,
+    ):
         proc = FakeWatchdogProcess(alive_polls=10_000)
         root = ProcessNode(
             pid=proc.pid,
@@ -6973,22 +6975,76 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         )
         nodes = {root.pid: root, escaped.pid: escaped}
         killed: list[tuple[int, int]] = []
-        with patch.object(
-            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+
+        def terminate_group(*args, **kwargs) -> None:
+            nodes.pop(root.pid)
+
+        with (
+            patch.object(
+                runner_module,
+                "terminate_worker_process_group",
+                side_effect=terminate_group,
+            ),
+            patch.object(
+                runner_module.os,
+                "killpg",
+                lambda pid, sig: killed.append((pid, sig)),
+            ),
         ):
             result = terminate_verified_worker_process_group(
                 proc,
                 StringIO(),
                 expected_birth_id=root.process_birth_id,
+                sigkill_after_seconds=0.001,
                 process_table=lambda: nodes,
                 process_node=nodes.get,
             )
 
         self.assertFalse(result.terminated)
         self.assertTrue(result.identity_verified)
-        self.assertFalse(result.descendants_verified)
-        self.assertEqual(result.reason, "descendant_outside_worker_process_group")
-        self.assertEqual(killed, [])
+        self.assertTrue(result.descendants_verified)
+        self.assertEqual(result.reason, "verified_processes_remain")
+        self.assertEqual(killed, [(proc.pid, signal.SIGKILL)])
+
+    def test_accepted_report_teardown_accepts_escaped_descendant_that_exits(self):
+        proc = FakeWatchdogProcess(alive_polls=10_000)
+        root = ProcessNode(
+            pid=proc.pid,
+            parent_pid=1,
+            process_group_id=proc.pid,
+            session_id=proc.pid,
+            process_birth_id="boot:root",
+        )
+        escaped = ProcessNode(
+            pid=proc.pid + 1,
+            parent_pid=proc.pid,
+            process_group_id=proc.pid + 1,
+            session_id=proc.pid + 1,
+            process_birth_id="boot:child",
+        )
+        nodes = {root.pid: root, escaped.pid: escaped}
+
+        def terminate_group(*args, **kwargs) -> None:
+            nodes.clear()
+
+        with patch.object(
+            runner_module,
+            "terminate_worker_process_group",
+            side_effect=terminate_group,
+        ):
+            result = terminate_verified_worker_process_group(
+                proc,
+                StringIO(),
+                expected_birth_id=root.process_birth_id,
+                process_table=lambda: nodes.copy(),
+                process_node=nodes.get,
+            )
+
+        self.assertTrue(result.terminated)
+        self.assertTrue(result.identity_verified)
+        self.assertTrue(result.descendants_verified)
+        self.assertEqual(result.reason, "accepted_report_runtime_closure")
+        self.assertEqual(result.process_count, 2)
 
     def test_accepted_report_teardown_owns_reparented_same_group_child(self):
         proc = FakeWatchdogProcess(alive_polls=10_000)
@@ -7277,6 +7333,46 @@ class FakeMonotonicClock:
 
 
 class ClassifyPostReportActivityTests(unittest.TestCase):
+    def test_runtime_lifecycle_decision_combines_activity_and_survivor_evidence(
+        self,
+    ) -> None:
+        completed = WorkerReport(run_id="run-1", task_id="T-1", status="completed")
+        unavailable = runner_module.unavailable_usage("anthropic", "test_fixture")
+        cases = (
+            ("stray_tool_call_only", "tool_call", "accepted_report_runtime_closure"),
+            ("surviving_orphan_only", "", "verified_processes_remain"),
+            ("both", "tool_call", "verified_processes_remain"),
+            ("neither", "", "accepted_report_runtime_closure"),
+        )
+
+        for name, activity_kind, teardown_reason in cases:
+            with self.subTest(name=name):
+                activity = runner_module.PostReportActivity(
+                    reported=True,
+                    seconds=0.5,
+                    activity_kind=activity_kind,
+                    activity_count=1 if activity_kind else 0,
+                    enforced_stop=True,
+                    identity_verified=True,
+                    usage=unavailable,
+                    teardown_reason=teardown_reason,
+                    descendants_verified=True,
+                    teardown_process_count=2,
+                )
+                decision = runner_module.post_report_runtime_lifecycle_decision(
+                    runtime_owned=True,
+                    exit_code=-signal.SIGTERM,
+                    timed_out=False,
+                    worker_report=completed,
+                    activity=activity,
+                )
+                expected = (
+                    ("refuse", "verified_processes_remain")
+                    if teardown_reason == "verified_processes_remain"
+                    else ("continue", "verified_accepted_report_runtime_closure")
+                )
+                self.assertEqual(decision, expected)
+
     def test_runtime_lifecycle_decision_rejects_non_authoritative_exits(self) -> None:
         activity = runner_module.PostReportActivity(
             reported=True,

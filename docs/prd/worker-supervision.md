@@ -44,18 +44,21 @@ finalization/next-task dispatch still waits for the worker process to exit.
 In runtime-owned orchestration, the bounded-summary grace does not apply after a
 completed report whose resolved commit matches a recorded candidate and whose
 candidate still matches the claimed workspace. That accepted pair is the terminal
-implementation contract: the supervisor promptly verifies that the isolated
-session and process group contain only birth-identified worker processes, including
-same-group children reparented after an intermediate process exits, stops the
-group, and proves the captured processes exited. A nonzero exit caused by this
-closure may advance to candidate collection only when closure identity,
-descendant verification, and termination all succeeded and the run did not hit
-its wall-clock timeout. On platforms without the Linux birth-identity primitive,
-the supervisor retains the clean-exit and bounded-grace path and does not claim a
-verified closure. The runtime re-snapshots the claimed candidate after teardown
-and before any gate. An external termination, missing or mismatched candidate,
-unverifiable Linux identity or descendants, non-completed report, teardown
-failure, or changed candidate remains fail-closed.
+implementation contract: the supervisor promptly verifies the captured worker
+tree through birth identities, including children reparented after an
+intermediate process exits, stops the verified worker process group, and proves
+every captured process exited. A captured descendant outside that process group
+is closure evidence, not an immediate candidate refusal: closure advances only
+if that exact descendant also exits during teardown. A surviving descendant
+remains fail-closed. A nonzero exit caused by this closure may advance to
+candidate collection only when closure identity, descendant verification, and
+termination all succeeded and the run did not hit its wall-clock timeout. On
+platforms without the Linux birth-identity primitive, the supervisor retains the
+clean-exit and bounded-grace path and does not claim a verified closure. The
+runtime re-snapshots the claimed candidate after teardown and before any gate.
+An external termination, missing or mismatched candidate, unverifiable Linux
+identity or descendants, non-completed report, surviving captured process,
+teardown failure, or changed candidate remains fail-closed.
 
 Runtime-initiated accepted-report closure is recorded separately from
 `post_report_activity` and timeout evidence. Its closed reason vocabulary,

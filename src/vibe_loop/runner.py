@@ -9057,10 +9057,6 @@ def terminate_verified_worker_process_group(
         return VerifiedWorkerTeardown(
             False, True, False, "process_group_contains_unowned_member"
         )
-    if any(node.process_group_id != process.pid for node in descendants):
-        return VerifiedWorkerTeardown(
-            False, True, False, "descendant_outside_worker_process_group"
-        )
     owned = {node.pid: node for node in group}
     owned.update((node.pid, node) for node in descendants)
     for node in owned.values():
