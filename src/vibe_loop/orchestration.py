@@ -2426,7 +2426,8 @@ class ReviewRouter:
                     transient_retry_used = True
                     previous = continuation
                     if exc.result is not None:
-                        previous = ContinuationContext(
+                        previous = dataclasses.replace(
+                            continuation,
                             session_id=exc.result.session_id,
                             session_id_source=exc.result.session_id_source,
                             continuation_ordinal=exc.result.continuation_ordinal,
@@ -2807,34 +2808,6 @@ class ReviewRouter:
             findings = tuple(ReviewFinding.from_payload(item) for item in raw_findings)
         except ReviewExecutionError as exc:
             raise ReviewExecutionError(f"malformed review output: {exc}") from exc
-        if request.family == "initial" and verdict == "approve" and findings:
-            raise ReviewExecutionError(
-                "malformed review output: approve verdict cannot include findings"
-            )
-        if verdict == "findings" and not findings:
-            raise ReviewExecutionError(
-                "malformed review output: findings verdict requires findings"
-            )
-        if request.family == "initial" and any(
-            finding.state != "open" for finding in findings
-        ):
-            raise ReviewExecutionError(
-                "malformed review output: initial findings must be open"
-            )
-        if request.family == "closure":
-            prior_ids = {finding.finding_id for finding in request.prior_findings}
-            result_ids = {finding.finding_id for finding in findings}
-            if result_ids != prior_ids:
-                raise ReviewExecutionError(
-                    "malformed review output: closure must return every prior finding exactly once"
-                )
-            has_open = any(finding.state == "open" for finding in findings)
-            if (verdict == "approve" and has_open) or (
-                verdict == "findings" and not has_open
-            ):
-                raise ReviewExecutionError(
-                    "malformed review output: closure verdict must match finding states"
-                )
         reported_session_id = payload.get("session_id", "")
         reported_session_id_source = payload.get("session_id_source", "")
         reported_continuation_ordinal = payload.get("continuation_ordinal", 0)
@@ -2867,6 +2840,34 @@ class ReviewRouter:
             raise ReviewExecutionError(
                 "malformed review output: non-error verdict must classify as ok"
             )
+        if request.family == "initial" and verdict == "approve" and findings:
+            raise ReviewExecutionError(
+                "malformed review output: approve verdict cannot include findings"
+            )
+        if verdict == "findings" and not findings:
+            raise ReviewExecutionError(
+                "malformed review output: findings verdict requires findings"
+            )
+        if request.family == "initial" and any(
+            finding.state != "open" for finding in findings
+        ):
+            raise ReviewExecutionError(
+                "malformed review output: initial findings must be open"
+            )
+        if request.family == "closure" and verdict != "error":
+            prior_ids = {finding.finding_id for finding in request.prior_findings}
+            result_ids = {finding.finding_id for finding in findings}
+            if result_ids != prior_ids:
+                raise ReviewExecutionError(
+                    "malformed review output: closure must return every prior finding exactly once"
+                )
+            has_open = any(finding.state == "open" for finding in findings)
+            if (verdict == "approve" and has_open) or (
+                verdict == "findings" and not has_open
+            ):
+                raise ReviewExecutionError(
+                    "malformed review output: closure verdict must match finding states"
+                )
         if (
             continuation.session_id_source in {"runtime_injected", "runtime_resumed"}
             and continuation.session_id
@@ -3050,14 +3051,16 @@ class ReviewRouter:
                 session_id_factory=self.session_id_factory,
             )
 
+        lineage_prior_session_id = ""
+        lineage_fallback_reason = ""
         prior_session_id = ""
         prior_ordinal = 0
-        fallback_reason = ""
         if previous is not None:
             if previous.fallback_reason:
-                prior_session_id = previous.prior_session_id
-                prior_ordinal = max(0, previous.continuation_ordinal - 1)
-                fallback_reason = previous.fallback_reason
+                lineage_prior_session_id = previous.prior_session_id
+                lineage_fallback_reason = previous.fallback_reason
+                prior_session_id = previous.session_id
+                prior_ordinal = previous.continuation_ordinal
             else:
                 prior_session_id = previous.session_id
                 prior_ordinal = previous.continuation_ordinal
@@ -3065,7 +3068,8 @@ class ReviewRouter:
             prior = self._latest_review_session(provider)
             if prior is not None:
                 prior_session_id, prior_ordinal = prior
-        if prior_session_id and not fallback_reason:
+        fallback_reason = ""
+        if prior_session_id:
             availability = (
                 self.continuation_availability
                 or self._default_continuation_availability
@@ -3075,7 +3079,7 @@ class ReviewRouter:
                 raise ReviewExecutionError(
                     "continuation availability returned an invalid reason"
                 )
-        return plan_session_continuation(
+        planned = plan_session_continuation(
             provider=provider,
             role="reviewer",
             continuing=True,
@@ -3084,6 +3088,13 @@ class ReviewRouter:
             availability_reason=fallback_reason,
             session_id_factory=self.session_id_factory,
         )
+        if lineage_fallback_reason:
+            planned = dataclasses.replace(
+                planned,
+                prior_session_id=lineage_prior_session_id,
+                fallback_reason=lineage_fallback_reason,
+            )
+        return planned
 
     def _default_continuation_availability(
         self, provider: str, role: str, session_id: str
@@ -3207,7 +3218,7 @@ class ReviewRouter:
                     task_id=self.task_id,
                     payload=self._continuation_fallback_payload(request, continuation),
                 ).to_record()
-                if continuation.fallback_reason
+                if continuation.fallback_reason and not continuation.resumed
                 else None
             ),
         )
@@ -3638,6 +3649,8 @@ class ReviewRouter:
     ) -> str:
         if request.family == "initial":
             return "initial"
+        if continuation.fallback_reason:
+            return "fresh_closure"
         if continuation.resumed:
             return "resumed_closure"
         return "fresh_closure"
@@ -8035,11 +8048,14 @@ def require_candidate_review_clear(
                 "findings": "findings",
                 "error": "blocked",
             }.get(record.get("verdict"))
-        if (
-            control_verdict == "blocked"
-            and record.get("output_classification")
-            in REVIEW_DIAGNOSTIC_OUTPUT_CLASSIFICATIONS
-        ):
+        diagnostic_output = record.get(
+            "output_classification"
+        ) in REVIEW_DIAGNOSTIC_OUTPUT_CLASSIFICATIONS or (
+            record.get("output_classification") == "parsed"
+            and record.get("engine_verdict") == "error"
+            and record.get("retry_classification") == "transient"
+        )
+        if control_verdict == "blocked" and diagnostic_output:
             continue
         if control_verdict in {"findings", "blocked"}:
             raise ReviewControlFenceError(f"review_verdict_{control_verdict}")
