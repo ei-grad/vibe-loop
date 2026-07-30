@@ -1512,6 +1512,19 @@ def preserve_runtime_lock_fields(
         if key not in updated and key in current:
             updated[key] = current[key]
     preserve_settled_lock_outcome(updated, current)
+    if (
+        current.get("scope_fence_source") == "current"
+        and updated.get("scope_fence_source") != "current"
+    ):
+        for key in (
+            "resources",
+            "paths",
+            "conflict_domains_known",
+            "scope_fence_source",
+            "scope_fence_widened_by",
+        ):
+            if key in current:
+                updated[key] = current[key]
     for key in (
         "workspace",
         "worker_pid",

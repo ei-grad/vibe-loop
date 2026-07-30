@@ -1547,6 +1547,7 @@ class RuntimeGateTests(unittest.TestCase):
         self,
         scope_policy: CandidateScopePolicy,
         current_scope_policy=None,
+        authorize_current_scope_policy=None,
     ) -> CandidateCollector:
         return CandidateCollector(
             worktree=self.repo,
@@ -1557,6 +1558,7 @@ class RuntimeGateTests(unittest.TestCase):
             task_id="TASK-01",
             scope_policy=scope_policy,
             current_scope_policy=current_scope_policy,
+            authorize_current_scope_policy=authorize_current_scope_policy,
         )
 
     def test_candidate_declaration_and_derivation_are_validated_and_recorded(
@@ -1923,6 +1925,7 @@ class RuntimeGateTests(unittest.TestCase):
                 actor_kind="operator",
                 actor="alice",
             ),
+            authorize_current_scope_policy=lambda _policy: True,
         )
 
         candidate = collector.collect_declared(head_commit=self.head)
@@ -1941,6 +1944,7 @@ class RuntimeGateTests(unittest.TestCase):
             assessment["current_domains"],
             {"resources": [], "paths": ["src", "tracked.txt"]},
         )
+        self.assertTrue(assessment["current_domain_lease_updated"])
 
     def test_candidate_scope_equal_current_domains_uses_snapshot(self) -> None:
         collector = self.collector_with_scope(
@@ -1985,6 +1989,215 @@ class RuntimeGateTests(unittest.TestCase):
         self.assertEqual(assessment["fence_source"], "snapshot")
         self.assertEqual(assessment["current_domains_actor_kind"], "worker")
         self.assertEqual(assessment["current_domains_actor"], "implementer-session")
+
+    def test_candidate_scope_refuses_unattributed_widening(self) -> None:
+        collector = self.collector_with_scope(
+            CandidateScopePolicy(known=True, paths=("src",)),
+            current_scope_policy=lambda: CandidateScopePolicy(
+                known=True,
+                paths=("src", "tracked.txt"),
+            ),
+            authorize_current_scope_policy=lambda _policy: True,
+        )
+
+        with self.assertRaises(CandidateCollectionError):
+            collector.collect_declared(head_commit=self.head)
+
+        assessment = self.store.read_records()[-1]
+        self.assertEqual(
+            assessment["reason"],
+            "current_domain_widening_not_operator_authorized",
+        )
+        self.assertEqual(assessment["fence_source"], "snapshot")
+
+    def test_candidate_scope_refuses_runtime_and_external_widening(self) -> None:
+        for actor_kind in ("runtime", "external-system"):
+            with self.subTest(actor_kind=actor_kind):
+                collector = self.collector_with_scope(
+                    CandidateScopePolicy(known=True, paths=("src",)),
+                    current_scope_policy=lambda: CandidateScopePolicy(
+                        known=True,
+                        paths=("src", "tracked.txt"),
+                        actor_kind=actor_kind,
+                        actor=f"{actor_kind}-actor",
+                    ),
+                    authorize_current_scope_policy=lambda _policy: True,
+                )
+
+                with self.assertRaises(CandidateCollectionError):
+                    collector.collect_declared(head_commit=self.head)
+
+                assessment = self.store.read_records()[-1]
+                self.assertEqual(
+                    assessment["reason"],
+                    "current_domain_widening_not_operator_authorized",
+                )
+                self.assertEqual(
+                    assessment["current_domains_actor_kind"],
+                    actor_kind,
+                )
+
+    def test_candidate_scope_refuses_operator_without_identity(self) -> None:
+        collector = self.collector_with_scope(
+            CandidateScopePolicy(known=True, paths=("src",)),
+            current_scope_policy=lambda: CandidateScopePolicy(
+                known=True,
+                paths=("src", "tracked.txt"),
+                actor_kind="operator",
+            ),
+            authorize_current_scope_policy=lambda _policy: True,
+        )
+
+        with self.assertRaises(CandidateCollectionError):
+            collector.collect_declared(head_commit=self.head)
+
+        assessment = self.store.read_records()[-1]
+        self.assertEqual(
+            assessment["reason"],
+            "current_domain_widening_not_operator_authorized",
+        )
+
+    def test_candidate_scope_falls_back_when_widened_lease_is_unavailable(
+        self,
+    ) -> None:
+        collector = self.collector_with_scope(
+            CandidateScopePolicy(known=True, paths=("src",)),
+            current_scope_policy=lambda: CandidateScopePolicy(
+                known=True,
+                paths=("src", "tracked.txt"),
+                actor_kind="operator",
+                actor="alice",
+            ),
+            authorize_current_scope_policy=lambda _policy: False,
+        )
+
+        with self.assertRaises(CandidateCollectionError):
+            collector.collect_declared(head_commit=self.head)
+
+        assessment = self.store.read_records()[-1]
+        self.assertEqual(
+            assessment["reason"],
+            "current_domain_widening_lease_not_acquired",
+        )
+        self.assertFalse(assessment["current_domain_lease_updated"])
+        self.assertEqual(assessment["fence_source"], "snapshot")
+
+    def test_candidate_scope_narrowing_keeps_snapshot_authority(self) -> None:
+        collector = self.collector_with_scope(
+            CandidateScopePolicy(known=True, paths=("tracked.txt", "src")),
+            current_scope_policy=lambda: CandidateScopePolicy(
+                known=True,
+                paths=("src",),
+                actor_kind="operator",
+                actor="alice",
+            ),
+            authorize_current_scope_policy=lambda _policy: self.fail(
+                "narrowing must not request a wider lease"
+            ),
+        )
+
+        collector.collect_declared(head_commit=self.head)
+
+        assessment = self.store.read_records()[-2]
+        self.assertEqual(assessment["outcome"], "in_scope")
+        self.assertEqual(assessment["fence_source"], "snapshot")
+        self.assertFalse(assessment["fence_widened_mid_run"])
+
+    def test_candidate_scope_does_not_widen_lease_when_snapshot_covers_candidate(
+        self,
+    ) -> None:
+        collector = self.collector_with_scope(
+            CandidateScopePolicy(known=True, paths=("tracked.txt",)),
+            current_scope_policy=lambda: CandidateScopePolicy(
+                known=True,
+                paths=("tracked.txt", "src"),
+                actor_kind="operator",
+                actor="alice",
+            ),
+            authorize_current_scope_policy=lambda _policy: self.fail(
+                "an already in-scope candidate does not need a wider lease"
+            ),
+        )
+
+        collector.collect_declared(head_commit=self.head)
+
+        assessment = self.store.read_records()[-2]
+        self.assertEqual(assessment["outcome"], "in_scope")
+        self.assertEqual(assessment["fence_source"], "snapshot")
+        self.assertFalse(assessment["fence_widened_mid_run"])
+
+    def test_candidate_scope_widening_that_still_drifts_keeps_snapshot(self) -> None:
+        collector = self.collector_with_scope(
+            CandidateScopePolicy(known=True, paths=("src",)),
+            current_scope_policy=lambda: CandidateScopePolicy(
+                known=True,
+                resources=("resource:database",),
+                paths=("src", "docs"),
+                actor_kind="operator",
+                actor="alice",
+            ),
+            authorize_current_scope_policy=lambda _policy: self.fail(
+                "a drifting current fence must not update the lease"
+            ),
+        )
+
+        with self.assertRaises(CandidateCollectionError):
+            collector.collect_declared(head_commit=self.head)
+
+        assessment = self.store.read_records()[-1]
+        self.assertEqual(assessment["reason"], "paths_outside_declared_domains")
+        self.assertEqual(assessment["fence_source"], "snapshot")
+
+    def test_candidate_scope_unknown_snapshot_skips_current_probe(self) -> None:
+        collector = self.collector_with_scope(
+            CandidateScopePolicy(known=False),
+            current_scope_policy=lambda: (_ for _ in ()).throw(
+                FileNotFoundError("missing task source")
+            ),
+        )
+
+        candidate = collector.collect_declared(head_commit=self.head)
+
+        self.assertEqual(candidate.changed_paths, ("tracked.txt",))
+        assessment = self.store.read_records()[-2]
+        self.assertEqual(assessment["outcome"], "unenforceable")
+        self.assertEqual(assessment["fence_source"], "snapshot")
+        self.assertEqual(assessment["current_domains_refresh"], "skipped")
+
+    def test_candidate_scope_probe_failure_keeps_known_snapshot(self) -> None:
+        collector = self.collector_with_scope(
+            CandidateScopePolicy(known=True, paths=("tracked.txt",)),
+            current_scope_policy=lambda: (_ for _ in ()).throw(
+                ValueError("ambiguous task source")
+            ),
+        )
+
+        collector.collect_declared(head_commit=self.head)
+
+        assessment = self.store.read_records()[-2]
+        self.assertEqual(assessment["outcome"], "in_scope")
+        self.assertEqual(assessment["fence_source"], "snapshot")
+        self.assertEqual(assessment["current_domains_refresh"], "failed")
+        self.assertEqual(
+            assessment["current_domains_refresh_error"],
+            "ValueError",
+        )
+
+    def test_candidate_scope_resource_widening_is_monotonic(self) -> None:
+        snapshot = CandidateScopePolicy(
+            known=True,
+            resources=("resource:database",),
+            paths=("tracked.txt",),
+        )
+        current = CandidateScopePolicy(
+            known=True,
+            resources=("resource:database", "resource:cache"),
+            paths=("tracked.txt",),
+            actor_kind="operator",
+            actor="alice",
+        )
+
+        self.assertTrue(current.covers(snapshot))
 
     def test_candidate_scope_without_domains_is_explicitly_unenforceable(
         self,

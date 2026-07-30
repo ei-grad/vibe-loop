@@ -102,7 +102,7 @@ from vibe_loop.orchestration import (
     candidate_scope_policy_from_task,
     config_contract_blockers,
 )
-from vibe_loop.runner import VibeRunner
+from vibe_loop.runner import VibeRunner, authorize_task_lock_scope_widening
 from vibe_loop.runtime_events import (
     RuntimeEventAdapterError,
     bootstrap_run_journal_cursor,
@@ -2603,13 +2603,13 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
                     "candidate declaration requires a claimed workspace",
                 )
             claim = active.workspace
-            candidate_source = build_task_source(
-                claim.worktree,
-                config.task_source,
-                runtime_context=config.runtime_environment,
-            )
 
             def current_scope_policy() -> CandidateScopePolicy:
+                candidate_source = build_task_source(
+                    claim.worktree,
+                    config.task_source,
+                    runtime_context=config.runtime_environment,
+                )
                 current_task = candidate_source.probe(task_id)
                 if current_task is None:
                     raise ValueError(
@@ -2631,6 +2631,16 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
                     paths=active.paths,
                 ),
                 current_scope_policy=current_scope_policy,
+                authorize_current_scope_policy=lambda policy: (
+                    authorize_task_lock_scope_widening(
+                        state_path=config.state_path,
+                        lock_manager=manager,
+                        task_lock=lock,
+                        run_id=run_id,
+                        task_id=task_id,
+                        policy=policy,
+                    )
+                ),
             )
             recorded = collector.collect_declared(
                 head_commit=args.head,

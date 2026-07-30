@@ -5574,6 +5574,9 @@ class CliTests(unittest.TestCase):
                         "started_at": "2026-07-21T00:00:00+00:00",
                         "base_main": base,
                         "fencing_token": fencing_token,
+                        "resources": [],
+                        "paths": ["candidate.txt"],
+                        "conflict_domains_known": True,
                     }
                 ),
                 encoding="utf-8",
@@ -5601,28 +5604,36 @@ class CliTests(unittest.TestCase):
                 )
             candidate_stdout = StringIO()
             candidate_stderr = StringIO()
-            with redirect_stdout(candidate_stdout), redirect_stderr(candidate_stderr):
-                candidate_exit = main(
-                    [
-                        "worker",
-                        "candidate",
-                        "--repo",
-                        str(repo),
-                        "--run-id",
-                        "run-1",
-                        "--task-id",
-                        "TASK-01",
-                        "--head",
-                        head,
-                        "--base-main",
-                        base,
-                        "--changed-path",
-                        "candidate.txt",
-                        "--fencing-token",
-                        fencing_token,
-                        "--json",
-                    ]
-                )
+            with patch(
+                "vibe_loop.cli.build_task_source",
+                side_effect=ValueError("ambiguous task source"),
+            ) as build_source:
+                with (
+                    redirect_stdout(candidate_stdout),
+                    redirect_stderr(candidate_stderr),
+                ):
+                    candidate_exit = main(
+                        [
+                            "worker",
+                            "candidate",
+                            "--repo",
+                            str(repo),
+                            "--run-id",
+                            "run-1",
+                            "--task-id",
+                            "TASK-01",
+                            "--head",
+                            head,
+                            "--base-main",
+                            base,
+                            "--changed-path",
+                            "candidate.txt",
+                            "--fencing-token",
+                            fencing_token,
+                            "--json",
+                        ]
+                    )
+                build_source.assert_called_once()
             wrong_stdout = StringIO()
             wrong_stderr = StringIO()
             with redirect_stdout(wrong_stdout), redirect_stderr(wrong_stderr):
@@ -5660,11 +5671,23 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["candidate"]["changed_paths"], ["candidate.txt"])
         self.assertEqual(
             payload["scope_assessment"]["finding"],
-            "candidate_scope_unenforceable",
+            "",
         )
         self.assertEqual(
             payload["scope_assessment"]["reason"],
-            "conflict_domains_unknown",
+            "all_paths_matched",
+        )
+        self.assertEqual(
+            payload["scope_assessment"]["fence_source"],
+            "snapshot",
+        )
+        self.assertEqual(
+            payload["scope_assessment"]["current_domains_refresh"],
+            "failed",
+        )
+        self.assertEqual(
+            payload["scope_assessment"]["current_domains_refresh_error"],
+            "ValueError",
         )
         self.assertEqual(
             [record["record_type"] for record in records[-2:]],

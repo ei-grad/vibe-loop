@@ -707,6 +707,7 @@ class CandidateScopePolicy:
         candidate: CandidateRecord,
         *,
         current: CandidateScopePolicy | None = None,
+        authorize_current: Callable[[CandidateScopePolicy], bool] | None = None,
     ) -> CandidateScopeAssessment:
         snapshot_assessment = self._assess_declared(candidate)
         if current is None:
@@ -735,21 +736,31 @@ class CandidateScopePolicy:
             monotonic_widening
             and current_assessment.outcome == "in_scope"
             and operator_authorized
+            and snapshot_assessment.outcome == "drift"
         ):
-            return dataclasses.replace(
-                current_assessment,
-                details={
-                    **current_assessment.details,
-                    **fence_details,
-                    "fence_source": "current",
-                    "fence_widened_mid_run": True,
-                    "fence_widened_by": current.actor,
-                },
-            )
+            lease_updated = bool(authorize_current and authorize_current(current))
+            fence_details["current_domain_lease_updated"] = lease_updated
+            if lease_updated:
+                return dataclasses.replace(
+                    current_assessment,
+                    details={
+                        **current_assessment.details,
+                        **fence_details,
+                        "fence_source": "current",
+                        "fence_widened_mid_run": True,
+                        "fence_widened_by": current.actor,
+                    },
+                )
+            if snapshot_assessment.outcome == "drift":
+                snapshot_assessment = dataclasses.replace(
+                    snapshot_assessment,
+                    reason="current_domain_widening_lease_not_acquired",
+                )
         if (
             monotonic_widening
             and current_assessment.outcome == "in_scope"
             and snapshot_assessment.outcome == "drift"
+            and not operator_authorized
         ):
             snapshot_assessment = dataclasses.replace(
                 snapshot_assessment,
@@ -870,6 +881,9 @@ class CandidateCollector:
         main_branch: str = "main",
         scope_policy: CandidateScopePolicy | None = None,
         current_scope_policy: Callable[[], CandidateScopePolicy] | None = None,
+        authorize_current_scope_policy: (
+            Callable[[CandidateScopePolicy], bool] | None
+        ) = None,
     ) -> None:
         self.worktree = worktree.resolve()
         self.branch = branch
@@ -880,6 +894,7 @@ class CandidateCollector:
         self.main_branch = main_branch
         self.scope_policy = scope_policy
         self.current_scope_policy = current_scope_policy
+        self.authorize_current_scope_policy = authorize_current_scope_policy
         self.last_scope_assessment: CandidateScopeAssessment | None = None
 
     def collect_derived(self) -> CandidateRecord:
@@ -934,14 +949,35 @@ class CandidateCollector:
     def validate_scope(self, candidate: CandidateRecord) -> None:
         if self.scope_policy is None:
             return
-        try:
-            current = self.current_scope_policy() if self.current_scope_policy else None
-        except (OSError, subprocess.SubprocessError, ValueError) as exc:
-            raise CandidateCollectionError(
-                "candidate_scope_refresh_failed",
-                "current task conflict domains could not be read at scope check",
-            ) from exc
-        assessment = self.scope_policy.assess(candidate, current=current)
+        current = None
+        refresh_state = ""
+        refresh_error = ""
+        if self.current_scope_policy is not None:
+            if not self.scope_policy.known:
+                refresh_state = "skipped"
+            else:
+                try:
+                    current = self.current_scope_policy()
+                    refresh_state = "refreshed"
+                except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                    refresh_state = "failed"
+                    refresh_error = type(exc).__name__
+        assessment = self.scope_policy.assess(
+            candidate,
+            current=current,
+            authorize_current=self.authorize_current_scope_policy,
+        )
+        if self.current_scope_policy is not None and current is None:
+            details = {
+                **assessment.details,
+                "fence_source": "snapshot",
+                "fence_widened_mid_run": False,
+                "snapshot_domains": self.scope_policy.domains_payload(),
+                "current_domains_refresh": refresh_state,
+            }
+            if refresh_error:
+                details["current_domains_refresh_error"] = refresh_error
+            assessment = dataclasses.replace(assessment, details=details)
         self.last_scope_assessment = assessment
         self._record_scope_assessment(candidate, assessment)
         if assessment.outcome == "drift":

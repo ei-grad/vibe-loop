@@ -174,15 +174,24 @@ record a named scope-unenforceable assessment and allow the candidate to
 proceed; absence cannot silently pass as an enforced scope check or turn an
 optional task-source field into a late runtime requirement.
 
-At each scope-check boundary the runtime probes the current task domains. It
-may replace the claim-time snapshot only when the current set monotonically
-covers the snapshot, covers the candidate, and the task source attributes the
-change to a named `operator`. Equal sets continue to use the snapshot.
-Unattributed changes, narrowing, and changes attributed to a worker, runtime,
-or external system do not expand candidate authority. The typed assessment
-records both domain sets, the selected `snapshot` or `current` fence source,
-whether the fence widened mid-run, and the operator identity when current
-domains were selected.
+At each scope-check boundary for a known claim-time domain set, the runtime
+probes the current task domains. A failed probe retains the snapshot instead of
+turning optional task metadata into a late runtime dependency; an unknown
+snapshot skips the probe because no current set can safely widen unknown
+authority. The runtime may replace a known snapshot only when the current set
+monotonically covers it, covers the candidate, and the task source attributes
+the change to a named `operator`.
+
+Before selecting current domains, the runtime holds the resource-scheduler
+mutex, confirms that no other live run leases the widened domains, and
+publishes the widened set into this run's task-lock lease. A conflict or failed
+lease update retains the snapshot. Equal sets also continue to use the
+snapshot. Unattributed changes, narrowing, and changes attributed to a worker,
+runtime, or external system do not expand candidate authority; they are not by
+themselves task-status mutations. The typed assessment records both available
+domain sets, the selected `snapshot` or `current` fence source, whether the
+fence widened mid-run, lease-update success, and the operator identity when
+current domains were selected.
 
 The candidate's base is the commit its workspace was provisioned from, which
 for an adopted workspace is legitimately older than `main` at run start. When

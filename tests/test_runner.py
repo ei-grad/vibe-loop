@@ -53,6 +53,7 @@ from vibe_loop.orchestration import (
     CandidateCollectionError,
     CandidateRecord,
     CandidateReanchorRetryExhausted,
+    CandidateScopePolicy,
     GateResult,
     GateRunSummary,
     IntegrationResult,
@@ -85,6 +86,7 @@ from vibe_loop.runner import (
     TaskActivationError,
     VibeRunner,
     active_lock_conflict_domains,
+    authorize_task_lock_scope_widening,
     bind_worker_workspace_env,
     build_batch_selection_prompt,
     build_run_context_payload,
@@ -6503,6 +6505,102 @@ class ActiveLockConflictDomainLivenessTests(unittest.TestCase):
             self.assertIn("Makefile", domains[0].paths)
             self.assertIn("resource:system-monitoring", domains[0].resources)
 
+    def test_authorized_widening_republishes_live_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            state_path = repo / ".vibe-loop"
+            manager = LockManager(state_path / "locks")
+            state = _active_run_state(
+                task_id="LIVE-OWNER",
+                run_id="run-live",
+                worker_pid=os.getpid(),
+                host=socket.gethostname(),
+                repo=repo,
+                paths=("src/a",),
+            )
+            task_lock = manager.acquire(
+                "LIVE-OWNER",
+                "run-live",
+                metadata=state.to_lock_metadata(),
+            )
+            policy = CandidateScopePolicy(
+                known=True,
+                paths=("src/a", "src/b"),
+                actor_kind="operator",
+                actor="alice",
+            )
+
+            accepted = authorize_task_lock_scope_widening(
+                state_path=state_path,
+                lock_manager=manager,
+                task_lock=task_lock,
+                run_id="run-live",
+                task_id="LIVE-OWNER",
+                policy=policy,
+            )
+            manager.update(task_lock, state.to_lock_metadata())
+
+            self.assertTrue(accepted)
+            stored = manager.status("LIVE-OWNER")
+            assert stored is not None
+            self.assertEqual(stored["paths"], ["src/a", "src/b"])
+            self.assertEqual(stored["scope_fence_source"], "current")
+            self.assertEqual(stored["scope_fence_widened_by"], "alice")
+            domains = active_lock_conflict_domains(manager)
+            self.assertEqual(domains[0].paths, ("src/a", "src/b"))
+
+    def test_widening_refuses_conflict_with_existing_live_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            state_path = repo / ".vibe-loop"
+            manager = LockManager(state_path / "locks")
+            owner = _active_run_state(
+                task_id="OWNER",
+                run_id="run-owner",
+                worker_pid=os.getpid(),
+                host=socket.gethostname(),
+                repo=repo,
+                paths=("src/a",),
+            )
+            other = _active_run_state(
+                task_id="OTHER",
+                run_id="run-other",
+                worker_pid=os.getpid(),
+                host=socket.gethostname(),
+                repo=repo,
+                paths=("src/b",),
+            )
+            task_lock = manager.acquire(
+                "OWNER",
+                "run-owner",
+                metadata=owner.to_lock_metadata(),
+            )
+            manager.acquire(
+                "OTHER",
+                "run-other",
+                metadata=other.to_lock_metadata(),
+            )
+
+            accepted = authorize_task_lock_scope_widening(
+                state_path=state_path,
+                lock_manager=manager,
+                task_lock=task_lock,
+                run_id="run-owner",
+                task_id="OWNER",
+                policy=CandidateScopePolicy(
+                    known=True,
+                    paths=("src/a", "src/b"),
+                    actor_kind="operator",
+                    actor="alice",
+                ),
+            )
+
+            self.assertFalse(accepted)
+            stored = manager.status("OWNER")
+            assert stored is not None
+            self.assertEqual(stored["paths"], ["src/a"])
+            self.assertNotIn("scope_fence_source", stored)
+
     def test_live_supervisor_holds_domains_after_worker_teardown(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -10392,7 +10490,9 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             ]
             self.assertNotIn("worker_task_source_mutation", transition_reasons)
 
-    def test_task_source_invariant_refuses_worker_domain_widening(self) -> None:
+    def test_task_source_invariant_leaves_domain_authority_to_scope_check(
+        self,
+    ) -> None:
         task = Task(
             task_id="T-1",
             title="Task",
@@ -10404,12 +10504,6 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             runner, _, _ = self._build_runner(directory, [task], {})
             source = self._enable_runtime_owned_task_source(runner, task)
             source.status = "active"
-            source.task = dataclasses.replace(
-                task,
-                paths=("src", "tests"),
-                conflict_domains_actor_kind="worker",
-                conflict_domains_actor="implementer-session",
-            )
             candidate = CandidateRecord(
                 branch="worker/T-1",
                 worktree=runner.config.repo,
@@ -10419,21 +10513,30 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 source="derived",
             )
 
-            with self.assertRaises(TaskSourceCompletionError) as raised:
+            variants = (
+                dataclasses.replace(
+                    task,
+                    paths=("src", "tests"),
+                    conflict_domains_actor_kind="worker",
+                    conflict_domains_actor="implementer-session",
+                ),
+                dataclasses.replace(
+                    task,
+                    paths=(),
+                    conflict_domains_actor_kind="operator",
+                    conflict_domains_actor="alice",
+                ),
+                dataclasses.replace(task, paths=("src", "tests")),
+            )
+            for observed in variants:
+                source.task = observed
                 runner._require_runtime_task_source_unchanged(
                     run_id="run-1",
                     expected_task=task,
                     candidate=candidate,
                 )
 
-            self.assertEqual(raised.exception.code, "worker_task_source_mutation")
-            transition = runner.run_store.read_records()[-1]
-            self.assertEqual(transition["reason"], "worker_task_source_mutation")
-            self.assertEqual(transition["conflict_domains_actor_kind"], "worker")
-            self.assertEqual(
-                transition["conflict_domains_actor"],
-                "implementer-session",
-            )
+            self.assertEqual(runner.run_store.read_records(), [])
 
     def test_review_remediation_scope_drift_carries_open_ledger_findings(
         self,

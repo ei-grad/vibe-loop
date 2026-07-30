@@ -893,6 +893,47 @@ class SchedulerLockBusy(RuntimeError):
         super().__init__(f"resource scheduler lock is busy: {path}")
 
 
+def acquire_resource_scheduler_lock(
+    state_path: Path,
+    run_id: str,
+    task_id: str,
+) -> SchedulerLock:
+    lock_path = state_path / "internal-locks" / f"{RESOURCE_SCHEDULER_LOCK_NAME}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    deadline = time.monotonic() + RESOURCE_SCHEDULER_LOCK_TIMEOUT_SECONDS
+    try:
+        while True:
+            if not try_lock_scheduler_file(handle):
+                if time.monotonic() >= deadline:
+                    raise SchedulerLockBusy(lock_path)
+                time.sleep(RESOURCE_SCHEDULER_LOCK_POLL_SECONDS)
+                continue
+            handle.seek(0)
+            handle.truncate()
+            payload = {
+                "record_type": "resource_scheduler_lock",
+                "run_id": run_id,
+                "owner_task_id": task_id,
+                "pid": os.getpid(),
+                "started_at": datetime.now(UTC).isoformat(),
+            }
+            handle.write((json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+            return SchedulerLock(path=lock_path, handle=handle)
+    except BaseException:
+        handle.close()
+        raise
+
+
+def release_resource_scheduler_lock(scheduler_lock: SchedulerLock) -> None:
+    try:
+        unlock_scheduler_file(scheduler_lock.handle)
+    finally:
+        scheduler_lock.handle.close()
+
+
 class AttemptCircuitOpen(RuntimeError):
     """A task has exhausted unchanged cross-run implementation attempts."""
 
@@ -3118,12 +3159,6 @@ class VibeRunner:
                             resources=task.resources,
                             paths=task.paths,
                         ),
-                        current_scope_policy=lambda: (
-                            self._current_candidate_scope_policy(
-                                task.task_id,
-                                provisioned_workspace.worktree,
-                            )
-                        ),
                     )
                     candidate = collector.latest_recorded()
                     if candidate is None:
@@ -3418,6 +3453,7 @@ class VibeRunner:
                         implementation_session_id=session_id,
                         implementation_session_id_source=session_id_source,
                         output_log_path=log_path,
+                        task_lock=task_lock,
                     )
                 except BudgetReservationDenied as exc:
                     # A review or remediation launch was refused: no reviewer or
@@ -4074,6 +4110,7 @@ class VibeRunner:
         implementation_session_id: str,
         implementation_session_id_source: str,
         output_log_path: Path,
+        task_lock: TaskLock | None = None,
     ) -> ClassificationResult:
         self._journal_worker_output_bypass_attempts(
             run_id=run_id,
@@ -4107,6 +4144,17 @@ class VibeRunner:
             current_scope_policy=lambda: self._current_candidate_scope_policy(
                 task.task_id,
                 provisioned_workspace.worktree,
+            ),
+            authorize_current_scope_policy=lambda policy: (
+                task_lock is not None
+                and authorize_task_lock_scope_widening(
+                    state_path=self.config.state_path,
+                    lock_manager=self.lock_manager,
+                    task_lock=task_lock,
+                    run_id=run_id,
+                    task_id=task.task_id,
+                    policy=policy,
+                )
             ),
         )
         if stage_machine.stage is RunStage.IMPLEMENTING:
@@ -4588,22 +4636,7 @@ class VibeRunner:
                 "implementation_task_source_probe_failed",
                 f"could not verify task source after implementation: {type(exc).__name__}",
             ) from exc
-        snapshot_scope = candidate_scope_policy_from_task(expected_task)
-        current_scope = (
-            candidate_scope_policy_from_task(task) if task is not None else None
-        )
-        domains_allowed = bool(
-            current_scope is not None
-            and (
-                snapshot_scope.same_domains(current_scope)
-                or (
-                    current_scope.covers(snapshot_scope)
-                    and current_scope.actor_kind == "operator"
-                    and bool(current_scope.actor)
-                )
-            )
-        )
-        if unchanged and domains_allowed:
+        if unchanged:
             return
         self.run_store.append_lifecycle_event(
             RunLifecycleEvent.run_state_transition(
@@ -4614,12 +4647,6 @@ class VibeRunner:
                 reason="worker_task_source_mutation",
                 payload={
                     "observed_status": task.status if task is not None else "missing",
-                    "conflict_domains_actor_kind": (
-                        current_scope.actor_kind if current_scope is not None else ""
-                    ),
-                    "conflict_domains_actor": (
-                        current_scope.actor if current_scope is not None else ""
-                    ),
                 },
             )
         )
@@ -4863,45 +4890,14 @@ class VibeRunner:
         return context
 
     def acquire_scheduler_lock(self, run_id: str, task_id: str) -> SchedulerLock:
-        lock_path = (
-            self.config.state_path
-            / "internal-locks"
-            / f"{RESOURCE_SCHEDULER_LOCK_NAME}.lock"
+        return acquire_resource_scheduler_lock(
+            self.config.state_path,
+            run_id,
+            task_id,
         )
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = lock_path.open("a+b")
-        deadline = time.monotonic() + RESOURCE_SCHEDULER_LOCK_TIMEOUT_SECONDS
-        try:
-            while True:
-                if not try_lock_scheduler_file(handle):
-                    if time.monotonic() >= deadline:
-                        raise SchedulerLockBusy(lock_path)
-                    time.sleep(RESOURCE_SCHEDULER_LOCK_POLL_SECONDS)
-                    continue
-                handle.seek(0)
-                handle.truncate()
-                payload = {
-                    "record_type": "resource_scheduler_lock",
-                    "run_id": run_id,
-                    "owner_task_id": task_id,
-                    "pid": os.getpid(),
-                    "started_at": datetime.now(UTC).isoformat(),
-                }
-                handle.write(
-                    (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
-                )
-                handle.flush()
-                os.fsync(handle.fileno())
-                return SchedulerLock(path=lock_path, handle=handle)
-        except BaseException:
-            handle.close()
-            raise
 
     def release_scheduler_lock(self, scheduler_lock: SchedulerLock) -> None:
-        try:
-            unlock_scheduler_file(scheduler_lock.handle)
-        finally:
-            scheduler_lock.handle.close()
+        release_resource_scheduler_lock(scheduler_lock)
 
     def run_next(
         self,
@@ -7865,12 +7861,16 @@ def resource_conflicts_enabled(
 
 def active_lock_conflict_domains(
     lock_manager: LockManager,
+    *,
+    exclude_task_id: str = "",
 ) -> tuple[ConflictDomains, ...]:
     domains: list[ConflictDomains] = []
     group_checker = process_group_liveness_checker()
     for metadata in lock_manager.list_locks():
         active = ActiveRunState.from_lock_metadata(metadata)
         if active is None:
+            continue
+        if active.task_id == exclude_task_id:
             continue
         # Only live runs hold their conflict-domain leases. A lock left behind
         # by a dead/expired run must not keep serializing unrelated work
@@ -7882,6 +7882,65 @@ def active_lock_conflict_domains(
             continue
         domains.append(conflict_domains_from_task_like(active))
     return tuple(domains)
+
+
+def authorize_task_lock_scope_widening(
+    *,
+    state_path: Path,
+    lock_manager: LockManager,
+    task_lock: TaskLock,
+    run_id: str,
+    task_id: str,
+    policy: CandidateScopePolicy,
+) -> bool:
+    scheduler_lock = None
+    try:
+        scheduler_lock = acquire_resource_scheduler_lock(
+            state_path,
+            run_id,
+            task_id,
+        )
+        proposed = ConflictDomains(
+            known=policy.known,
+            resources=frozenset(policy.resources),
+            paths=policy.paths,
+        )
+        active_domains = active_lock_conflict_domains(
+            lock_manager,
+            exclude_task_id=task_id,
+        )
+        if any(conflict_domains_overlap(proposed, active) for active in active_domains):
+            return False
+        current = lock_manager.validate_owner(
+            task_id=task_id,
+            run_id=run_id,
+            fencing_token=fencing_token_value(task_lock.metadata.get("fencing_token")),
+        )
+        metadata = dict(current.metadata)
+        metadata.update(
+            {
+                "resources": list(policy.resources),
+                "paths": list(policy.paths),
+                "conflict_domains_known": policy.known,
+                "scope_fence_source": "current",
+                "scope_fence_widened_by": policy.actor,
+            }
+        )
+        lock_manager.update(current, metadata)
+        return True
+    except (
+        LockBusy,
+        LockBackendError,
+        LockOwnerMismatch,
+        LockFencingMismatch,
+        SchedulerLockBusy,
+        OSError,
+        ValueError,
+    ):
+        return False
+    finally:
+        if scheduler_lock is not None:
+            release_resource_scheduler_lock(scheduler_lock)
 
 
 def first_task_conflict(tasks: list[Task]) -> tuple[Task, Task] | None:
