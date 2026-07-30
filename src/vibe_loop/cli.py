@@ -99,6 +99,7 @@ from vibe_loop.orchestration import (
     CandidateCollectionError,
     CandidateCollector,
     CandidateScopePolicy,
+    candidate_scope_policy_from_task,
     config_contract_blockers,
 )
 from vibe_loop.runner import VibeRunner
@@ -143,7 +144,7 @@ from vibe_loop.task_views import (
     render_task_tree,
     task_tree_json,
 )
-from vibe_loop.tasks import Task
+from vibe_loop.tasks import Task, build_task_source
 from vibe_loop.workers import (
     ActiveRunState,
     StaleLock,
@@ -2602,6 +2603,20 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
                     "candidate declaration requires a claimed workspace",
                 )
             claim = active.workspace
+            candidate_source = build_task_source(
+                claim.worktree,
+                config.task_source,
+                runtime_context=config.runtime_environment,
+            )
+
+            def current_scope_policy() -> CandidateScopePolicy:
+                current_task = candidate_source.probe(task_id)
+                if current_task is None:
+                    raise ValueError(
+                        f"task source no longer contains candidate task {task_id}"
+                    )
+                return candidate_scope_policy_from_task(current_task)
+
             collector = CandidateCollector(
                 worktree=claim.worktree,
                 branch=claim.branch,
@@ -2615,6 +2630,7 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
                     resources=active.resources,
                     paths=active.paths,
                 ),
+                current_scope_policy=current_scope_policy,
             )
             recorded = collector.collect_declared(
                 head_commit=args.head,

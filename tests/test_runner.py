@@ -9175,6 +9175,7 @@ class StubTaskSource:
 class RuntimeOwnedTaskSource(StubTaskSource):
     def __init__(self, task: Task) -> None:
         super().__init__([task], {task.task_id: task})
+        self.task = task
         self.status = "ready"
         self.activate_context: dict[str, str] = {}
         self.complete_context: dict[str, str] = {}
@@ -9189,6 +9190,11 @@ class RuntimeOwnedTaskSource(StubTaskSource):
             title="Task",
             status=self.status,
             agent="worker",
+            resources=self.task.resources,
+            paths=self.task.paths,
+            conflict_domains_known=self.task.conflict_domains_known,
+            conflict_domains_actor_kind=self.task.conflict_domains_actor_kind,
+            conflict_domains_actor=self.task.conflict_domains_actor,
             prior_findings=self.prior_findings,
             review_budget_exhaustions=self.review_budget_exhaustions,
         )
@@ -10345,6 +10351,89 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             source.settlement_context["VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS"],
             "0",
         )
+
+    def test_task_source_invariant_allows_operator_domain_widening(self) -> None:
+        task = Task(
+            task_id="T-1",
+            title="Task",
+            status="ready",
+            paths=("src",),
+            conflict_domains_known=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+            source.status = "active"
+            source.task = dataclasses.replace(
+                task,
+                paths=("src", "tests"),
+                conflict_domains_actor_kind="operator",
+                conflict_domains_actor="alice",
+            )
+            candidate = CandidateRecord(
+                branch="worker/T-1",
+                worktree=runner.config.repo,
+                base_main="a" * 40,
+                head_commit="b" * 40,
+                changed_paths=("tests/test_runner.py",),
+                source="derived",
+            )
+
+            runner._require_runtime_task_source_unchanged(
+                run_id="run-1",
+                expected_task=task,
+                candidate=candidate,
+            )
+
+            transition_reasons = [
+                record.get("reason")
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "run_state_transition"
+            ]
+            self.assertNotIn("worker_task_source_mutation", transition_reasons)
+
+    def test_task_source_invariant_refuses_worker_domain_widening(self) -> None:
+        task = Task(
+            task_id="T-1",
+            title="Task",
+            status="ready",
+            paths=("src",),
+            conflict_domains_known=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+            source.status = "active"
+            source.task = dataclasses.replace(
+                task,
+                paths=("src", "tests"),
+                conflict_domains_actor_kind="worker",
+                conflict_domains_actor="implementer-session",
+            )
+            candidate = CandidateRecord(
+                branch="worker/T-1",
+                worktree=runner.config.repo,
+                base_main="a" * 40,
+                head_commit="b" * 40,
+                changed_paths=("tests/test_runner.py",),
+                source="derived",
+            )
+
+            with self.assertRaises(TaskSourceCompletionError) as raised:
+                runner._require_runtime_task_source_unchanged(
+                    run_id="run-1",
+                    expected_task=task,
+                    candidate=candidate,
+                )
+
+            self.assertEqual(raised.exception.code, "worker_task_source_mutation")
+            transition = runner.run_store.read_records()[-1]
+            self.assertEqual(transition["reason"], "worker_task_source_mutation")
+            self.assertEqual(transition["conflict_domains_actor_kind"], "worker")
+            self.assertEqual(
+                transition["conflict_domains_actor"],
+                "implementer-session",
+            )
 
     def test_review_remediation_scope_drift_carries_open_ledger_findings(
         self,

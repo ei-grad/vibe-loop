@@ -1024,6 +1024,38 @@ class MarkdownPlanTests(unittest.TestCase):
         self.assertFalse(unknown.conflict_domains_known)
         self.assertTrue(empty.conflict_domains_known)
 
+    def test_command_task_source_extracts_domain_change_provenance(self) -> None:
+        task = task_from_mapping(
+            {
+                "id": "CMD-01",
+                "title": "Command task",
+                "status": "Next",
+                "paths": ["src"],
+                "conflict_domains_actor_kind": "operator",
+                "conflict_domains_actor": "alice",
+            },
+            0,
+        )
+
+        self.assertEqual(task.conflict_domains_actor_kind, "operator")
+        self.assertEqual(task.conflict_domains_actor, "alice")
+
+    def test_command_task_source_rejects_invalid_domain_actor_kind(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "conflict_domains_actor_kind must be one of",
+        ):
+            task_from_mapping(
+                {
+                    "id": "CMD-01",
+                    "title": "Command task",
+                    "status": "Next",
+                    "paths": ["src"],
+                    "conflict_domains_actor_kind": "implementer",
+                },
+                0,
+            )
+
     def test_command_task_source_parses_agent_model_and_hazards(self) -> None:
         task = task_from_mapping(
             {

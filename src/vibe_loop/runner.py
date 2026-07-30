@@ -85,6 +85,7 @@ from vibe_loop.orchestration import (
     CandidateRecord,
     CandidateReanchorRetryExhausted,
     CandidateScopePolicy,
+    candidate_scope_policy_from_task,
     GateExecutionError,
     GateRunner,
     GateRunSummary,
@@ -3117,6 +3118,12 @@ class VibeRunner:
                             resources=task.resources,
                             paths=task.paths,
                         ),
+                        current_scope_policy=lambda: (
+                            self._current_candidate_scope_policy(
+                                task.task_id,
+                                provisioned_workspace.worktree,
+                            )
+                        ),
                     )
                     candidate = collector.latest_recorded()
                     if candidate is None:
@@ -4097,6 +4104,10 @@ class VibeRunner:
                 resources=task.resources,
                 paths=task.paths,
             ),
+            current_scope_policy=lambda: self._current_candidate_scope_policy(
+                task.task_id,
+                provisioned_workspace.worktree,
+            ),
         )
         if stage_machine.stage is RunStage.IMPLEMENTING:
             stage_machine.transition(
@@ -4577,7 +4588,22 @@ class VibeRunner:
                 "implementation_task_source_probe_failed",
                 f"could not verify task source after implementation: {type(exc).__name__}",
             ) from exc
-        if unchanged:
+        snapshot_scope = candidate_scope_policy_from_task(expected_task)
+        current_scope = (
+            candidate_scope_policy_from_task(task) if task is not None else None
+        )
+        domains_allowed = bool(
+            current_scope is not None
+            and (
+                snapshot_scope.same_domains(current_scope)
+                or (
+                    current_scope.covers(snapshot_scope)
+                    and current_scope.actor_kind == "operator"
+                    and bool(current_scope.actor)
+                )
+            )
+        )
+        if unchanged and domains_allowed:
             return
         self.run_store.append_lifecycle_event(
             RunLifecycleEvent.run_state_transition(
@@ -4587,7 +4613,13 @@ class VibeRunner:
                 to_state="invariant_bypass_rejected",
                 reason="worker_task_source_mutation",
                 payload={
-                    "observed_status": task.status if task is not None else "missing"
+                    "observed_status": task.status if task is not None else "missing",
+                    "conflict_domains_actor_kind": (
+                        current_scope.actor_kind if current_scope is not None else ""
+                    ),
+                    "conflict_domains_actor": (
+                        current_scope.actor if current_scope is not None else ""
+                    ),
                 },
             )
         )
@@ -4595,6 +4627,24 @@ class VibeRunner:
             "worker_task_source_mutation",
             "worker changed authoritative task-source state during implementation",
         )
+
+    def _current_candidate_scope_policy(
+        self,
+        task_id: str,
+        worktree: Path,
+    ) -> CandidateScopePolicy:
+        if self.source_resolution.task_source.activate_command is None:
+            candidate_source = build_task_source(
+                worktree,
+                self.source_resolution.task_source,
+                runtime_context=self.config.runtime_environment,
+            )
+            task = candidate_source.probe(task_id)
+        else:
+            task = self.source.probe(task_id)
+        if task is None:
+            raise ValueError(f"task source no longer contains candidate task {task_id}")
+        return candidate_scope_policy_from_task(task)
 
     def _journal_worker_output_bypass_attempts(
         self,

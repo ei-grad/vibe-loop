@@ -699,13 +699,73 @@ class CandidateScopePolicy:
     known: bool
     resources: tuple[str, ...] = ()
     paths: tuple[str, ...] = ()
+    actor_kind: str = ""
+    actor: str = ""
 
-    def assess(self, candidate: CandidateRecord) -> CandidateScopeAssessment:
+    def assess(
+        self,
+        candidate: CandidateRecord,
+        *,
+        current: CandidateScopePolicy | None = None,
+    ) -> CandidateScopeAssessment:
+        snapshot_assessment = self._assess_declared(candidate)
+        if current is None:
+            return snapshot_assessment
+        snapshot_domains = self.domains_payload()
+        current_domains = current.domains_payload()
+        fence_details: dict[str, object] = {
+            "fence_source": "snapshot",
+            "fence_widened_mid_run": False,
+            "snapshot_domains": snapshot_domains,
+            "current_domains": current_domains,
+        }
+        if current.actor_kind:
+            fence_details["current_domains_actor_kind"] = current.actor_kind
+        if current.actor:
+            fence_details["current_domains_actor"] = current.actor
+        if self.same_domains(current):
+            return dataclasses.replace(
+                snapshot_assessment,
+                details={**snapshot_assessment.details, **fence_details},
+            )
+        current_assessment = current._assess_declared(candidate)
+        monotonic_widening = current.covers(self)
+        operator_authorized = current.actor_kind == "operator" and bool(current.actor)
+        if (
+            monotonic_widening
+            and current_assessment.outcome == "in_scope"
+            and operator_authorized
+        ):
+            return dataclasses.replace(
+                current_assessment,
+                details={
+                    **current_assessment.details,
+                    **fence_details,
+                    "fence_source": "current",
+                    "fence_widened_mid_run": True,
+                    "fence_widened_by": current.actor,
+                },
+            )
+        if (
+            monotonic_widening
+            and current_assessment.outcome == "in_scope"
+            and snapshot_assessment.outcome == "drift"
+        ):
+            snapshot_assessment = dataclasses.replace(
+                snapshot_assessment,
+                reason="current_domain_widening_not_operator_authorized",
+            )
+        return dataclasses.replace(
+            snapshot_assessment,
+            details={**snapshot_assessment.details, **fence_details},
+        )
+
+    def _assess_declared(
+        self,
+        candidate: CandidateRecord,
+    ) -> CandidateScopeAssessment:
         details: dict[str, object] = {
-            "declared_domains": {
-                "resources": list(self.resources),
-                "paths": list(self.paths),
-            },
+            "declared_domains": self.domains_payload(),
             "changed_paths": list(candidate.changed_paths),
             "unmatched_paths": list(candidate.changed_paths),
             "comparison_base": candidate.comparison_base or candidate.base_main,
@@ -750,6 +810,42 @@ class CandidateScopePolicy:
             details=details,
         )
 
+    def domains_payload(self) -> dict[str, object]:
+        return {
+            "resources": list(self.resources),
+            "paths": list(self.paths),
+        }
+
+    def same_domains(self, other: CandidateScopePolicy) -> bool:
+        return (
+            self.known == other.known
+            and set(self.resources) == set(other.resources)
+            and set(self.paths) == set(other.paths)
+        )
+
+    def covers(self, other: CandidateScopePolicy) -> bool:
+        if not self.known or not other.known:
+            return False
+        if not set(self.resources).issuperset(other.resources):
+            return False
+        return all(
+            any(
+                path_domain_contains_changed_path(current_path, snapshot_path)
+                for current_path in self.paths
+            )
+            for snapshot_path in other.paths
+        )
+
+
+def candidate_scope_policy_from_task(task: Task) -> CandidateScopePolicy:
+    return CandidateScopePolicy(
+        known=task.conflict_domains_known,
+        resources=task.resources,
+        paths=task.paths,
+        actor_kind=task.conflict_domains_actor_kind,
+        actor=task.conflict_domains_actor,
+    )
+
 
 def path_domain_contains_changed_path(domain: str, changed_path: str) -> bool:
     normalized_domain = domain.removeprefix("./").rstrip("/")
@@ -773,6 +869,7 @@ class CandidateCollector:
         task_id: str,
         main_branch: str = "main",
         scope_policy: CandidateScopePolicy | None = None,
+        current_scope_policy: Callable[[], CandidateScopePolicy] | None = None,
     ) -> None:
         self.worktree = worktree.resolve()
         self.branch = branch
@@ -782,6 +879,7 @@ class CandidateCollector:
         self.task_id = task_id
         self.main_branch = main_branch
         self.scope_policy = scope_policy
+        self.current_scope_policy = current_scope_policy
         self.last_scope_assessment: CandidateScopeAssessment | None = None
 
     def collect_derived(self) -> CandidateRecord:
@@ -836,7 +934,14 @@ class CandidateCollector:
     def validate_scope(self, candidate: CandidateRecord) -> None:
         if self.scope_policy is None:
             return
-        assessment = self.scope_policy.assess(candidate)
+        try:
+            current = self.current_scope_policy() if self.current_scope_policy else None
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            raise CandidateCollectionError(
+                "candidate_scope_refresh_failed",
+                "current task conflict domains could not be read at scope check",
+            ) from exc
+        assessment = self.scope_policy.assess(candidate, current=current)
         self.last_scope_assessment = assessment
         self._record_scope_assessment(candidate, assessment)
         if assessment.outcome == "drift":

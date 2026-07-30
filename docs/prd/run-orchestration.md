@@ -174,6 +174,16 @@ record a named scope-unenforceable assessment and allow the candidate to
 proceed; absence cannot silently pass as an enforced scope check or turn an
 optional task-source field into a late runtime requirement.
 
+At each scope-check boundary the runtime probes the current task domains. It
+may replace the claim-time snapshot only when the current set monotonically
+covers the snapshot, covers the candidate, and the task source attributes the
+change to a named `operator`. Equal sets continue to use the snapshot.
+Unattributed changes, narrowing, and changes attributed to a worker, runtime,
+or external system do not expand candidate authority. The typed assessment
+records both domain sets, the selected `snapshot` or `current` fence source,
+whether the fence widened mid-run, and the operator identity when current
+domains were selected.
+
 The candidate's base is the commit its workspace was provisioned from, which
 for an adopted workspace is legitimately older than `main` at run start. When
 that base is behind the integration branch, the runtime may re-anchor the

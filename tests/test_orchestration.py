@@ -1544,7 +1544,9 @@ class RuntimeGateTests(unittest.TestCase):
         )
 
     def collector_with_scope(
-        self, scope_policy: CandidateScopePolicy
+        self,
+        scope_policy: CandidateScopePolicy,
+        current_scope_policy=None,
     ) -> CandidateCollector:
         return CandidateCollector(
             worktree=self.repo,
@@ -1554,6 +1556,7 @@ class RuntimeGateTests(unittest.TestCase):
             run_id="run-1",
             task_id="TASK-01",
             scope_policy=scope_policy,
+            current_scope_policy=current_scope_policy,
         )
 
     def test_candidate_declaration_and_derivation_are_validated_and_recorded(
@@ -1908,6 +1911,80 @@ class RuntimeGateTests(unittest.TestCase):
         self.assertEqual(assessment["outcome"], "drift")
         self.assertEqual(assessment["finding"], "candidate_scope_drift")
         self.assertEqual(assessment["reason"], "paths_outside_declared_domains")
+
+    def test_candidate_scope_honors_operator_widening_from_current_domains(
+        self,
+    ) -> None:
+        collector = self.collector_with_scope(
+            CandidateScopePolicy(known=True, paths=("src",)),
+            current_scope_policy=lambda: CandidateScopePolicy(
+                known=True,
+                paths=("src", "tracked.txt"),
+                actor_kind="operator",
+                actor="alice",
+            ),
+        )
+
+        candidate = collector.collect_declared(head_commit=self.head)
+
+        self.assertEqual(candidate.changed_paths, ("tracked.txt",))
+        assessment = self.store.read_records()[-2]
+        self.assertEqual(assessment["outcome"], "in_scope")
+        self.assertEqual(assessment["fence_source"], "current")
+        self.assertTrue(assessment["fence_widened_mid_run"])
+        self.assertEqual(assessment["fence_widened_by"], "alice")
+        self.assertEqual(
+            assessment["snapshot_domains"],
+            {"resources": [], "paths": ["src"]},
+        )
+        self.assertEqual(
+            assessment["current_domains"],
+            {"resources": [], "paths": ["src", "tracked.txt"]},
+        )
+
+    def test_candidate_scope_equal_current_domains_uses_snapshot(self) -> None:
+        collector = self.collector_with_scope(
+            CandidateScopePolicy(known=True, paths=("tracked.txt",)),
+            current_scope_policy=lambda: CandidateScopePolicy(
+                known=True,
+                paths=("tracked.txt",),
+                actor_kind="operator",
+                actor="alice",
+            ),
+        )
+
+        collector.collect_declared(head_commit=self.head)
+
+        assessment = self.store.read_records()[-2]
+        self.assertEqual(assessment["outcome"], "in_scope")
+        self.assertEqual(assessment["fence_source"], "snapshot")
+        self.assertFalse(assessment["fence_widened_mid_run"])
+        self.assertNotIn("fence_widened_by", assessment)
+
+    def test_candidate_scope_refuses_worker_self_widening(self) -> None:
+        collector = self.collector_with_scope(
+            CandidateScopePolicy(known=True, paths=("src",)),
+            current_scope_policy=lambda: CandidateScopePolicy(
+                known=True,
+                paths=("src", "tracked.txt"),
+                actor_kind="worker",
+                actor="implementer-session",
+            ),
+        )
+
+        with self.assertRaises(CandidateCollectionError) as raised:
+            collector.collect_declared(head_commit=self.head)
+
+        self.assertEqual(raised.exception.code, "candidate_scope_drift")
+        assessment = self.store.read_records()[-1]
+        self.assertEqual(assessment["outcome"], "drift")
+        self.assertEqual(
+            assessment["reason"],
+            "current_domain_widening_not_operator_authorized",
+        )
+        self.assertEqual(assessment["fence_source"], "snapshot")
+        self.assertEqual(assessment["current_domains_actor_kind"], "worker")
+        self.assertEqual(assessment["current_domains_actor"], "implementer-session")
 
     def test_candidate_scope_without_domains_is_explicitly_unenforceable(
         self,

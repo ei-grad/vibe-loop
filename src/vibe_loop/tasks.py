@@ -63,6 +63,9 @@ DONE_STATUS = "Done"
 BLOCKED_STATUSES = {"Done", "Gated", "Low"}
 BLOCKED_FAMILY_STATUSES = frozenset({"blocked", "gated", "low"})
 LOCK_ACTIVATED_STATUS = "active"
+CONFLICT_DOMAIN_ACTOR_KINDS = frozenset(
+    {"external-system", "operator", "runtime", "worker"}
+)
 STATUS_RANK = {"Active": 0, "Next": 1, "Planned": 2}
 _STATUS_RANK_CASEFOLDED = {
     status.casefold(): rank for status, rank in STATUS_RANK.items()
@@ -225,6 +228,8 @@ class Task:
     resources: tuple[str, ...] = ()
     paths: tuple[str, ...] = ()
     conflict_domains_known: bool = False
+    conflict_domains_actor_kind: str = ""
+    conflict_domains_actor: str = ""
     scope: str = ""
     acceptance: str = ""
     evidence: str = ""
@@ -282,6 +287,10 @@ class Task:
             "evidence": self.evidence,
             "source": self.source,
         }
+        if self.conflict_domains_actor_kind:
+            payload["conflict_domains_actor_kind"] = self.conflict_domains_actor_kind
+        if self.conflict_domains_actor:
+            payload["conflict_domains_actor"] = self.conflict_domains_actor
         if self.status_reason:
             payload["status_reason"] = self.status_reason
         if self.prior_findings:
@@ -2881,6 +2890,20 @@ def task_from_mapping(value: object, order: int) -> Task:
     agent = optional_task_string(value.get("agent"), "agent")
     model = optional_task_string(value.get("model"), "model")
     approval_state = optional_task_string(value.get("approval_state"), "approval_state")
+    conflict_domains_actor_kind = optional_task_string(
+        value.get("conflict_domains_actor_kind"),
+        "conflict_domains_actor_kind",
+    )
+    if (
+        conflict_domains_actor_kind
+        and conflict_domains_actor_kind not in CONFLICT_DOMAIN_ACTOR_KINDS
+    ):
+        allowed = ", ".join(sorted(CONFLICT_DOMAIN_ACTOR_KINDS))
+        raise ValueError(f"conflict_domains_actor_kind must be one of {allowed}")
+    conflict_domains_actor = optional_task_string(
+        value.get("conflict_domains_actor"),
+        "conflict_domains_actor",
+    )
     status_reason = first_task_string(
         value,
         ("status_reason", "gating_reason", "reason", "blocker"),
@@ -2914,6 +2937,8 @@ def task_from_mapping(value: object, order: int) -> Task:
         conflict_domains_known=bool(value.get("conflict_domains_known"))
         or resources_present
         or paths_present,
+        conflict_domains_actor_kind=conflict_domains_actor_kind,
+        conflict_domains_actor=conflict_domains_actor,
         scope=str(value.get("scope") or ""),
         acceptance=str(value.get("acceptance") or ""),
         evidence=str(value.get("evidence") or ""),
