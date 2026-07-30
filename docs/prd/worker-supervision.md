@@ -80,8 +80,8 @@ instant; malformed or missing timestamps conservatively fall back to reader
 order. A tool call that started before the boundary and only completes after it
 (the worker's own `vibe-loop report` invocation and its result included) is
 correlated by call id and not counted as fresh post-report activity; only
-genuinely new post-report tool starts, and completions with no observed start,
-are violations.
+genuinely new post-report tool starts, completions with no observed start, and
+structured state mutations such as Codex todo-list updates are violations.
 
 Post-report elapsed time and attributable provider usage are recorded separately
 from the useful implementation/review spend so quota diagnostics can isolate

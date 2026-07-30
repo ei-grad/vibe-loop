@@ -263,6 +263,24 @@ def test_stats_drop_unknown_post_report_activity_kind() -> None:
     assert stats["post_report"] == {"duration_seconds": 1.0}
 
 
+def test_stats_preserve_post_report_state_update_kind() -> None:
+    stats = sanitize_run_stats(
+        {
+            "post_report": {
+                "duration_seconds": 1.0,
+                "activity_kind": "state_update",
+                "activity_count": 1,
+            }
+        }
+    )
+
+    assert stats["post_report"] == {
+        "duration_seconds": 1.0,
+        "activity_kind": "state_update",
+        "activity_count": 1,
+    }
+
+
 def test_codex_quota_snapshot_keeps_only_bounded_window_evidence() -> None:
     usage = parse_codex_event(fixture("codex-quota-first.json"))
     assert usage is not None

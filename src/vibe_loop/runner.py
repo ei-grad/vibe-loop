@@ -1157,6 +1157,7 @@ CODEX_COMPLETION_EVENT_TYPES = frozenset(
 CODEX_ITEM_COMPLETION_ENVELOPE_TYPES = frozenset(
     {"item.updated", "item.completed", "response.output_item.done"}
 )
+CODEX_POST_REPORT_STATE_ITEM_TYPES = frozenset({"todo_list"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1167,6 +1168,7 @@ class ActivityEvent:
     the dialect did not carry one. ``is_completion`` marks the closing half of a
     call (a Claude ``tool_result``, a Codex ``*_end``/``item.completed``) so a
     pre-boundary call finishing after the report is not counted as new activity.
+    Structured state updates are fresh emissions rather than call completions.
     """
 
     kind: str
@@ -1247,6 +1249,11 @@ def _codex_activity_event(payload: Mapping[str, object]) -> ActivityEvent | None
         if isinstance(item_type, str) and item_type in CODEX_TOOL_ITEM_TYPES:
             is_completion = event_type in CODEX_ITEM_COMPLETION_ENVELOPE_TYPES
             return ActivityEvent("tool_call", _string_id(item.get("id")), is_completion)
+        if (
+            isinstance(item_type, str)
+            and item_type in CODEX_POST_REPORT_STATE_ITEM_TYPES
+        ):
+            return ActivityEvent("state_update", "", False)
     return None
 
 
@@ -1322,8 +1329,8 @@ def classify_post_report_activity(line: str) -> str:
     """Return the activity kind of a worker stream line, ``""`` when benign.
 
     Thin wrapper over :func:`classify_post_report_event` that keeps the kind
-    label (``tool_call``/``tool_result``) for callers that do not need the
-    correlation id.
+    label (``tool_call``/``tool_result``/``state_update``) for callers that do
+    not need the correlation id.
     """
     event = classify_post_report_event(line)
     return event.kind if event is not None else ""
@@ -1486,12 +1493,12 @@ class PostReportActivityMonitor:
     A tool call that started before the boundary but only completes after it
     (including the worker's own ``vibe-loop report`` invocation and its result)
     is correlated by id and ignored, so only genuinely fresh post-report tool
-    starts -- and orphan completions with no observed start -- count as a policy
-    violation (F2). The teardown-only provider usage (the delta from the boundary
-    snapshot) is reported separately so quota diagnostics can distinguish
-    teardown burn from useful implementation/review. Thread-safe: stream threads
-    call ``observe_line`` while the supervision watchdog marks the boundary and
-    reads ``violation``.
+    starts, orphan completions with no observed start, and structured state
+    updates count as a policy violation (F2). The teardown-only provider usage
+    (the delta from the boundary snapshot) is reported separately so quota
+    diagnostics can distinguish teardown burn from useful implementation/review.
+    Thread-safe: stream threads call ``observe_line`` while the supervision
+    watchdog marks the boundary and reads ``violation``.
     """
 
     def __init__(
@@ -9912,6 +9919,10 @@ def stream_pipe(
     try:
         for source_position, line in enumerate(pipe, start=1):
             redacted_line = redact_worker_stream_line(line, fencing_token)
+            # Attribute the line at read time before telemetry persistence or
+            # callbacks can cross a concurrently filed report boundary.
+            if post_report_monitor is not None:
+                post_report_monitor.observe_line(redacted_line)
             observation = output_observer.observe_line(
                 redacted_line,
                 stream_name,
@@ -9919,8 +9930,6 @@ def stream_pipe(
             )
             if observation is not None and on_observation is not None:
                 on_observation(observation)
-            if post_report_monitor is not None:
-                post_report_monitor.observe_line(redacted_line)
             if forward:
                 sys.stderr.write(redacted_line)
                 sys.stderr.flush()

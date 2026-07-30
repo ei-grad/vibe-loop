@@ -7556,6 +7556,12 @@ class ClassifyPostReportActivityTests(unittest.TestCase):
         )
         self.assertEqual(classify_post_report_activity(line), "tool_call")
 
+    def test_codex_todo_list_update_is_state_update(self) -> None:
+        line = json.dumps(
+            {"type": "item.updated", "item": {"type": "todo_list", "id": "item_1"}}
+        )
+        self.assertEqual(classify_post_report_activity(line), "state_update")
+
     def test_codex_agent_message_and_token_count_are_benign(self) -> None:
         for payload in (
             {"type": "item.completed", "item": {"type": "agent_message"}},
@@ -7734,6 +7740,14 @@ class PostReportActivityMonitorTests(unittest.TestCase):
             }
         )
 
+    def _codex_item(self, event_type: str, item_type: str, item_id: str) -> str:
+        return json.dumps(
+            {
+                "type": event_type,
+                "item": {"type": item_type, "id": item_id},
+            }
+        )
+
     def test_activity_between_persistence_and_mark_is_reconciled(self) -> None:
         # A tool call emitted after the report persisted (wall 120) but before
         # the watchdog marked the boundary is buffered and, once the boundary is
@@ -7761,6 +7775,86 @@ class PostReportActivityMonitorTests(unittest.TestCase):
         monitor.mark_report_observed(boundary_wall=100.0)
         self.assertFalse(monitor.violation)
         self.assertEqual(monitor.snapshot().activity_count, 0)
+
+    def test_codex_report_completion_at_source_position_240_is_ignored(self) -> None:
+        # The capOS incident ended with the report command at source positions
+        # 239 (tool_started) and 240 (tool_completed). Persistence occurred
+        # between them, so the correlated completion is not fresh activity.
+        wall = FakeMonotonicClock([90.0, 110.0])
+        monitor = PostReportActivityMonitor("openai", wallclock=wall)
+        monitor.observe_line(
+            self._codex_item("item.started", "command_execution", "item_130")
+        )
+        monitor.mark_report_observed(boundary_wall=100.0)
+        monitor.observe_line(
+            self._codex_item("item.completed", "command_execution", "item_130")
+        )
+        self.assertFalse(monitor.violation)
+        self.assertEqual(monitor.snapshot().activity_count, 0)
+
+    def test_stream_telemetry_callback_cannot_move_start_past_report(self) -> None:
+        # Telemetry persistence for a just-read tool start can overlap the
+        # report command filing its boundary. Policy attribution must retain
+        # the line's pre-callback observation time.
+        callback_started = False
+        monitor = PostReportActivityMonitor(
+            "openai",
+            wallclock=lambda: 110.0 if callback_started else 90.0,
+        )
+        lines = StringIO(
+            self._codex_item("item.started", "command_execution", "item_130")
+            + "\n"
+            + self._codex_item("item.completed", "command_execution", "item_130")
+            + "\n"
+        )
+
+        class OutputObserver:
+            def observe_line(
+                self,
+                line: str,
+                stream_name: str,
+                *,
+                source_position: int,
+            ) -> object:
+                return object()
+
+        def persist_observation(observation: object) -> None:
+            nonlocal callback_started
+            callback_started = True
+            monitor.mark_report_observed(boundary_wall=100.0)
+
+        runner_module.stream_pipe(
+            lines,
+            StringIO(),
+            threading.Lock(),
+            False,
+            OutputObserver(),
+            "stdout",
+            persist_observation,
+            post_report_monitor=monitor,
+        )
+
+        self.assertFalse(monitor.violation)
+        self.assertEqual(monitor.snapshot().activity_count, 0)
+
+    def test_codex_todo_update_after_report_completion_is_a_violation(self) -> None:
+        # The genuine wave-30 case has the report command at positions 36/37,
+        # followed by a todo_list update at position 38. The completion remains
+        # correlated while the later state mutation is counted.
+        wall = FakeMonotonicClock([90.0, 110.0, 120.0])
+        monitor = PostReportActivityMonitor("openai", wallclock=wall)
+        monitor.observe_line(
+            self._codex_item("item.started", "command_execution", "item_19")
+        )
+        monitor.mark_report_observed(boundary_wall=100.0)
+        monitor.observe_line(
+            self._codex_item("item.completed", "command_execution", "item_19")
+        )
+        monitor.observe_line(self._codex_item("item.updated", "todo_list", "item_1"))
+        snapshot = monitor.snapshot()
+        self.assertTrue(snapshot.violation)
+        self.assertEqual(snapshot.activity_kind, "state_update")
+        self.assertEqual(snapshot.activity_count, 1)
 
     def test_delayed_claude_report_tool_start_uses_provider_timestamp(self) -> None:
         # The report command started before persistence but the reader did not

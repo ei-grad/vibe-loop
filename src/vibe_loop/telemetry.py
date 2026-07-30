@@ -74,7 +74,9 @@ NATIVE_MODEL_LABEL_RE = re.compile(
 ATTRIBUTION_DIAGNOSTIC_LIMIT = 16
 # Structured activity a worker may perform after its accepted terminal report.
 # A bounded text-only summary is not activity and carries no kind.
-POST_REPORT_ACTIVITY_KINDS = frozenset({"tool_call", "tool_result", "child_process"})
+POST_REPORT_ACTIVITY_KINDS = frozenset(
+    {"tool_call", "tool_result", "state_update", "child_process"}
+)
 USAGE_SOURCES = frozenset(
     {
         "unavailable",
