@@ -7556,6 +7556,43 @@ class ClassifyPostReportActivityTests(unittest.TestCase):
         )
         self.assertEqual(classify_post_report_activity(line), "tool_call")
 
+    def test_codex_worker_report_command_is_identified(self) -> None:
+        event = classify_post_report_event(
+            json.dumps(
+                {
+                    "type": "item.started",
+                    "item": {
+                        "type": "command_execution",
+                        "id": "report",
+                        "command": (
+                            '/bin/zsh -lc \'vibe-loop report --repo "$VIBE_LOOP_REPO" '
+                            '--run-id "$VIBE_LOOP_RUN_ID"\''
+                        ),
+                    },
+                }
+            )
+        )
+        self.assertIsNotNone(event)
+        self.assertTrue(event.is_report_command)
+
+    def test_codex_command_that_only_mentions_worker_report_is_not_boundary(
+        self,
+    ) -> None:
+        event = classify_post_report_event(
+            json.dumps(
+                {
+                    "type": "item.started",
+                    "item": {
+                        "type": "command_execution",
+                        "id": "mention",
+                        "command": "printf '%s' 'vibe-loop report'",
+                    },
+                }
+            )
+        )
+        self.assertIsNotNone(event)
+        self.assertFalse(event.is_report_command)
+
     def test_codex_todo_list_update_is_state_update(self) -> None:
         line = json.dumps(
             {"type": "item.updated", "item": {"type": "todo_list", "id": "item_1"}}
@@ -7740,12 +7777,33 @@ class PostReportActivityMonitorTests(unittest.TestCase):
             }
         )
 
-    def _codex_item(self, event_type: str, item_type: str, item_id: str) -> str:
+    def _codex_item(
+        self,
+        event_type: str,
+        item_type: str,
+        item_id: str,
+        *,
+        command: str = "",
+    ) -> str:
+        item = {"type": item_type, "id": item_id}
+        if command:
+            item["command"] = command
         return json.dumps(
             {
                 "type": event_type,
-                "item": {"type": item_type, "id": item_id},
+                "item": item,
             }
+        )
+
+    def _codex_report_item(self, event_type: str, item_id: str) -> str:
+        return self._codex_item(
+            event_type,
+            "command_execution",
+            item_id,
+            command=(
+                '/bin/zsh -lc \'vibe-loop report --repo "$VIBE_LOOP_REPO" '
+                '--run-id "$VIBE_LOOP_RUN_ID"\''
+            ),
         )
 
     def test_activity_between_persistence_and_mark_is_reconciled(self) -> None:
@@ -7776,84 +7834,60 @@ class PostReportActivityMonitorTests(unittest.TestCase):
         self.assertFalse(monitor.violation)
         self.assertEqual(monitor.snapshot().activity_count, 0)
 
-    def test_codex_report_completion_at_source_position_240_is_ignored(self) -> None:
-        # The capOS incident ended with the report command at source positions
-        # 239 (tool_started) and 240 (tool_completed). Persistence occurred
-        # between them, so the correlated completion is not fresh activity.
-        wall = FakeMonotonicClock([90.0, 110.0])
+    def test_codex_report_lifecycle_at_historical_positions_is_ignored(self) -> None:
+        # The two incidents ended at source positions 239/240 and 87/88. Even
+        # when delayed delivery stamps both report envelopes after persistence,
+        # their structured command lifecycle is the causal boundary.
+        wall = FakeMonotonicClock([150.0, 150.0])
         monitor = PostReportActivityMonitor("openai", wallclock=wall)
-        monitor.observe_line(
-            self._codex_item("item.started", "command_execution", "item_130")
-        )
+        monitor.observe_line(self._codex_report_item("item.started", "item_130"))
         monitor.mark_report_observed(boundary_wall=100.0)
-        monitor.observe_line(
-            self._codex_item("item.completed", "command_execution", "item_130")
-        )
+        monitor.observe_line(self._codex_report_item("item.completed", "item_130"))
         self.assertFalse(monitor.violation)
         self.assertEqual(monitor.snapshot().activity_count, 0)
 
-    def test_stream_telemetry_callback_cannot_move_start_past_report(self) -> None:
-        # Telemetry persistence for a just-read tool start can overlap the
-        # report command filing its boundary. Policy attribution must retain
-        # the line's pre-callback observation time.
-        callback_started = False
-        monitor = PostReportActivityMonitor(
-            "openai",
-            wallclock=lambda: 110.0 if callback_started else 90.0,
-        )
-        lines = StringIO(
-            self._codex_item("item.started", "command_execution", "item_130")
-            + "\n"
-            + self._codex_item("item.completed", "command_execution", "item_130")
-            + "\n"
-        )
-
-        class OutputObserver:
-            def observe_line(
-                self,
-                line: str,
-                stream_name: str,
-                *,
-                source_position: int,
-            ) -> object:
-                return object()
-
-        def persist_observation(observation: object) -> None:
-            nonlocal callback_started
-            callback_started = True
-            monitor.mark_report_observed(boundary_wall=100.0)
-
-        runner_module.stream_pipe(
-            lines,
-            StringIO(),
-            threading.Lock(),
-            False,
-            OutputObserver(),
-            "stdout",
-            persist_observation,
-            post_report_monitor=monitor,
-        )
-
-        self.assertFalse(monitor.violation)
-        self.assertEqual(monitor.snapshot().activity_count, 0)
-
-    def test_codex_todo_update_after_report_completion_is_a_violation(self) -> None:
-        # The genuine wave-30 case has the report command at positions 36/37,
-        # followed by a todo_list update at position 38. The completion remains
-        # correlated while the later state mutation is counted.
-        wall = FakeMonotonicClock([90.0, 110.0, 120.0])
+    def test_codex_preexisting_todo_closure_after_report_is_benign(self) -> None:
+        # The wave-30 tail and routine Codex turn closure both update the same
+        # todo item that started before the report command. Its later envelopes
+        # are correlated lifecycle closure, not a fresh state mutation.
+        wall = FakeMonotonicClock([50.0, 150.0, 150.0, 150.0, 150.0])
         monitor = PostReportActivityMonitor("openai", wallclock=wall)
-        monitor.observe_line(
-            self._codex_item("item.started", "command_execution", "item_19")
-        )
+        monitor.observe_line(self._codex_item("item.started", "todo_list", "item_1"))
+        monitor.observe_line(self._codex_report_item("item.started", "item_19"))
         monitor.mark_report_observed(boundary_wall=100.0)
-        monitor.observe_line(
-            self._codex_item("item.completed", "command_execution", "item_19")
-        )
+        monitor.observe_line(self._codex_report_item("item.completed", "item_19"))
         monitor.observe_line(self._codex_item("item.updated", "todo_list", "item_1"))
+        monitor.observe_line(self._codex_item("item.completed", "todo_list", "item_1"))
+        self.assertFalse(monitor.violation)
+        self.assertEqual(monitor.snapshot().activity_count, 0)
+
+    def test_codex_new_todo_after_report_counts_one_logical_update(self) -> None:
+        wall = FakeMonotonicClock([150.0] * 8)
+        monitor = PostReportActivityMonitor("openai", wallclock=wall)
+        monitor.observe_line(self._codex_report_item("item.started", "report"))
+        monitor.mark_report_observed(boundary_wall=100.0)
+        monitor.observe_line(self._codex_report_item("item.completed", "report"))
+        monitor.observe_line(self._codex_item("item.started", "todo_list", "fresh"))
+        for _ in range(4):
+            monitor.observe_line(self._codex_item("item.updated", "todo_list", "fresh"))
+        monitor.observe_line(self._codex_item("item.completed", "todo_list", "fresh"))
         snapshot = monitor.snapshot()
         self.assertTrue(snapshot.violation)
         self.assertEqual(snapshot.activity_kind, "state_update")
+        self.assertEqual(snapshot.activity_count, 1)
+
+    def test_codex_tool_after_report_uses_causal_order_not_clock(self) -> None:
+        wall = FakeMonotonicClock([50.0] * 3)
+        monitor = PostReportActivityMonitor("openai", wallclock=wall)
+        monitor.observe_line(self._codex_report_item("item.started", "report"))
+        monitor.observe_line(self._codex_report_item("item.completed", "report"))
+        monitor.observe_line(
+            self._codex_item("item.started", "command_execution", "fresh")
+        )
+        monitor.mark_report_observed(boundary_wall=100.0)
+        snapshot = monitor.snapshot()
+        self.assertTrue(snapshot.violation)
+        self.assertEqual(snapshot.activity_kind, "tool_call")
         self.assertEqual(snapshot.activity_count, 1)
 
     def test_delayed_claude_report_tool_start_uses_provider_timestamp(self) -> None:

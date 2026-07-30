@@ -1168,13 +1168,14 @@ class ActivityEvent:
     the dialect did not carry one. ``is_completion`` marks the closing half of a
     call (a Claude ``tool_result``, a Codex ``*_end``/``item.completed``) so a
     pre-boundary call finishing after the report is not counted as new activity.
-    Structured state updates are fresh emissions rather than call completions.
+    Codex state-item updates and completions use the same lifecycle correlation.
     """
 
     kind: str
     tool_id: str
     is_completion: bool
     emitted_at: float | None = None
+    is_report_command: bool = False
 
 
 def _string_id(value: object) -> str:
@@ -1219,6 +1220,28 @@ def _codex_call_id(event: Mapping[str, object]) -> str:
     return ""
 
 
+def _invokes_worker_report(command: object, *, depth: int = 0) -> bool:
+    if not isinstance(command, str) or not command or depth > 1:
+        return False
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if len(argv) >= 2 and Path(argv[0]).name == "vibe-loop":
+        return argv[1] == "report"
+    if (
+        len(argv) >= 4
+        and Path(argv[0]).name == "uv"
+        and argv[1:3] == ["run", "vibe-loop"]
+    ):
+        return argv[3] == "report"
+    if argv and Path(argv[0]).name in {"bash", "dash", "sh", "zsh"}:
+        for index, argument in enumerate(argv[1:-1], start=1):
+            if argument.startswith("-") and "c" in argument[1:]:
+                return _invokes_worker_report(argv[index + 1], depth=depth + 1)
+    return False
+
+
 def _claude_activity_event(payload: Mapping[str, object]) -> ActivityEvent | None:
     event_type = payload.get("type")
     message = payload.get("message")
@@ -1248,12 +1271,24 @@ def _codex_activity_event(payload: Mapping[str, object]) -> ActivityEvent | None
         item_type = item.get("type") if isinstance(item, Mapping) else None
         if isinstance(item_type, str) and item_type in CODEX_TOOL_ITEM_TYPES:
             is_completion = event_type in CODEX_ITEM_COMPLETION_ENVELOPE_TYPES
-            return ActivityEvent("tool_call", _string_id(item.get("id")), is_completion)
+            return ActivityEvent(
+                "tool_call",
+                _string_id(item.get("id")),
+                is_completion,
+                is_report_command=(
+                    event_type != "item.updated"
+                    and _invokes_worker_report(item.get("command"))
+                ),
+            )
         if (
             isinstance(item_type, str)
             and item_type in CODEX_POST_REPORT_STATE_ITEM_TYPES
         ):
-            return ActivityEvent("state_update", "", False)
+            return ActivityEvent(
+                "state_update",
+                _string_id(item.get("id")),
+                event_type in CODEX_ITEM_COMPLETION_ENVELOPE_TYPES,
+            )
     return None
 
 
@@ -1490,15 +1525,15 @@ class PostReportActivityMonitor:
     the boundary until ``mark_report_observed`` fires, it buffers recent activity
     and cumulative usage observations, then reconciles both against the boundary.
 
-    A tool call that started before the boundary but only completes after it
-    (including the worker's own ``vibe-loop report`` invocation and its result)
-    is correlated by id and ignored, so only genuinely fresh post-report tool
-    starts, orphan completions with no observed start, and structured state
-    updates count as a policy violation (F2). The teardown-only provider usage
-    (the delta from the boundary snapshot) is reported separately so quota
-    diagnostics can distinguish teardown burn from useful implementation/review.
-    Thread-safe: stream threads call ``observe_line`` while the supervision
-    watchdog marks the boundary and reads ``violation``.
+    Codex's structured ``vibe-loop report`` command lifecycle establishes a
+    causal stream boundary that does not depend on pipe-delivery timing. Tool
+    and state-item updates/completions correlate by id, so only genuinely fresh
+    post-report starts and orphan completions count as policy violations. The
+    teardown-only provider usage (the delta from the boundary snapshot) is
+    reported separately so quota diagnostics can distinguish teardown burn from
+    useful implementation/review. Thread-safe: stream threads call
+    ``observe_line`` while the supervision watchdog marks the boundary and reads
+    ``violation``.
     """
 
     def __init__(
@@ -1521,12 +1556,16 @@ class PostReportActivityMonitor:
         )
         self._activity_kind = ""
         self._activity_count = 0
-        # Wall time of the first observed start for each correlation id, used to
-        # tell a pre-boundary tool finishing apart from a fresh post-report call.
-        self._start_wall: dict[str, float] = {}
+        # Lifecycle ids suppress repeated update/completion envelopes.
+        self._started_lifecycle_ids: set[str] = set()
+        self._counted_completion_ids: set[str] = set()
+        self._report_command_id = ""
+        self._report_command_completed = False
         # Structured events seen before the boundary is known, reconciled once
-        # ``mark_report_observed`` supplies the persistence instant.
-        self._pending: deque[tuple[float, ActivityEvent]] = deque(
+        # ``mark_report_observed`` supplies the persistence instant. The third
+        # field is causal position relative to the report command completion:
+        # false is before it, true is after it, and none falls back to time.
+        self._pending: deque[tuple[float, ActivityEvent, bool | None]] = deque(
             maxlen=POST_REPORT_PENDING_BUFFER
         )
         self._usage_history: deque[_CumulativeUsageObservation] = deque(
@@ -1547,9 +1586,8 @@ class PostReportActivityMonitor:
             self._boundary_wall = (
                 boundary_wall if boundary_wall is not None else self._wallclock()
             )
-            for wall, event in self._pending:
-                self._attribute_locked(wall, event)
-            self._pending.clear()
+            if self._provider != "openai" or self._report_command_completed:
+                self._flush_pending_locked()
 
     @property
     def reported(self) -> bool:
@@ -1593,23 +1631,74 @@ class PostReportActivityMonitor:
                 )
             if event is None:
                 return
+            if self._observe_report_command_locked(event):
+                return
             if event.tool_id and not event.is_completion:
-                self._start_wall.setdefault(event.tool_id, wall)
-            if self._boundary_wall is None:
-                self._pending.append((wall, event))
+                self._started_lifecycle_ids.add(event.tool_id)
+            causal_position = (
+                True
+                if self._report_command_completed
+                else False
+                if self._report_command_id
+                else None
+            )
+            if self._boundary_wall is None or (
+                self._provider == "openai" and not self._report_command_completed
+            ):
+                self._pending.append((wall, event, causal_position))
             else:
-                self._attribute_locked(wall, event)
+                self._attribute_locked(wall, event, causal_position)
 
-    def _attribute_locked(self, wall: float, event: ActivityEvent) -> None:
+    def _observe_report_command_locked(self, event: ActivityEvent) -> bool:
+        if (
+            not event.is_report_command
+            or self._report_command_completed
+            or (self._report_command_id and event.tool_id != self._report_command_id)
+        ):
+            return False
+        if not self._report_command_id:
+            self._report_command_id = event.tool_id
+            self._pending = deque(
+                (
+                    (
+                        wall,
+                        pending_event,
+                        False if causal_position is None else causal_position,
+                    )
+                    for wall, pending_event, causal_position in self._pending
+                ),
+                maxlen=POST_REPORT_PENDING_BUFFER,
+            )
+        if event.is_completion:
+            self._report_command_completed = True
+            if self._boundary_wall is not None:
+                self._flush_pending_locked()
+        return True
+
+    def _flush_pending_locked(self) -> None:
+        for wall, event, causal_position in self._pending:
+            self._attribute_locked(wall, event, causal_position)
+        self._pending.clear()
+
+    def _attribute_locked(
+        self,
+        wall: float,
+        event: ActivityEvent,
+        causal_position: bool | None,
+    ) -> None:
         # Caller holds the lock and the boundary is set. Only activity at or
-        # after the report-persistence boundary is teardown. A completion whose
-        # start id we have already seen is either a pre-boundary tool finishing
-        # or a post-boundary start already counted, so it is never double
-        # counted; an orphan completion with no observed start is treated as
-        # fresh post-report activity.
-        if self._boundary_wall is None or wall < self._boundary_wall:
+        # after the report-persistence boundary is teardown. Causal stream order
+        # around the report command overrides delayed supervisor timestamps.
+        if self._boundary_wall is None or causal_position is False:
             return
-        if event.is_completion and event.tool_id and event.tool_id in self._start_wall:
+        if event.is_completion and event.tool_id:
+            if (
+                event.tool_id in self._started_lifecycle_ids
+                or event.tool_id in self._counted_completion_ids
+            ):
+                return
+            self._counted_completion_ids.add(event.tool_id)
+        if causal_position is None and wall < self._boundary_wall:
             return
         self._activity_count += 1
         if not self._activity_kind:
@@ -1666,6 +1755,8 @@ class PostReportActivityMonitor:
         until: float | None = None,
     ) -> PostReportActivity:
         with self._lock:
+            if self._reported_at is not None and self._pending:
+                self._flush_pending_locked()
             reported = self._reported_at is not None
             boundary_wall = self._boundary_wall
             history = tuple(self._usage_history)
@@ -9919,10 +10010,6 @@ def stream_pipe(
     try:
         for source_position, line in enumerate(pipe, start=1):
             redacted_line = redact_worker_stream_line(line, fencing_token)
-            # Attribute the line at read time before telemetry persistence or
-            # callbacks can cross a concurrently filed report boundary.
-            if post_report_monitor is not None:
-                post_report_monitor.observe_line(redacted_line)
             observation = output_observer.observe_line(
                 redacted_line,
                 stream_name,
@@ -9930,6 +10017,8 @@ def stream_pipe(
             )
             if observation is not None and on_observation is not None:
                 on_observation(observation)
+            if post_report_monitor is not None:
+                post_report_monitor.observe_line(redacted_line)
             if forward:
                 sys.stderr.write(redacted_line)
                 sys.stderr.flush()

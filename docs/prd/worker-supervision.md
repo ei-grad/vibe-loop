@@ -77,11 +77,14 @@ but before that poll — including a worker that reports, acts, and exits inside
 single poll window — is buffered and attributed rather than lost. Valid provider
 timestamps order delayed Claude stream-json and Codex JSON delivery against that
 instant; malformed or missing timestamps conservatively fall back to reader
-order. A tool call that started before the boundary and only completes after it
-(the worker's own `vibe-loop report` invocation and its result included) is
-correlated by call id and not counted as fresh post-report activity; only
-genuinely new post-report tool starts, completions with no observed start, and
-structured state mutations such as Codex todo-list updates are violations.
+order. For Codex, the structured `vibe-loop report` command completion is also a
+causal boundary: its own lifecycle and every earlier lifecycle are pre-report
+regardless of delayed pipe delivery, while later lifecycle starts are
+post-report regardless of their supervisor timestamps. Tool and state-item
+updates or completions correlate with their starts by item id, so the routine
+end-of-turn re-emission of a pre-existing todo list is not fresh activity.
+Genuinely new post-report tool or state-item starts, and completions with no
+observed start, are violations.
 
 Post-report elapsed time and attributable provider usage are recorded separately
 from the useful implementation/review spend so quota diagnostics can isolate
