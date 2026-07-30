@@ -124,8 +124,10 @@ from vibe_loop.orchestration import (
     settlement_intent,
 )
 from vibe_loop.processes import (
+    PROC_ROOT,
     ProcessNode,
     collect_owned_descendants,
+    read_process_details,
     read_process_node,
     read_process_table,
 )
@@ -1155,6 +1157,7 @@ CODEX_COMPLETION_EVENT_TYPES = frozenset(
 CODEX_ITEM_COMPLETION_ENVELOPE_TYPES = frozenset(
     {"item.updated", "item.completed", "response.output_item.done"}
 )
+CODEX_POST_REPORT_STATE_ITEM_TYPES = frozenset({"todo_list"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1165,12 +1168,14 @@ class ActivityEvent:
     the dialect did not carry one. ``is_completion`` marks the closing half of a
     call (a Claude ``tool_result``, a Codex ``*_end``/``item.completed``) so a
     pre-boundary call finishing after the report is not counted as new activity.
+    Codex state-item updates and completions use the same lifecycle correlation.
     """
 
     kind: str
     tool_id: str
     is_completion: bool
     emitted_at: float | None = None
+    is_report_command: bool = False
 
 
 def _string_id(value: object) -> str:
@@ -1215,6 +1220,28 @@ def _codex_call_id(event: Mapping[str, object]) -> str:
     return ""
 
 
+def _invokes_worker_report(command: object, *, depth: int = 0) -> bool:
+    if not isinstance(command, str) or not command or depth > 1:
+        return False
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if len(argv) >= 2 and Path(argv[0]).name == "vibe-loop":
+        return argv[1] == "report"
+    if (
+        len(argv) >= 4
+        and Path(argv[0]).name == "uv"
+        and argv[1:3] == ["run", "vibe-loop"]
+    ):
+        return argv[3] == "report"
+    if argv and Path(argv[0]).name in {"bash", "dash", "sh", "zsh"}:
+        for index, argument in enumerate(argv[1:-1], start=1):
+            if argument.startswith("-") and "c" in argument[1:]:
+                return _invokes_worker_report(argv[index + 1], depth=depth + 1)
+    return False
+
+
 def _claude_activity_event(payload: Mapping[str, object]) -> ActivityEvent | None:
     event_type = payload.get("type")
     message = payload.get("message")
@@ -1244,7 +1271,24 @@ def _codex_activity_event(payload: Mapping[str, object]) -> ActivityEvent | None
         item_type = item.get("type") if isinstance(item, Mapping) else None
         if isinstance(item_type, str) and item_type in CODEX_TOOL_ITEM_TYPES:
             is_completion = event_type in CODEX_ITEM_COMPLETION_ENVELOPE_TYPES
-            return ActivityEvent("tool_call", _string_id(item.get("id")), is_completion)
+            return ActivityEvent(
+                "tool_call",
+                _string_id(item.get("id")),
+                is_completion,
+                is_report_command=(
+                    event_type != "item.updated"
+                    and _invokes_worker_report(item.get("command"))
+                ),
+            )
+        if (
+            isinstance(item_type, str)
+            and item_type in CODEX_POST_REPORT_STATE_ITEM_TYPES
+        ):
+            return ActivityEvent(
+                "state_update",
+                _string_id(item.get("id")),
+                event_type in CODEX_ITEM_COMPLETION_ENVELOPE_TYPES,
+            )
     return None
 
 
@@ -1320,8 +1364,8 @@ def classify_post_report_activity(line: str) -> str:
     """Return the activity kind of a worker stream line, ``""`` when benign.
 
     Thin wrapper over :func:`classify_post_report_event` that keeps the kind
-    label (``tool_call``/``tool_result``) for callers that do not need the
-    correlation id.
+    label (``tool_call``/``tool_result``/``state_update``) for callers that do
+    not need the correlation id.
     """
     event = classify_post_report_event(line)
     return event.kind if event is not None else ""
@@ -1348,6 +1392,7 @@ class PostReportActivity:
     descendants_verified: bool = False
     teardown_process_count: int = 0
     teardown_seconds: float = 0.0
+    escaped_descendants: tuple[dict[str, object], ...] = ()
 
     @property
     def violation(self) -> bool:
@@ -1480,15 +1525,15 @@ class PostReportActivityMonitor:
     the boundary until ``mark_report_observed`` fires, it buffers recent activity
     and cumulative usage observations, then reconciles both against the boundary.
 
-    A tool call that started before the boundary but only completes after it
-    (including the worker's own ``vibe-loop report`` invocation and its result)
-    is correlated by id and ignored, so only genuinely fresh post-report tool
-    starts -- and orphan completions with no observed start -- count as a policy
-    violation (F2). The teardown-only provider usage (the delta from the boundary
-    snapshot) is reported separately so quota diagnostics can distinguish
-    teardown burn from useful implementation/review. Thread-safe: stream threads
-    call ``observe_line`` while the supervision watchdog marks the boundary and
-    reads ``violation``.
+    Codex's structured ``vibe-loop report`` command lifecycle establishes a
+    causal stream boundary that does not depend on pipe-delivery timing. Tool
+    and state-item updates/completions correlate by id, so only genuinely fresh
+    post-report starts and orphan completions count as policy violations. The
+    teardown-only provider usage (the delta from the boundary snapshot) is
+    reported separately so quota diagnostics can distinguish teardown burn from
+    useful implementation/review. Thread-safe: stream threads call
+    ``observe_line`` while the supervision watchdog marks the boundary and reads
+    ``violation``.
     """
 
     def __init__(
@@ -1511,12 +1556,16 @@ class PostReportActivityMonitor:
         )
         self._activity_kind = ""
         self._activity_count = 0
-        # Wall time of the first observed start for each correlation id, used to
-        # tell a pre-boundary tool finishing apart from a fresh post-report call.
-        self._start_wall: dict[str, float] = {}
+        # Lifecycle ids suppress repeated update/completion envelopes.
+        self._started_lifecycle_ids: set[str] = set()
+        self._counted_completion_ids: set[str] = set()
+        self._report_command_id = ""
+        self._report_command_completed = False
         # Structured events seen before the boundary is known, reconciled once
-        # ``mark_report_observed`` supplies the persistence instant.
-        self._pending: deque[tuple[float, ActivityEvent]] = deque(
+        # ``mark_report_observed`` supplies the persistence instant. The third
+        # field is causal position relative to the report command completion:
+        # false is before it, true is after it, and none falls back to time.
+        self._pending: deque[tuple[float, ActivityEvent, bool | None]] = deque(
             maxlen=POST_REPORT_PENDING_BUFFER
         )
         self._usage_history: deque[_CumulativeUsageObservation] = deque(
@@ -1537,9 +1586,8 @@ class PostReportActivityMonitor:
             self._boundary_wall = (
                 boundary_wall if boundary_wall is not None else self._wallclock()
             )
-            for wall, event in self._pending:
-                self._attribute_locked(wall, event)
-            self._pending.clear()
+            if self._provider != "openai" or self._report_command_completed:
+                self._flush_pending_locked()
 
     @property
     def reported(self) -> bool:
@@ -1583,23 +1631,74 @@ class PostReportActivityMonitor:
                 )
             if event is None:
                 return
+            if self._observe_report_command_locked(event):
+                return
             if event.tool_id and not event.is_completion:
-                self._start_wall.setdefault(event.tool_id, wall)
-            if self._boundary_wall is None:
-                self._pending.append((wall, event))
+                self._started_lifecycle_ids.add(event.tool_id)
+            causal_position = (
+                True
+                if self._report_command_completed
+                else False
+                if self._report_command_id
+                else None
+            )
+            if self._boundary_wall is None or (
+                self._provider == "openai" and not self._report_command_completed
+            ):
+                self._pending.append((wall, event, causal_position))
             else:
-                self._attribute_locked(wall, event)
+                self._attribute_locked(wall, event, causal_position)
 
-    def _attribute_locked(self, wall: float, event: ActivityEvent) -> None:
+    def _observe_report_command_locked(self, event: ActivityEvent) -> bool:
+        if (
+            not event.is_report_command
+            or self._report_command_completed
+            or (self._report_command_id and event.tool_id != self._report_command_id)
+        ):
+            return False
+        if not self._report_command_id:
+            self._report_command_id = event.tool_id
+            self._pending = deque(
+                (
+                    (
+                        wall,
+                        pending_event,
+                        False if causal_position is None else causal_position,
+                    )
+                    for wall, pending_event, causal_position in self._pending
+                ),
+                maxlen=POST_REPORT_PENDING_BUFFER,
+            )
+        if event.is_completion:
+            self._report_command_completed = True
+            if self._boundary_wall is not None:
+                self._flush_pending_locked()
+        return True
+
+    def _flush_pending_locked(self) -> None:
+        for wall, event, causal_position in self._pending:
+            self._attribute_locked(wall, event, causal_position)
+        self._pending.clear()
+
+    def _attribute_locked(
+        self,
+        wall: float,
+        event: ActivityEvent,
+        causal_position: bool | None,
+    ) -> None:
         # Caller holds the lock and the boundary is set. Only activity at or
-        # after the report-persistence boundary is teardown. A completion whose
-        # start id we have already seen is either a pre-boundary tool finishing
-        # or a post-boundary start already counted, so it is never double
-        # counted; an orphan completion with no observed start is treated as
-        # fresh post-report activity.
-        if self._boundary_wall is None or wall < self._boundary_wall:
+        # after the report-persistence boundary is teardown. Causal stream order
+        # around the report command overrides delayed supervisor timestamps.
+        if self._boundary_wall is None or causal_position is False:
             return
-        if event.is_completion and event.tool_id and event.tool_id in self._start_wall:
+        if event.is_completion and event.tool_id:
+            if (
+                event.tool_id in self._started_lifecycle_ids
+                or event.tool_id in self._counted_completion_ids
+            ):
+                return
+            self._counted_completion_ids.add(event.tool_id)
+        if causal_position is None and wall < self._boundary_wall:
             return
         self._activity_count += 1
         if not self._activity_kind:
@@ -1656,6 +1755,8 @@ class PostReportActivityMonitor:
         until: float | None = None,
     ) -> PostReportActivity:
         with self._lock:
+            if self._reported_at is not None and self._pending:
+                self._flush_pending_locked()
             reported = self._reported_at is not None
             boundary_wall = self._boundary_wall
             history = tuple(self._usage_history)
@@ -3387,6 +3488,9 @@ class VibeRunner:
                             ),
                             runtime_lifecycle_decision=(post_report_lifecycle_decision),
                             runtime_lifecycle_reason=post_report_lifecycle_reason,
+                            escaped_descendants=(
+                                post_report_activity.escaped_descendants
+                            ),
                         )
                     )
                 if (
@@ -3413,6 +3517,9 @@ class VibeRunner:
                             teardown_reason=post_report_activity.teardown_reason,
                             runtime_lifecycle_decision=(post_report_lifecycle_decision),
                             runtime_lifecycle_reason=post_report_lifecycle_reason,
+                            escaped_descendants=(
+                                post_report_activity.escaped_descendants
+                            ),
                         )
                     )
             try:
@@ -9028,6 +9135,47 @@ class VerifiedWorkerTeardown:
     descendants_verified: bool
     reason: str
     process_count: int = 0
+    escaped_descendants: tuple[dict[str, object], ...] = ()
+
+
+ESCAPED_DESCENDANT_EVIDENCE_LIMIT = 8
+ESCAPED_DESCENDANT_CMDLINE_LIMIT = 512
+UTF8_MAX_BYTES_PER_CODE_POINT = 4
+
+
+def escaped_descendant_evidence(
+    descendants: Sequence[ProcessNode],
+    *,
+    fencing_token: str = "",
+    proc_root: Path = PROC_ROOT,
+) -> tuple[dict[str, object], ...]:
+    evidence: list[dict[str, object]] = []
+    for node in descendants[:ESCAPED_DESCENDANT_EVIDENCE_LIMIT]:
+        # Include any token that begins within the persisted character bound,
+        # even when every preceding code point uses four UTF-8 bytes.
+        details = read_process_details(
+            node,
+            proc_root=proc_root,
+            max_cmdline_bytes=(
+                ESCAPED_DESCENDANT_CMDLINE_LIMIT * UTF8_MAX_BYTES_PER_CODE_POINT
+                + len(fencing_token.encode("utf-8"))
+            ),
+        )
+        comm = redact_fencing_token_text(details.comm, fencing_token)
+        cmdline = redact_fencing_token_text(details.cmdline, fencing_token)
+        evidence.append(
+            {
+                "pid": node.pid,
+                "ppid": node.parent_pid,
+                "pgid": node.process_group_id,
+                "sid": node.session_id,
+                "comm": comm,
+                "cmdline": cmdline[:ESCAPED_DESCENDANT_CMDLINE_LIMIT],
+                "state": node.state,
+                "process_birth_id": node.process_birth_id,
+            }
+        )
+    return tuple(evidence)
 
 
 def terminate_verified_worker_process_group(
@@ -9038,6 +9186,7 @@ def terminate_verified_worker_process_group(
     sigkill_after_seconds: float = 2.0,
     process_table: Callable[[], dict[int, ProcessNode]] = read_process_table,
     process_node: Callable[[int], ProcessNode | None] = read_process_node,
+    fencing_token: str = "",
 ) -> VerifiedWorkerTeardown:
     """Stop only the verified worker group and prove its captured tree exited."""
     if not expected_birth_id:
@@ -9060,16 +9209,25 @@ def terminate_verified_worker_process_group(
         return VerifiedWorkerTeardown(
             False, True, False, "process_group_contains_unowned_member"
         )
-    if any(
-        node.process_group_id != process.pid and node.state not in {"Z", "X", "x"}
+    escaped_descendants = [
+        node
         for node in descendants
-    ):
+        if node.process_group_id != process.pid and node.state not in {"Z", "X", "x"}
+    ]
+    if escaped_descendants:
         # The process-group stop cannot signal an escaped descendant, and a
         # one-time ancestry snapshot cannot attribute children it forks and
         # reparents during teardown. Refuse before signalling rather than claim
         # closure from the disappearance of only the captured process.
         return VerifiedWorkerTeardown(
-            False, True, False, "descendant_outside_worker_process_group"
+            False,
+            True,
+            False,
+            "descendant_outside_worker_process_group",
+            escaped_descendants=escaped_descendant_evidence(
+                escaped_descendants,
+                fencing_token=fencing_token,
+            ),
         )
     owned = {node.pid: node for node in group}
     owned.update((node.pid, node) for node in descendants)
@@ -9175,6 +9333,7 @@ class WaitOutcome:
     post_report_descendants_verified: bool = False
     post_report_teardown_process_count: int = 0
     post_report_teardown_seconds: float = 0.0
+    post_report_escaped_descendants: tuple[dict[str, object], ...] = ()
 
 
 def wait_with_reap_watchdog(
@@ -9299,6 +9458,7 @@ def wait_with_reap_watchdog(
             post_report_descendants_verified=closure_teardown.descendants_verified,
             post_report_teardown_process_count=closure_teardown.process_count,
             post_report_teardown_seconds=closure_teardown_seconds,
+            post_report_escaped_descendants=(closure_teardown.escaped_descendants),
         )
 
     def _reap_for_timeout() -> WaitOutcome:
@@ -9651,6 +9811,7 @@ def run_streaming_command(
             process,
             log,
             expected_birth_id=expected_birth_id,
+            fencing_token=fencing_token,
         ),
     )
     stdout_thread.join()
@@ -9670,6 +9831,7 @@ def run_streaming_command(
         descendants_verified=wait_outcome.post_report_descendants_verified,
         teardown_process_count=wait_outcome.post_report_teardown_process_count,
         teardown_seconds=wait_outcome.post_report_teardown_seconds,
+        escaped_descendants=wait_outcome.post_report_escaped_descendants,
     )
     return StreamingCommandResult(
         exit_code=wait_outcome.exit_code,

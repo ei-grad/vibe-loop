@@ -922,6 +922,16 @@ class RunStoreTests(unittest.TestCase):
     def test_post_report_activity_event_records_violation_and_teardown(
         self,
     ) -> None:
+        escaped = {
+            "pid": 4444,
+            "ppid": 4321,
+            "pgid": 4444,
+            "sid": 4321,
+            "comm": "python",
+            "cmdline": "python worker.py",
+            "state": "S",
+            "process_birth_id": "boot-id:501",
+        }
         event = RunLifecycleEvent.post_report_activity(
             run_id="run-1",
             task_id="TASK-01",
@@ -935,6 +945,7 @@ class RunStoreTests(unittest.TestCase):
             report_status="completed",
             runtime_lifecycle_decision="continue",
             runtime_lifecycle_reason="verified_runtime_enforced_teardown",
+            escaped_descendants=(escaped,),
         ).to_record()
 
         self.assertEqual(event["record_type"], POST_REPORT_ACTIVITY_RECORD_TYPE)
@@ -952,6 +963,7 @@ class RunStoreTests(unittest.TestCase):
             event["runtime_lifecycle_reason"],
             "verified_runtime_enforced_teardown",
         )
+        self.assertEqual(event["escaped_descendants"], [escaped])
         self.assertIn(POST_REPORT_ACTIVITY_RECORD_TYPE, KNOWN_RECORD_TYPES)
 
     def test_post_report_activity_event_round_trips_through_store(self) -> None:
@@ -982,6 +994,16 @@ class RunStoreTests(unittest.TestCase):
         self.assertFalse(records[0]["terminated"])
 
     def test_post_report_closure_records_bounded_teardown_evidence(self) -> None:
+        escaped = {
+            "pid": 102,
+            "ppid": 101,
+            "pgid": 102,
+            "sid": 101,
+            "comm": "python",
+            "cmdline": "python worker.py",
+            "state": "S",
+            "process_birth_id": "boot-id:501",
+        }
         event = RunLifecycleEvent.post_report_closure(
             run_id="run-1",
             task_id="TASK-01",
@@ -997,6 +1019,7 @@ class RunStoreTests(unittest.TestCase):
             teardown_reason="accepted_report_runtime_closure",
             runtime_lifecycle_decision="continue",
             runtime_lifecycle_reason=("verified_accepted_report_runtime_closure"),
+            escaped_descendants=(escaped,),
         ).to_record()
 
         self.assertEqual(event["record_type"], "post_report_closure")
@@ -1005,6 +1028,7 @@ class RunStoreTests(unittest.TestCase):
         self.assertTrue(event["identity_verified"])
         self.assertTrue(event["descendants_verified"])
         self.assertTrue(event["terminated"])
+        self.assertEqual(event["escaped_descendants"], [escaped])
         encoded = json.dumps(event)
         self.assertNotIn("prompt", encoded)
         self.assertNotIn("tool_payload", encoded)

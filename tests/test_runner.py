@@ -7004,8 +7004,84 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         self.assertTrue(result.identity_verified)
         self.assertFalse(result.descendants_verified)
         self.assertEqual(result.reason, "descendant_outside_worker_process_group")
+        self.assertEqual(
+            result.escaped_descendants,
+            (
+                {
+                    "pid": escaped.pid,
+                    "ppid": escaped.parent_pid,
+                    "pgid": escaped.process_group_id,
+                    "sid": escaped.session_id,
+                    "comm": "",
+                    "cmdline": "",
+                    "state": escaped.state,
+                    "process_birth_id": escaped.process_birth_id,
+                },
+            ),
+        )
         self.assertEqual(terminate_calls, 0)
         self.assertNotIn(escaped.pid + 1, nodes)
+
+    def test_escaped_descendant_evidence_is_bounded(self):
+        descendants = [
+            ProcessNode(
+                pid=5000 + offset,
+                parent_pid=4321,
+                process_group_id=5000 + offset,
+                session_id=4321,
+                process_birth_id=f"boot:{offset}",
+            )
+            for offset in range(12)
+        ]
+
+        evidence = runner_module.escaped_descendant_evidence(descendants)
+
+        self.assertEqual(len(evidence), 8)
+        self.assertEqual(
+            [identity["pid"] for identity in evidence],
+            [node.pid for node in descendants[:8]],
+        )
+
+    @unittest.skipUnless(sys.platform == "linux", "/proc parsing is Linux-only")
+    def test_escaped_descendant_cmdline_redaction_and_character_bound(self):
+        boot_id = "11111111-2222-3333-4444-555555555555"
+        token = "a" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            boot_path = root / "sys/kernel/random"
+            boot_path.mkdir(parents=True)
+            (boot_path / "boot_id").write_text(f"{boot_id}\n", encoding="utf-8")
+            process_dir = root / "42"
+            process_dir.mkdir()
+            fields = ["S", "7", "42", "42"] + ["0"] * 15 + ["900"]
+            (process_dir / "stat").write_text(
+                "42 (worker) " + " ".join(fields) + "\n",
+                encoding="utf-8",
+            )
+            (process_dir / "comm").write_text("worker\n", encoding="utf-8")
+            (process_dir / "cmdline").write_bytes(
+                ("界" * 100 + "y" * 229 + " " + token + " " + "z" * 300).encode("utf-8")
+            )
+            escaped = ProcessNode(
+                pid=42,
+                parent_pid=7,
+                process_group_id=42,
+                session_id=42,
+                process_birth_id=f"{boot_id}:900",
+                state="S",
+            )
+
+            evidence = runner_module.escaped_descendant_evidence(
+                [escaped],
+                fencing_token=token,
+                proc_root=root,
+            )
+
+        cmdline = evidence[0]["cmdline"]
+        self.assertEqual(len(cmdline), runner_module.ESCAPED_DESCENDANT_CMDLINE_LIMIT)
+        self.assertIn("<redacted>", cmdline)
+        self.assertNotIn(token, cmdline)
+        self.assertNotIn(token[:8], cmdline)
 
     def test_accepted_report_teardown_ignores_exited_out_of_group_descendant(self):
         proc = FakeWatchdogProcess(alive_polls=10_000)
@@ -7481,6 +7557,49 @@ class ClassifyPostReportActivityTests(unittest.TestCase):
         )
         self.assertEqual(classify_post_report_activity(line), "tool_call")
 
+    def test_codex_worker_report_command_is_identified(self) -> None:
+        event = classify_post_report_event(
+            json.dumps(
+                {
+                    "type": "item.started",
+                    "item": {
+                        "type": "command_execution",
+                        "id": "report",
+                        "command": (
+                            '/bin/zsh -lc \'vibe-loop report --repo "$VIBE_LOOP_REPO" '
+                            '--run-id "$VIBE_LOOP_RUN_ID"\''
+                        ),
+                    },
+                }
+            )
+        )
+        self.assertIsNotNone(event)
+        self.assertTrue(event.is_report_command)
+
+    def test_codex_command_that_only_mentions_worker_report_is_not_boundary(
+        self,
+    ) -> None:
+        event = classify_post_report_event(
+            json.dumps(
+                {
+                    "type": "item.started",
+                    "item": {
+                        "type": "command_execution",
+                        "id": "mention",
+                        "command": "printf '%s' 'vibe-loop report'",
+                    },
+                }
+            )
+        )
+        self.assertIsNotNone(event)
+        self.assertFalse(event.is_report_command)
+
+    def test_codex_todo_list_update_is_state_update(self) -> None:
+        line = json.dumps(
+            {"type": "item.updated", "item": {"type": "todo_list", "id": "item_1"}}
+        )
+        self.assertEqual(classify_post_report_activity(line), "state_update")
+
     def test_codex_agent_message_and_token_count_are_benign(self) -> None:
         for payload in (
             {"type": "item.completed", "item": {"type": "agent_message"}},
@@ -7659,6 +7778,35 @@ class PostReportActivityMonitorTests(unittest.TestCase):
             }
         )
 
+    def _codex_item(
+        self,
+        event_type: str,
+        item_type: str,
+        item_id: str,
+        *,
+        command: str = "",
+    ) -> str:
+        item = {"type": item_type, "id": item_id}
+        if command:
+            item["command"] = command
+        return json.dumps(
+            {
+                "type": event_type,
+                "item": item,
+            }
+        )
+
+    def _codex_report_item(self, event_type: str, item_id: str) -> str:
+        return self._codex_item(
+            event_type,
+            "command_execution",
+            item_id,
+            command=(
+                '/bin/zsh -lc \'vibe-loop report --repo "$VIBE_LOOP_REPO" '
+                '--run-id "$VIBE_LOOP_RUN_ID"\''
+            ),
+        )
+
     def test_activity_between_persistence_and_mark_is_reconciled(self) -> None:
         # A tool call emitted after the report persisted (wall 120) but before
         # the watchdog marked the boundary is buffered and, once the boundary is
@@ -7686,6 +7834,62 @@ class PostReportActivityMonitorTests(unittest.TestCase):
         monitor.mark_report_observed(boundary_wall=100.0)
         self.assertFalse(monitor.violation)
         self.assertEqual(monitor.snapshot().activity_count, 0)
+
+    def test_codex_report_lifecycle_at_historical_positions_is_ignored(self) -> None:
+        # The two incidents ended at source positions 239/240 and 87/88. Even
+        # when delayed delivery stamps both report envelopes after persistence,
+        # their structured command lifecycle is the causal boundary.
+        wall = FakeMonotonicClock([150.0, 150.0])
+        monitor = PostReportActivityMonitor("openai", wallclock=wall)
+        monitor.observe_line(self._codex_report_item("item.started", "item_130"))
+        monitor.mark_report_observed(boundary_wall=100.0)
+        monitor.observe_line(self._codex_report_item("item.completed", "item_130"))
+        self.assertFalse(monitor.violation)
+        self.assertEqual(monitor.snapshot().activity_count, 0)
+
+    def test_codex_preexisting_todo_closure_after_report_is_benign(self) -> None:
+        # The wave-30 tail and routine Codex turn closure both update the same
+        # todo item that started before the report command. Its later envelopes
+        # are correlated lifecycle closure, not a fresh state mutation.
+        wall = FakeMonotonicClock([50.0, 150.0, 150.0, 150.0, 150.0])
+        monitor = PostReportActivityMonitor("openai", wallclock=wall)
+        monitor.observe_line(self._codex_item("item.started", "todo_list", "item_1"))
+        monitor.observe_line(self._codex_report_item("item.started", "item_19"))
+        monitor.mark_report_observed(boundary_wall=100.0)
+        monitor.observe_line(self._codex_report_item("item.completed", "item_19"))
+        monitor.observe_line(self._codex_item("item.updated", "todo_list", "item_1"))
+        monitor.observe_line(self._codex_item("item.completed", "todo_list", "item_1"))
+        self.assertFalse(monitor.violation)
+        self.assertEqual(monitor.snapshot().activity_count, 0)
+
+    def test_codex_new_todo_after_report_counts_one_logical_update(self) -> None:
+        wall = FakeMonotonicClock([150.0] * 8)
+        monitor = PostReportActivityMonitor("openai", wallclock=wall)
+        monitor.observe_line(self._codex_report_item("item.started", "report"))
+        monitor.mark_report_observed(boundary_wall=100.0)
+        monitor.observe_line(self._codex_report_item("item.completed", "report"))
+        monitor.observe_line(self._codex_item("item.started", "todo_list", "fresh"))
+        for _ in range(4):
+            monitor.observe_line(self._codex_item("item.updated", "todo_list", "fresh"))
+        monitor.observe_line(self._codex_item("item.completed", "todo_list", "fresh"))
+        snapshot = monitor.snapshot()
+        self.assertTrue(snapshot.violation)
+        self.assertEqual(snapshot.activity_kind, "state_update")
+        self.assertEqual(snapshot.activity_count, 1)
+
+    def test_codex_tool_after_report_uses_causal_order_not_clock(self) -> None:
+        wall = FakeMonotonicClock([50.0] * 3)
+        monitor = PostReportActivityMonitor("openai", wallclock=wall)
+        monitor.observe_line(self._codex_report_item("item.started", "report"))
+        monitor.observe_line(self._codex_report_item("item.completed", "report"))
+        monitor.observe_line(
+            self._codex_item("item.started", "command_execution", "fresh")
+        )
+        monitor.mark_report_observed(boundary_wall=100.0)
+        snapshot = monitor.snapshot()
+        self.assertTrue(snapshot.violation)
+        self.assertEqual(snapshot.activity_kind, "tool_call")
+        self.assertEqual(snapshot.activity_count, 1)
 
     def test_delayed_claude_report_tool_start_uses_provider_timestamp(self) -> None:
         # The report command started before persistence but the reader did not
@@ -8169,6 +8373,91 @@ class RunStreamingPostReportTests(unittest.TestCase):
         # dispatch can overlap an unfinalized process.
         self.assertTrue(pids)
         self.assertIsNone(read_process_node(pids[0]))
+
+    @unittest.skipUnless(
+        sys.platform == "linux" and hasattr(os, "killpg"),
+        "verified process-tree teardown requires Linux",
+    )
+    def test_escaped_descendant_refusal_records_exact_redacted_identity(self):
+        escaped_pid = 0
+        escaped_birth_id = ""
+        token = "escaped-token-canary"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child_pid_path = root / "child.pid"
+            report_path = root / "reported"
+            script = root / "cmd.py"
+            script.write_text(
+                "import os, pathlib, subprocess, sys, time\n"
+                "child = subprocess.Popen(\n"
+                "    [sys.executable, '-c', 'import time; time.sleep(60)',\n"
+                "     'VIBE_LOOP_FENCING_TOKEN=escaped-token-canary'],\n"
+                "    start_new_session=True,\n"
+                "    stdout=subprocess.DEVNULL,\n"
+                "    stderr=subprocess.DEVNULL,\n"
+                ")\n"
+                "pathlib.Path('child.pid').write_text(str(child.pid))\n"
+                "pathlib.Path('reported').write_text('completed')\n"
+                "time.sleep(60)\n",
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment["VIBE_LOOP_FENCING_TOKEN"] = token
+            log_path = root / "run.log"
+            try:
+                with log_path.open("w", encoding="utf-8") as log:
+                    result = run_streaming_command(
+                        f"{sys.executable} cmd.py",
+                        root,
+                        log,
+                        env=environment,
+                        reap_check=report_path.exists,
+                        reap_grace_seconds=0.05,
+                        reap_poll_seconds=0.01,
+                        post_report_closure_check=(
+                            lambda: "accepted_completed_candidate"
+                        ),
+                        provider="anthropic",
+                    )
+                escaped_pid = int(child_pid_path.read_text(encoding="utf-8"))
+                current = read_process_node(escaped_pid)
+                self.assertIsNotNone(current)
+                escaped_birth_id = current.process_birth_id
+
+                self.assertIsNotNone(result.post_report)
+                self.assertEqual(
+                    result.post_report.teardown_reason,
+                    "descendant_outside_worker_process_group",
+                )
+                self.assertFalse(result.post_report.enforced_stop)
+                self.assertEqual(len(result.post_report.escaped_descendants), 1)
+                identity = result.post_report.escaped_descendants[0]
+                self.assertEqual(identity["pid"], escaped_pid)
+                self.assertGreater(identity["ppid"], 1)
+                self.assertEqual(identity["pgid"], escaped_pid)
+                self.assertEqual(identity["sid"], escaped_pid)
+                self.assertTrue(identity["comm"])
+                self.assertIn("<redacted>", identity["cmdline"])
+                self.assertNotIn(token, identity["cmdline"])
+                self.assertTrue(identity["state"])
+                self.assertNotIn(identity["state"], {"Z", "X", "x"})
+                self.assertEqual(identity["process_birth_id"], escaped_birth_id)
+            finally:
+                if escaped_pid:
+                    current = read_process_node(escaped_pid)
+                    if (
+                        current is not None
+                        and current.process_birth_id == escaped_birth_id
+                    ):
+                        os.kill(escaped_pid, signal.SIGTERM)
+                        deadline = time.monotonic() + 2
+                        while time.monotonic() < deadline:
+                            current = read_process_node(escaped_pid)
+                            if current is None or current.state in {"Z", "X", "x"}:
+                                break
+                            time.sleep(0.01)
+                        else:
+                            os.kill(escaped_pid, signal.SIGKILL)
 
     @unittest.skipUnless(
         sys.platform == "linux" and hasattr(os, "killpg"),
