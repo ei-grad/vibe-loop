@@ -1373,7 +1373,10 @@ def post_report_runtime_lifecycle_decision(
         return "refuse", "accepted_report_not_completed"
     if activity.teardown_reason:
         if activity.teardown_reason != "accepted_report_runtime_closure":
-            return "refuse", activity.teardown_reason
+            reason = activity.teardown_reason
+            if activity.violation:
+                reason = f"{reason}_with_post_report_activity"
+            return "refuse", reason
         if not activity.enforced_stop:
             return "refuse", "teardown_not_runtime_enforced"
         if not activity.identity_verified:
@@ -9056,6 +9059,17 @@ def terminate_verified_worker_process_group(
     if any(node.session_id != process.pid for node in group):
         return VerifiedWorkerTeardown(
             False, True, False, "process_group_contains_unowned_member"
+        )
+    if any(
+        node.process_group_id != process.pid and node.state not in {"Z", "X", "x"}
+        for node in descendants
+    ):
+        # The process-group stop cannot signal an escaped descendant, and a
+        # one-time ancestry snapshot cannot attribute children it forks and
+        # reparents during teardown. Refuse before signalling rather than claim
+        # closure from the disappearance of only the captured process.
+        return VerifiedWorkerTeardown(
+            False, True, False, "descendant_outside_worker_process_group"
         )
     owned = {node.pid: node for node in group}
     owned.update((node.pid, node) for node in descendants)

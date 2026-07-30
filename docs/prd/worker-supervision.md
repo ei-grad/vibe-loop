@@ -47,18 +47,22 @@ candidate still matches the claimed workspace. That accepted pair is the termina
 implementation contract: the supervisor promptly verifies the captured worker
 tree through birth identities, including children reparented after an
 intermediate process exits, stops the verified worker process group, and proves
-every captured process exited. A captured descendant outside that process group
-is closure evidence, not an immediate candidate refusal: closure advances only
-if that exact descendant also exits during teardown. A surviving descendant
-remains fail-closed. A nonzero exit caused by this closure may advance to
-candidate collection only when closure identity, descendant verification, and
-termination all succeeded and the run did not hit its wall-clock timeout. On
-platforms without the Linux birth-identity primitive, the supervisor retains the
-clean-exit and bounded-grace path and does not claim a verified closure. The
-runtime re-snapshots the claimed candidate after teardown and before any gate.
-An external termination, missing or mismatched candidate, unverifiable Linux
-identity or descendants, non-completed report, surviving captured process,
-teardown failure, or changed candidate remains fail-closed.
+every captured process exited. A captured live descendant outside that process
+group refuses closure before teardown: the process-group signals cannot reach
+it, and its disappearance from a one-time ancestry snapshot cannot prove that
+it did not fork an untracked child first. An already-exited zombie cannot fork
+and does not cause that refusal. When post-report activity and this closure
+failure occur together, the lifecycle reason names both while the activity and
+closure events retain their separate evidence. A nonzero exit caused by closure
+may advance to candidate collection only when closure identity, descendant
+verification, and termination all succeeded and the run did not hit its
+wall-clock timeout. On platforms without the Linux birth-identity primitive,
+the supervisor retains the clean-exit and bounded-grace path and does not claim
+a verified closure. The runtime re-snapshots the claimed candidate after
+teardown and before any gate. An external termination, missing or mismatched
+candidate, unverifiable Linux identity or descendants, non-completed report,
+surviving captured process, teardown failure, or changed candidate remains
+fail-closed.
 
 Runtime-initiated accepted-report closure is recorded separately from
 `post_report_activity` and timeout evidence. Its closed reason vocabulary,

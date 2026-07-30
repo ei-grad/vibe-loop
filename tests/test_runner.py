@@ -6955,9 +6955,7 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
     @unittest.skipUnless(
         hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
     )
-    def test_accepted_report_teardown_refuses_descendant_that_survives_group_stop(
-        self,
-    ):
+    def test_accepted_report_teardown_refuses_unowned_descendant_before_stop(self):
         proc = FakeWatchdogProcess(alive_polls=10_000)
         root = ProcessNode(
             pid=proc.pid,
@@ -6974,39 +6972,41 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
             process_birth_id="boot:child",
         )
         nodes = {root.pid: root, escaped.pid: escaped}
-        killed: list[tuple[int, int]] = []
+        terminate_calls = 0
 
         def terminate_group(*args, **kwargs) -> None:
-            nodes.pop(root.pid)
+            nonlocal terminate_calls
+            terminate_calls += 1
+            nodes.pop(escaped.pid)
+            nodes[escaped.pid + 1] = ProcessNode(
+                pid=escaped.pid + 1,
+                parent_pid=1,
+                process_group_id=escaped.process_group_id,
+                session_id=escaped.session_id,
+                process_birth_id="boot:late-child",
+            )
 
-        with (
-            patch.object(
-                runner_module,
-                "terminate_worker_process_group",
-                side_effect=terminate_group,
-            ),
-            patch.object(
-                runner_module.os,
-                "killpg",
-                lambda pid, sig: killed.append((pid, sig)),
-            ),
+        with patch.object(
+            runner_module,
+            "terminate_worker_process_group",
+            side_effect=terminate_group,
         ):
             result = terminate_verified_worker_process_group(
                 proc,
                 StringIO(),
                 expected_birth_id=root.process_birth_id,
-                sigkill_after_seconds=0.001,
                 process_table=lambda: nodes,
                 process_node=nodes.get,
             )
 
         self.assertFalse(result.terminated)
         self.assertTrue(result.identity_verified)
-        self.assertTrue(result.descendants_verified)
-        self.assertEqual(result.reason, "verified_processes_remain")
-        self.assertEqual(killed, [(proc.pid, signal.SIGKILL)])
+        self.assertFalse(result.descendants_verified)
+        self.assertEqual(result.reason, "descendant_outside_worker_process_group")
+        self.assertEqual(terminate_calls, 0)
+        self.assertNotIn(escaped.pid + 1, nodes)
 
-    def test_accepted_report_teardown_accepts_escaped_descendant_that_exits(self):
+    def test_accepted_report_teardown_ignores_exited_out_of_group_descendant(self):
         proc = FakeWatchdogProcess(alive_polls=10_000)
         root = ProcessNode(
             pid=proc.pid,
@@ -7015,14 +7015,15 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
             session_id=proc.pid,
             process_birth_id="boot:root",
         )
-        escaped = ProcessNode(
+        exited = ProcessNode(
             pid=proc.pid + 1,
             parent_pid=proc.pid,
             process_group_id=proc.pid + 1,
             session_id=proc.pid + 1,
             process_birth_id="boot:child",
+            state="Z",
         )
-        nodes = {root.pid: root, escaped.pid: escaped}
+        nodes = {root.pid: root, exited.pid: exited}
 
         def terminate_group(*args, **kwargs) -> None:
             nodes.clear()
@@ -7191,7 +7192,10 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
                 worker_report=completed,
                 activity=activity,
             ),
-            ("refuse", "process_group_contains_unowned_member"),
+            (
+                "refuse",
+                "process_group_contains_unowned_member_with_post_report_activity",
+            ),
         )
 
     @unittest.skipUnless(
@@ -7340,8 +7344,16 @@ class ClassifyPostReportActivityTests(unittest.TestCase):
         unavailable = runner_module.unavailable_usage("anthropic", "test_fixture")
         cases = (
             ("stray_tool_call_only", "tool_call", "accepted_report_runtime_closure"),
-            ("surviving_orphan_only", "", "verified_processes_remain"),
-            ("both", "tool_call", "verified_processes_remain"),
+            (
+                "surviving_orphan_only",
+                "",
+                "descendant_outside_worker_process_group",
+            ),
+            (
+                "both",
+                "tool_call",
+                "descendant_outside_worker_process_group",
+            ),
             ("neither", "", "accepted_report_runtime_closure"),
         )
 
@@ -7367,8 +7379,12 @@ class ClassifyPostReportActivityTests(unittest.TestCase):
                     activity=activity,
                 )
                 expected = (
-                    ("refuse", "verified_processes_remain")
-                    if teardown_reason == "verified_processes_remain"
+                    (
+                        "refuse",
+                        teardown_reason
+                        + ("_with_post_report_activity" if activity_kind else ""),
+                    )
+                    if teardown_reason != "accepted_report_runtime_closure"
                     else ("continue", "verified_accepted_report_runtime_closure")
                 )
                 self.assertEqual(decision, expected)
