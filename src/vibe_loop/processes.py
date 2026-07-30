@@ -26,6 +26,12 @@ class ProcessNode:
     state: str = ""
 
 
+@dataclasses.dataclass(frozen=True)
+class ProcessDetails:
+    comm: str = ""
+    cmdline: str = ""
+
+
 def boot_identity(proc_root: Path = PROC_ROOT) -> str:
     try:
         return (
@@ -96,6 +102,53 @@ def read_process_node(pid: int, *, proc_root: Path = PROC_ROOT) -> ProcessNode |
     if sys.platform != "linux" or pid <= 0:
         return None
     return _read_process_node(pid, boot_identity(proc_root), proc_root=proc_root)
+
+
+def read_process_details(
+    node: ProcessNode,
+    *,
+    proc_root: Path = PROC_ROOT,
+    max_cmdline_bytes: int = 4096,
+) -> ProcessDetails:
+    """Read diagnostics only while ``node`` still names the same process."""
+    if sys.platform != "linux" or node.pid <= 0:
+        return ProcessDetails()
+    boot_id = node.process_birth_id.partition(":")[0]
+    before = _read_process_node(node.pid, boot_id, proc_root=proc_root)
+    if not _same_process_identity(before, node):
+        return ProcessDetails()
+    try:
+        comm_bytes = (proc_root / str(node.pid) / "comm").read_bytes()
+        with (proc_root / str(node.pid) / "cmdline").open("rb") as handle:
+            cmdline_bytes = handle.read(max(0, max_cmdline_bytes) + 1)
+    except OSError:
+        return ProcessDetails()
+    after = _read_process_node(node.pid, boot_id, proc_root=proc_root)
+    if not _same_process_identity(after, node):
+        return ProcessDetails()
+    return ProcessDetails(
+        comm=comm_bytes.decode("utf-8", "replace").rstrip("\n"),
+        cmdline=cmdline_bytes[:max_cmdline_bytes]
+        .replace(b"\0", b" ")
+        .decode("utf-8", "replace")
+        .rstrip(),
+    )
+
+
+def _same_process_identity(current: ProcessNode | None, expected: ProcessNode) -> bool:
+    return current is not None and (
+        current.pid,
+        current.parent_pid,
+        current.process_group_id,
+        current.session_id,
+        current.process_birth_id,
+    ) == (
+        expected.pid,
+        expected.parent_pid,
+        expected.process_group_id,
+        expected.session_id,
+        expected.process_birth_id,
+    )
 
 
 def read_process_table(*, proc_root: Path = PROC_ROOT) -> dict[int, ProcessNode]:

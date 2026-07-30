@@ -323,6 +323,12 @@ mismatch detected), run state transitions (session observed, classified), and
 after an accepted terminal report, with the verified process-group teardown and
 its post-report duration) and `post_report_closure` events (runtime-owned
 accepted-report process-tree closure with bounded typed verification evidence).
+When closure refuses because a live descendant escaped the worker process
+group, both event payloads include up to eight identities from the exact
+refusal snapshot: PID, parent PID, process-group ID, session ID, command name,
+a 512-character command line, process state, and process birth ID. Command
+names and command lines use the worker-log fencing-token redaction before the
+persisted bound is applied.
 
 Native Claude and Codex structured envelopes also yield provider-neutral
 `agent_started`, coalesced `activity_checkpoint`, `gate_result`, `work_blocked`,

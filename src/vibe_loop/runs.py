@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import time
+from collections.abc import Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1192,6 +1193,7 @@ class RunLifecycleEvent:
         report_status: str,
         runtime_lifecycle_decision: str,
         runtime_lifecycle_reason: str,
+        escaped_descendants: Sequence[Mapping[str, Any]] = (),
     ) -> RunLifecycleEvent:
         # A worker that keeps mutating state after its accepted terminal report
         # violates the finite-worker boundary and burns quota; this record makes
@@ -1214,6 +1216,9 @@ class RunLifecycleEvent:
                 "report_status": report_status,
                 "runtime_lifecycle_decision": runtime_lifecycle_decision,
                 "runtime_lifecycle_reason": runtime_lifecycle_reason,
+                "escaped_descendants": [
+                    dict(identity) for identity in escaped_descendants[:8]
+                ],
             },
         )
 
@@ -1235,6 +1240,7 @@ class RunLifecycleEvent:
         teardown_reason: str,
         runtime_lifecycle_decision: str,
         runtime_lifecycle_reason: str,
+        escaped_descendants: Sequence[Mapping[str, Any]] = (),
     ) -> RunLifecycleEvent:
         allowed_reasons = {
             "accepted_candidate_initially_changed",
@@ -1274,6 +1280,9 @@ class RunLifecycleEvent:
                 "teardown_reason": teardown_reason,
                 "runtime_lifecycle_decision": runtime_lifecycle_decision,
                 "runtime_lifecycle_reason": runtime_lifecycle_reason,
+                "escaped_descendants": [
+                    dict(identity) for identity in escaped_descendants[:8]
+                ],
             },
         )
 

@@ -126,6 +126,7 @@ from vibe_loop.orchestration import (
 from vibe_loop.processes import (
     ProcessNode,
     collect_owned_descendants,
+    read_process_details,
     read_process_node,
     read_process_table,
 )
@@ -1348,6 +1349,7 @@ class PostReportActivity:
     descendants_verified: bool = False
     teardown_process_count: int = 0
     teardown_seconds: float = 0.0
+    escaped_descendants: tuple[dict[str, object], ...] = ()
 
     @property
     def violation(self) -> bool:
@@ -3387,6 +3389,9 @@ class VibeRunner:
                             ),
                             runtime_lifecycle_decision=(post_report_lifecycle_decision),
                             runtime_lifecycle_reason=post_report_lifecycle_reason,
+                            escaped_descendants=(
+                                post_report_activity.escaped_descendants
+                            ),
                         )
                     )
                 if (
@@ -3413,6 +3418,9 @@ class VibeRunner:
                             teardown_reason=post_report_activity.teardown_reason,
                             runtime_lifecycle_decision=(post_report_lifecycle_decision),
                             runtime_lifecycle_reason=post_report_lifecycle_reason,
+                            escaped_descendants=(
+                                post_report_activity.escaped_descendants
+                            ),
                         )
                     )
             try:
@@ -9028,6 +9036,41 @@ class VerifiedWorkerTeardown:
     descendants_verified: bool
     reason: str
     process_count: int = 0
+    escaped_descendants: tuple[dict[str, object], ...] = ()
+
+
+ESCAPED_DESCENDANT_EVIDENCE_LIMIT = 8
+ESCAPED_DESCENDANT_CMDLINE_LIMIT = 512
+
+
+def escaped_descendant_evidence(
+    descendants: Sequence[ProcessNode],
+    *,
+    fencing_token: str = "",
+) -> tuple[dict[str, object], ...]:
+    evidence: list[dict[str, object]] = []
+    for node in descendants[:ESCAPED_DESCENDANT_EVIDENCE_LIMIT]:
+        details = read_process_details(
+            node,
+            max_cmdline_bytes=(
+                ESCAPED_DESCENDANT_CMDLINE_LIMIT + len(fencing_token) + 1
+            ),
+        )
+        comm = redact_fencing_token_text(details.comm, fencing_token)
+        cmdline = redact_fencing_token_text(details.cmdline, fencing_token)
+        evidence.append(
+            {
+                "pid": node.pid,
+                "ppid": node.parent_pid,
+                "pgid": node.process_group_id,
+                "sid": node.session_id,
+                "comm": comm,
+                "cmdline": cmdline[:ESCAPED_DESCENDANT_CMDLINE_LIMIT],
+                "state": node.state,
+                "process_birth_id": node.process_birth_id,
+            }
+        )
+    return tuple(evidence)
 
 
 def terminate_verified_worker_process_group(
@@ -9038,6 +9081,7 @@ def terminate_verified_worker_process_group(
     sigkill_after_seconds: float = 2.0,
     process_table: Callable[[], dict[int, ProcessNode]] = read_process_table,
     process_node: Callable[[int], ProcessNode | None] = read_process_node,
+    fencing_token: str = "",
 ) -> VerifiedWorkerTeardown:
     """Stop only the verified worker group and prove its captured tree exited."""
     if not expected_birth_id:
@@ -9060,16 +9104,25 @@ def terminate_verified_worker_process_group(
         return VerifiedWorkerTeardown(
             False, True, False, "process_group_contains_unowned_member"
         )
-    if any(
-        node.process_group_id != process.pid and node.state not in {"Z", "X", "x"}
+    escaped_descendants = [
+        node
         for node in descendants
-    ):
+        if node.process_group_id != process.pid and node.state not in {"Z", "X", "x"}
+    ]
+    if escaped_descendants:
         # The process-group stop cannot signal an escaped descendant, and a
         # one-time ancestry snapshot cannot attribute children it forks and
         # reparents during teardown. Refuse before signalling rather than claim
         # closure from the disappearance of only the captured process.
         return VerifiedWorkerTeardown(
-            False, True, False, "descendant_outside_worker_process_group"
+            False,
+            True,
+            False,
+            "descendant_outside_worker_process_group",
+            escaped_descendants=escaped_descendant_evidence(
+                escaped_descendants,
+                fencing_token=fencing_token,
+            ),
         )
     owned = {node.pid: node for node in group}
     owned.update((node.pid, node) for node in descendants)
@@ -9175,6 +9228,7 @@ class WaitOutcome:
     post_report_descendants_verified: bool = False
     post_report_teardown_process_count: int = 0
     post_report_teardown_seconds: float = 0.0
+    post_report_escaped_descendants: tuple[dict[str, object], ...] = ()
 
 
 def wait_with_reap_watchdog(
@@ -9299,6 +9353,7 @@ def wait_with_reap_watchdog(
             post_report_descendants_verified=closure_teardown.descendants_verified,
             post_report_teardown_process_count=closure_teardown.process_count,
             post_report_teardown_seconds=closure_teardown_seconds,
+            post_report_escaped_descendants=(closure_teardown.escaped_descendants),
         )
 
     def _reap_for_timeout() -> WaitOutcome:
@@ -9651,6 +9706,7 @@ def run_streaming_command(
             process,
             log,
             expected_birth_id=expected_birth_id,
+            fencing_token=fencing_token,
         ),
     )
     stdout_thread.join()
@@ -9670,6 +9726,7 @@ def run_streaming_command(
         descendants_verified=wait_outcome.post_report_descendants_verified,
         teardown_process_count=wait_outcome.post_report_teardown_process_count,
         teardown_seconds=wait_outcome.post_report_teardown_seconds,
+        escaped_descendants=wait_outcome.post_report_escaped_descendants,
     )
     return StreamingCommandResult(
         exit_code=wait_outcome.exit_code,

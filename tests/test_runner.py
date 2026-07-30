@@ -7003,8 +7003,43 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         self.assertTrue(result.identity_verified)
         self.assertFalse(result.descendants_verified)
         self.assertEqual(result.reason, "descendant_outside_worker_process_group")
+        self.assertEqual(
+            result.escaped_descendants,
+            (
+                {
+                    "pid": escaped.pid,
+                    "ppid": escaped.parent_pid,
+                    "pgid": escaped.process_group_id,
+                    "sid": escaped.session_id,
+                    "comm": "",
+                    "cmdline": "",
+                    "state": escaped.state,
+                    "process_birth_id": escaped.process_birth_id,
+                },
+            ),
+        )
         self.assertEqual(terminate_calls, 0)
         self.assertNotIn(escaped.pid + 1, nodes)
+
+    def test_escaped_descendant_evidence_is_bounded(self):
+        descendants = [
+            ProcessNode(
+                pid=5000 + offset,
+                parent_pid=4321,
+                process_group_id=5000 + offset,
+                session_id=4321,
+                process_birth_id=f"boot:{offset}",
+            )
+            for offset in range(12)
+        ]
+
+        evidence = runner_module.escaped_descendant_evidence(descendants)
+
+        self.assertEqual(len(evidence), 8)
+        self.assertEqual(
+            [identity["pid"] for identity in evidence],
+            [node.pid for node in descendants[:8]],
+        )
 
     def test_accepted_report_teardown_ignores_exited_out_of_group_descendant(self):
         proc = FakeWatchdogProcess(alive_polls=10_000)
@@ -8168,6 +8203,91 @@ class RunStreamingPostReportTests(unittest.TestCase):
         # dispatch can overlap an unfinalized process.
         self.assertTrue(pids)
         self.assertIsNone(read_process_node(pids[0]))
+
+    @unittest.skipUnless(
+        sys.platform == "linux" and hasattr(os, "killpg"),
+        "verified process-tree teardown requires Linux",
+    )
+    def test_escaped_descendant_refusal_records_exact_redacted_identity(self):
+        escaped_pid = 0
+        escaped_birth_id = ""
+        token = "escaped-token-canary"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child_pid_path = root / "child.pid"
+            report_path = root / "reported"
+            script = root / "cmd.py"
+            script.write_text(
+                "import os, pathlib, subprocess, sys, time\n"
+                "child = subprocess.Popen(\n"
+                "    [sys.executable, '-c', 'import time; time.sleep(60)',\n"
+                "     'VIBE_LOOP_FENCING_TOKEN=escaped-token-canary'],\n"
+                "    start_new_session=True,\n"
+                "    stdout=subprocess.DEVNULL,\n"
+                "    stderr=subprocess.DEVNULL,\n"
+                ")\n"
+                "pathlib.Path('child.pid').write_text(str(child.pid))\n"
+                "pathlib.Path('reported').write_text('completed')\n"
+                "time.sleep(60)\n",
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment["VIBE_LOOP_FENCING_TOKEN"] = token
+            log_path = root / "run.log"
+            try:
+                with log_path.open("w", encoding="utf-8") as log:
+                    result = run_streaming_command(
+                        f"{sys.executable} cmd.py",
+                        root,
+                        log,
+                        env=environment,
+                        reap_check=report_path.exists,
+                        reap_grace_seconds=0.05,
+                        reap_poll_seconds=0.01,
+                        post_report_closure_check=(
+                            lambda: "accepted_completed_candidate"
+                        ),
+                        provider="anthropic",
+                    )
+                escaped_pid = int(child_pid_path.read_text(encoding="utf-8"))
+                current = read_process_node(escaped_pid)
+                self.assertIsNotNone(current)
+                escaped_birth_id = current.process_birth_id
+
+                self.assertIsNotNone(result.post_report)
+                self.assertEqual(
+                    result.post_report.teardown_reason,
+                    "descendant_outside_worker_process_group",
+                )
+                self.assertFalse(result.post_report.enforced_stop)
+                self.assertEqual(len(result.post_report.escaped_descendants), 1)
+                identity = result.post_report.escaped_descendants[0]
+                self.assertEqual(identity["pid"], escaped_pid)
+                self.assertGreater(identity["ppid"], 1)
+                self.assertEqual(identity["pgid"], escaped_pid)
+                self.assertEqual(identity["sid"], escaped_pid)
+                self.assertTrue(identity["comm"])
+                self.assertIn("<redacted>", identity["cmdline"])
+                self.assertNotIn(token, identity["cmdline"])
+                self.assertTrue(identity["state"])
+                self.assertNotIn(identity["state"], {"Z", "X", "x"})
+                self.assertEqual(identity["process_birth_id"], escaped_birth_id)
+            finally:
+                if escaped_pid:
+                    current = read_process_node(escaped_pid)
+                    if (
+                        current is not None
+                        and current.process_birth_id == escaped_birth_id
+                    ):
+                        os.kill(escaped_pid, signal.SIGTERM)
+                        deadline = time.monotonic() + 2
+                        while time.monotonic() < deadline:
+                            current = read_process_node(escaped_pid)
+                            if current is None or current.state in {"Z", "X", "x"}:
+                                break
+                            time.sleep(0.01)
+                        else:
+                            os.kill(escaped_pid, signal.SIGKILL)
 
     @unittest.skipUnless(
         sys.platform == "linux" and hasattr(os, "killpg"),

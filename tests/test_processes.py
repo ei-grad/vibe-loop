@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import sys
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ from vibe_loop.processes import (
     collect_owned_descendants,
     process_birth_identity,
     process_group_is_live,
+    read_process_details,
     read_process_node,
     read_process_table,
 )
@@ -82,6 +84,26 @@ class ProcessTableTests(unittest.TestCase):
                 read_process_table(proc_root=root)
 
         self.assertEqual(boot_lookup.call_count, 1)
+
+    def test_reads_diagnostics_only_for_the_same_process_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fake_proc(root, {42: (7, 42, 42, 900)})
+            process_dir = root / "42"
+            (process_dir / "comm").write_text("worker\n", encoding="utf-8")
+            (process_dir / "cmdline").write_bytes(b"python\0worker.py\0--flag\0")
+            expected = node(42, 7, 42, 42, 900)
+
+            details = read_process_details(expected, proc_root=root)
+            recycled = read_process_details(
+                dataclasses.replace(expected, process_birth_id=f"{BOOT_ID}:901"),
+                proc_root=root,
+            )
+
+        self.assertEqual(details.comm, "worker")
+        self.assertEqual(details.cmdline, "python worker.py --flag")
+        self.assertEqual(recycled.comm, "")
+        self.assertEqual(recycled.cmdline, "")
 
     def test_process_group_survives_its_session_leader(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
