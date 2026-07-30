@@ -544,6 +544,7 @@ def _sanitize_post_report_stats(value: object) -> dict[str, object]:
         "accepted_report_not_completed",
         "accepted_report_runtime_closure",
         "closure_acceptance_check_failed",
+        "containment_boundary_not_empty",
         "descendant_identity_unverified",
         "descendant_outside_worker_process_group",
         "process_group_contains_unowned_member",

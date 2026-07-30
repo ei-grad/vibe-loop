@@ -45,24 +45,32 @@ In runtime-owned orchestration, the bounded-summary grace does not apply after a
 completed report whose resolved commit matches a recorded candidate and whose
 candidate still matches the claimed workspace. That accepted pair is the terminal
 implementation contract: the supervisor promptly verifies the captured worker
-tree through birth identities, including children reparented after an
-intermediate process exits, stops the verified worker process group, and proves
-every captured process exited. A captured live descendant outside that process
-group refuses closure before teardown: the process-group signals cannot reach
-it, and its disappearance from a one-time ancestry snapshot cannot prove that
-it did not fork an untracked child first. An already-exited zombie cannot fork
-and does not cause that refusal. When post-report activity and this closure
-failure occur together, the lifecycle reason names both while the activity and
-closure events retain their separate evidence. A nonzero exit caused by closure
-may advance to candidate collection only when closure identity, descendant
-verification, and termination all succeeded and the run did not hit its
-wall-clock timeout. On platforms without the Linux birth-identity primitive,
-the supervisor retains the clean-exit and bounded-grace path and does not claim
-a verified closure. The runtime re-snapshots the claimed candidate after
-teardown and before any gate. An external termination, missing or mismatched
-candidate, unverifiable Linux identity or descendants, non-completed report,
-surviving captured process, teardown failure, or changed candidate remains
-fail-closed.
+tree through birth identities. On Linux the published worker process remains a
+child subreaper for the command's lifetime. Children orphaned by intermediate
+process exits are therefore reparented to that stable root, and neither
+`setpgid` nor `setsid` can leave its enumerable ancestry boundary. Closure
+re-scans that boundary while signalling live descendants deepest-first, uses
+SIGKILL only after the bounded SIGTERM drain fails, stops the subreaper root
+only after no live descendant remains, and then proves the root exited. An
+already-exited zombie cannot fork and does not block the drain. If repeated
+scans do not converge, closure refuses with
+`containment_boundary_not_empty` and retains bounded `escaped_descendants`
+identity evidence from the final live scan. When post-report activity and this
+closure failure occur together, the lifecycle reason names both while the
+activity and closure events retain their separate evidence. A nonzero exit
+caused by closure may advance to candidate collection only when closure
+identity, descendant verification, and termination all succeeded and the run
+did not hit its wall-clock timeout. This mechanism requires Linux `prctl`
+subreaper support but does not require systemd, a user systemd manager, or
+delegated cgroup access, so it works in the boards' plain user process tree. If
+the guard cannot establish the subreaper before launching the command, it exits
+without running the worker. On platforms without the Linux birth-identity
+primitive, the supervisor retains the clean-exit and bounded-grace path and
+does not claim a verified closure. The runtime re-snapshots the claimed
+candidate after teardown and before any gate. An external termination, missing
+or mismatched candidate, unverifiable Linux identity or descendants,
+non-completed report, non-empty containment boundary, teardown failure, or
+changed candidate remains fail-closed.
 
 Runtime-initiated accepted-report closure is recorded separately from
 `post_report_activity` and timeout evidence. Its closed reason vocabulary,
@@ -323,15 +331,14 @@ Related implementation IDs: `PAR-09`, `PAR-11`, `EVAL-09`.
 run start snapshots, observed agent runtime context, workspace events (claimed,
 mismatch detected), run state transitions (session observed, classified), and
 `post_report_activity` policy violations (structured worker activity observed
-after an accepted terminal report, with the verified process-group teardown and
-its post-report duration) and `post_report_closure` events (runtime-owned
-accepted-report process-tree closure with bounded typed verification evidence).
-When closure refuses because a live descendant escaped the worker process
-group, both event payloads include up to eight identities from the exact
-refusal snapshot: PID, parent PID, process-group ID, session ID, command name,
-a 512-character command line, process state, and process birth ID. Command
-names and command lines use the worker-log fencing-token redaction before the
-persisted bound is applied.
+after an accepted terminal report, with the verified teardown and its
+post-report duration) and `post_report_closure` events (runtime-owned
+accepted-report containment closure with bounded typed verification evidence).
+When closure refuses because its boundary remains non-empty, both event
+payloads include up to eight identities from the exact final live scan: PID,
+parent PID, process-group ID, session ID, command name, a 512-character command
+line, process state, and process birth ID. Command names and command lines use
+the worker-log fencing-token redaction before the persisted bound is applied.
 
 Native Claude and Codex structured envelopes also yield provider-neutral
 `agent_started`, coalesced `activity_checkpoint`, `gate_result`, `work_blocked`,
