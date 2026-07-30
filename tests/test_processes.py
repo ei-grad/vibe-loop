@@ -105,6 +105,20 @@ class ProcessTableTests(unittest.TestCase):
         self.assertEqual(recycled.comm, "")
         self.assertEqual(recycled.cmdline, "")
 
+    def test_reads_diagnostics_after_process_metadata_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fake_proc(root, {42: (1, 84, 84, 900)})
+            process_dir = root / "42"
+            (process_dir / "comm").write_text("worker\n", encoding="utf-8")
+            (process_dir / "cmdline").write_bytes(b"python\0worker.py\0")
+            snapshot = node(42, 7, 42, 42, 900)
+
+            details = read_process_details(snapshot, proc_root=root)
+
+        self.assertEqual(details.comm, "worker")
+        self.assertEqual(details.cmdline, "python worker.py")
+
     def test_process_group_survives_its_session_leader(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

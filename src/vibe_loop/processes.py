@@ -136,18 +136,10 @@ def read_process_details(
 
 
 def _same_process_identity(current: ProcessNode | None, expected: ProcessNode) -> bool:
-    return current is not None and (
-        current.pid,
-        current.parent_pid,
-        current.process_group_id,
-        current.session_id,
-        current.process_birth_id,
-    ) == (
-        expected.pid,
-        expected.parent_pid,
-        expected.process_group_id,
-        expected.session_id,
-        expected.process_birth_id,
+    return (
+        current is not None
+        and current.pid == expected.pid
+        and current.process_birth_id == expected.process_birth_id
     )
 
 

@@ -7041,6 +7041,47 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
             [node.pid for node in descendants[:8]],
         )
 
+    @unittest.skipUnless(sys.platform == "linux", "/proc parsing is Linux-only")
+    def test_escaped_descendant_cmdline_redaction_and_character_bound(self):
+        boot_id = "11111111-2222-3333-4444-555555555555"
+        token = "a" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            boot_path = root / "sys/kernel/random"
+            boot_path.mkdir(parents=True)
+            (boot_path / "boot_id").write_text(f"{boot_id}\n", encoding="utf-8")
+            process_dir = root / "42"
+            process_dir.mkdir()
+            fields = ["S", "7", "42", "42"] + ["0"] * 15 + ["900"]
+            (process_dir / "stat").write_text(
+                "42 (worker) " + " ".join(fields) + "\n",
+                encoding="utf-8",
+            )
+            (process_dir / "comm").write_text("worker\n", encoding="utf-8")
+            (process_dir / "cmdline").write_bytes(
+                ("界" * 100 + "y" * 229 + " " + token + " " + "z" * 300).encode("utf-8")
+            )
+            escaped = ProcessNode(
+                pid=42,
+                parent_pid=7,
+                process_group_id=42,
+                session_id=42,
+                process_birth_id=f"{boot_id}:900",
+                state="S",
+            )
+
+            evidence = runner_module.escaped_descendant_evidence(
+                [escaped],
+                fencing_token=token,
+                proc_root=root,
+            )
+
+        cmdline = evidence[0]["cmdline"]
+        self.assertEqual(len(cmdline), runner_module.ESCAPED_DESCENDANT_CMDLINE_LIMIT)
+        self.assertIn("<redacted>", cmdline)
+        self.assertNotIn(token, cmdline)
+        self.assertNotIn(token[:8], cmdline)
+
     def test_accepted_report_teardown_ignores_exited_out_of_group_descendant(self):
         proc = FakeWatchdogProcess(alive_polls=10_000)
         root = ProcessNode(

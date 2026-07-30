@@ -124,6 +124,7 @@ from vibe_loop.orchestration import (
     settlement_intent,
 )
 from vibe_loop.processes import (
+    PROC_ROOT,
     ProcessNode,
     collect_owned_descendants,
     read_process_details,
@@ -9041,19 +9042,25 @@ class VerifiedWorkerTeardown:
 
 ESCAPED_DESCENDANT_EVIDENCE_LIMIT = 8
 ESCAPED_DESCENDANT_CMDLINE_LIMIT = 512
+UTF8_MAX_BYTES_PER_CODE_POINT = 4
 
 
 def escaped_descendant_evidence(
     descendants: Sequence[ProcessNode],
     *,
     fencing_token: str = "",
+    proc_root: Path = PROC_ROOT,
 ) -> tuple[dict[str, object], ...]:
     evidence: list[dict[str, object]] = []
     for node in descendants[:ESCAPED_DESCENDANT_EVIDENCE_LIMIT]:
+        # Include any token that begins within the persisted character bound,
+        # even when every preceding code point uses four UTF-8 bytes.
         details = read_process_details(
             node,
+            proc_root=proc_root,
             max_cmdline_bytes=(
-                ESCAPED_DESCENDANT_CMDLINE_LIMIT + len(fencing_token) + 1
+                ESCAPED_DESCENDANT_CMDLINE_LIMIT * UTF8_MAX_BYTES_PER_CODE_POINT
+                + len(fencing_token.encode("utf-8"))
             ),
         )
         comm = redact_fencing_token_text(details.comm, fencing_token)
