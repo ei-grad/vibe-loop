@@ -2543,6 +2543,23 @@ class RuntimeGateTests(unittest.TestCase):
             cwd = Path(kwargs["cwd"])
             if cwd == self.repo:
                 return subprocess.CompletedProcess(command, 1)
+            self.assertEqual(
+                git(cwd, "branch", "--show-current").stdout.strip(),
+                "main",
+            )
+            with tempfile.TemporaryDirectory() as clone_directory:
+                cloned = git(
+                    cwd,
+                    "clone",
+                    "--quiet",
+                    "--branch",
+                    "main",
+                    "--shared",
+                    str(cwd),
+                    str(Path(clone_directory) / "clone"),
+                    check=False,
+                )
+            self.assertEqual(cloned.returncode, 0, cloned.stderr)
             isolated_probe = cwd / ".venv" / "lib" / "vibe_loop.pth"
             isolated_probe.parent.mkdir(parents=True)
             isolated_probe.write_text(f"{cwd}/src\n", encoding="utf-8")
@@ -2648,6 +2665,99 @@ class RuntimeGateTests(unittest.TestCase):
         self.assertEqual(
             stage_records[-1]["reason"],
             "gate_environment_failure:remediation_rounds_charged=0:budget=none",
+        )
+
+    def test_different_candidate_and_base_pytest_failures_charge_remediation(
+        self,
+    ) -> None:
+        candidate = self.collector.collect_derived()
+
+        def fail_different_tests(command, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            node_id = (
+                "tests/test_candidate.py::test_a"
+                if cwd == self.repo
+                else "tests/test_base.py::test_b"
+            )
+            kwargs["stdout"].write(
+                "================ short test summary info ================\n"
+                f"FAILED {node_id} - AssertionError\n"
+            )
+            return subprocess.CompletedProcess(command, 1)
+
+        result = (
+            GateRunner(
+                completion_commands=("pytest",),
+                gate_keys=("completion.commands[0]",),
+                candidate_collector=self.collector,
+                run_store=self.store,
+                run_id="run-1",
+                task_id="TASK-01",
+                log_dir=self.repo / ".vibe-loop" / "different-failure-gates",
+                executor=fail_different_tests,
+            )
+            .run(candidate)
+            .results[0]
+        )
+
+        self.assertEqual(result.failure_class, "candidate")
+        self.assertEqual(result.budget_charge, "remediation")
+        self.assertTrue(result.base_environment_failure)
+        self.assertEqual(
+            result.failure_signature,
+            ("pytest:tests/test_candidate.py::test_a",),
+        )
+        self.assertEqual(
+            result.base_failure_signature,
+            ("pytest:tests/test_base.py::test_b",),
+        )
+        gate_record = self.store.read_records()[-1]
+        self.assertEqual(
+            gate_record["failure_signature"],
+            ["pytest:tests/test_candidate.py::test_a"],
+        )
+        self.assertEqual(
+            gate_record["base_failure_signature"],
+            ["pytest:tests/test_base.py::test_b"],
+        )
+        self.assertTrue(gate_record["base_environment_failure"])
+
+    def test_base_pytest_failure_superset_is_reproduced(self) -> None:
+        candidate = self.collector.collect_derived()
+
+        def fail_overlapping_tests(command, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            node_ids = ["tests/test_shared.py::test_a"]
+            if cwd != self.repo:
+                node_ids.append("tests/test_base.py::test_b")
+            for node_id in node_ids:
+                kwargs["stdout"].write(f"FAILED {node_id} - AssertionError\n")
+            return subprocess.CompletedProcess(command, 1)
+
+        result = (
+            GateRunner(
+                completion_commands=("pytest",),
+                gate_keys=("completion.commands[0]",),
+                candidate_collector=self.collector,
+                run_store=self.store,
+                run_id="run-1",
+                task_id="TASK-01",
+                log_dir=self.repo / ".vibe-loop" / "overlapping-failure-gates",
+                executor=fail_overlapping_tests,
+            )
+            .run(candidate)
+            .results[0]
+        )
+
+        self.assertEqual(result.failure_class, "environment")
+        self.assertEqual(result.budget_charge, "none")
+        self.assertTrue(result.base_environment_failure)
+        self.assertEqual(
+            result.base_failure_signature,
+            (
+                "pytest:tests/test_base.py::test_b",
+                "pytest:tests/test_shared.py::test_a",
+            ),
         )
 
     def test_base_control_launch_failure_fails_closed_to_remediation(self) -> None:

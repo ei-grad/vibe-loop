@@ -148,18 +148,33 @@ referencing the gate's configuration key, exit class, duration, and log. Gate
 failure classification uses a control run, never stderr or exit-code heuristics:
 an ordinary command failure is rerun once in an isolated checkout of the
 candidate's persisted comparison base without linking ignored state from the
-live candidate worktree. A failure reproduced there is classified as
-environmental, charges no remediation round, and terminates the gate stage with
-that zero-budget charge recorded explicitly. A base control that passes
-classifies the candidate failure as candidate-caused and charges one bounded
-remediation round. A conclusive base result is reused within the run for the
-same command key and comparison base. If the isolated checkout or base command
-cannot execute, the classification fails closed to candidate-caused, still
-charges remediation, and remains eligible for a later control attempt.
+live candidate worktree. The checkout has a local branch named after the
+configured repository main branch at that comparison commit, so commands see a
+named branch and can clone that branch from the checkout. It remains a
+short-lived clone at a historical commit: it intentionally excludes ignored
+state and other local working-copy state, and its remote refs still describe
+the source repository rather than a freshly synchronized upstream.
+
+The runtime records bounded normalized failure signatures for both executions.
+Pytest signatures contain the failing node IDs; other commands use a bounded
+normalized output excerpt, with the exit code as the fallback for empty output.
+A candidate failure is reproduced only when its signature is a subset of the
+base signature. Reproduction classifies the gate failure as environmental,
+charges no remediation round, and terminates the gate stage with that
+zero-budget charge recorded explicitly. A passing base or a base failure with
+a different signature classifies the candidate failure as candidate-caused and
+charges one bounded remediation round. The latter also records a separate
+base-environment finding, because a broken base and a candidate defect can
+coexist. A conclusive base result and its signature are reused within the run
+for the same command key and comparison base, while classification is
+recomputed against each candidate signature. If the isolated checkout or base
+command cannot execute, the classification fails closed to candidate-caused,
+still charges remediation, and remains eligible for a later control attempt.
 Candidate mutation and other non-passing gate outcomes also retain that
-remediation charge. Gate evidence records the failure class, charged budget,
-comparison base, base-control result, and whether the control was reused; it is
-part of the review request.
+remediation charge. Gate evidence records both failure signatures, the failure
+class, charged budget, the independent base-environment finding, comparison
+base, base-control result, and whether the control was reused; it is part of the
+review request.
 
 Conflict-domain fields remain optional in the
 [normalized task contract](task-discovery.md#prd-tsk-001-normalized-task-model).
