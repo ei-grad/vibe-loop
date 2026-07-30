@@ -10538,6 +10538,127 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
 
             self.assertEqual(runner.run_store.read_records(), [])
 
+    def test_current_candidate_scope_uses_authoritative_repository_source(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [], {})
+            repo = runner.config.repo
+            plan = (
+                "# Plan\n\n"
+                "| ID | Priority | Status | Dependencies | Paths | Scope | "
+                "Acceptance | Evidence |\n"
+                "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+                "| T-1 | P0 | Next | none | src | Task | Works | Not run |\n"
+            )
+            (repo / "PLAN.md").write_text(plan, encoding="utf-8")
+            subprocess.run(["git", "add", "PLAN.md"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "add task ledger"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            with tempfile.TemporaryDirectory() as worktree_directory:
+                worktree = Path(worktree_directory) / "T-1"
+                subprocess.run(
+                    [
+                        "git",
+                        "worktree",
+                        "add",
+                        "-b",
+                        "worker/T-1",
+                        str(worktree),
+                        "HEAD",
+                    ],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                (repo / "PLAN.md").write_text(
+                    plan.replace("| src |", "| src, tests |"),
+                    encoding="utf-8",
+                )
+                (worktree / "PLAN.md").write_text(
+                    plan.replace("| src |", "| src, worker-only |"),
+                    encoding="utf-8",
+                )
+                runner.config = dataclasses.replace(
+                    runner.config,
+                    task_source=TaskSourceConfig(
+                        type="markdown-profile",
+                        profile={
+                            "kind": "markdown_table",
+                            "source_paths": ["PLAN.md"],
+                            "stable_ids": True,
+                            "fields": {
+                                "id": {"column": "ID"},
+                                "title": {"column": "Scope"},
+                                "status": {"column": "Status"},
+                                "paths": {"column": "Paths"},
+                            },
+                            "status_map": {
+                                "done": ["Done"],
+                                "runnable": ["Next"],
+                                "blocked": ["Blocked"],
+                            },
+                        },
+                    ),
+                )
+                runner._source = None
+                runner._source_resolution = None
+
+                policy = runner._current_candidate_scope_policy("T-1")
+
+        self.assertEqual(policy.paths, ("src", "tests"))
+
+    def test_current_command_scope_retains_repository_and_runtime_binding(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [], {})
+            repo = runner.config.repo
+            script = repo / "scope_source.py"
+            script.write_text(
+                "import json\n"
+                "import os\n"
+                "from pathlib import Path\n"
+                "Path('scope-probe.json').write_text(json.dumps({\n"
+                "    'cwd': str(Path.cwd()),\n"
+                "    'project': os.environ.get('LOOPYARD_PROJECT'),\n"
+                "}), encoding='utf-8')\n"
+                "print(json.dumps([{\n"
+                "    'id': 'T-1', 'title': 'Task', 'status': 'active',\n"
+                "    'paths': ['src', 'tests'],\n"
+                "    'conflict_domains_actor_kind': 'operator',\n"
+                "    'conflict_domains_actor': 'alice',\n"
+                "}]))\n",
+                encoding="utf-8",
+            )
+            runner.config = dataclasses.replace(
+                runner.config,
+                task_source=TaskSourceConfig(
+                    type="command",
+                    list_command=f"{sys.executable} scope_source.py",
+                ),
+                runtime_context=(("LOOPYARD_PROJECT", "authoritative-project"),),
+            )
+            runner._source = None
+            runner._source_resolution = None
+
+            policy = runner._current_candidate_scope_policy("T-1")
+            observation = json.loads(
+                (repo / "scope-probe.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(policy.paths, ("src", "tests"))
+        self.assertEqual(policy.actor_kind, "operator")
+        self.assertEqual(policy.actor, "alice")
+        self.assertEqual(observation["cwd"], str(repo))
+        self.assertEqual(observation["project"], "authoritative-project")
+
     def test_review_remediation_scope_drift_carries_open_ledger_findings(
         self,
     ) -> None:

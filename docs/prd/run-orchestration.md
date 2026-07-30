@@ -175,12 +175,15 @@ proceed; absence cannot silently pass as an enforced scope check or turn an
 optional task-source field into a late runtime requirement.
 
 At each scope-check boundary for a known claim-time domain set, the runtime
-probes the current task domains. A failed probe retains the snapshot instead of
-turning optional task metadata into a late runtime dependency; an unknown
-snapshot skips the probe because no current set can safely widen unknown
-authority. The runtime may replace a known snapshot only when the current set
-monotonically covers it, covers the candidate, and the task source attributes
-the change to a named `operator`.
+probes the current task domains from the configured authoritative repository
+and project binding, never from the candidate worktree. This applies both to
+repository-backed sources and to command adapters, which retain the configured
+repository working directory and runtime context. A failed probe retains the
+snapshot instead of turning optional task metadata into a late runtime
+dependency; an unknown snapshot skips the probe because no current set can
+safely widen unknown authority. The runtime may replace a known snapshot only
+when the current set monotonically covers it, covers the candidate, and the
+task source attributes the change to a named `operator`.
 
 Before selecting current domains, the runtime holds the resource-scheduler
 mutex, confirms that no other live run leases the widened domains, and

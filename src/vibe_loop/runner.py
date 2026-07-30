@@ -4143,7 +4143,6 @@ class VibeRunner:
             ),
             current_scope_policy=lambda: self._current_candidate_scope_policy(
                 task.task_id,
-                provisioned_workspace.worktree,
             ),
             authorize_current_scope_policy=lambda policy: (
                 task_lock is not None
@@ -4658,17 +4657,8 @@ class VibeRunner:
     def _current_candidate_scope_policy(
         self,
         task_id: str,
-        worktree: Path,
     ) -> CandidateScopePolicy:
-        if self.source_resolution.task_source.activate_command is None:
-            candidate_source = build_task_source(
-                worktree,
-                self.source_resolution.task_source,
-                runtime_context=self.config.runtime_environment,
-            )
-            task = candidate_source.probe(task_id)
-        else:
-            task = self.source.probe(task_id)
+        task = self.source.probe(task_id)
         if task is None:
             raise ValueError(f"task source no longer contains candidate task {task_id}")
         return candidate_scope_policy_from_task(task)

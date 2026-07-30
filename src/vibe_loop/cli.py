@@ -78,6 +78,7 @@ from vibe_loop.generated_profiles import (
     generated_task_cache_report,
     read_only_generated_cache_notice,
     read_only_generated_cache_message,
+    resolve_runtime_task_source,
     runtime_task_source_report,
 )
 from vibe_loop.locks import (
@@ -1078,6 +1079,12 @@ def dispatch(args: argparse.Namespace) -> int:
         return run_until_done_exit_code(results)
 
     if args.command == "worker":
+        if args.worker_command == "candidate":
+            try:
+                config = worker_control_config(args, config)
+            except WorkerWorkspaceContextError as exc:
+                print(f"worker workspace context refused: {exc}", file=sys.stderr)
+                return 2
         return dispatch_worker(args, config)
 
     if args.command == "workers":
@@ -2605,12 +2612,12 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
             claim = active.workspace
 
             def current_scope_policy() -> CandidateScopePolicy:
-                candidate_source = build_task_source(
-                    claim.worktree,
-                    config.task_source,
+                authoritative_source = build_task_source(
+                    config.repo,
+                    resolve_runtime_task_source(config).task_source,
                     runtime_context=config.runtime_environment,
                 )
-                current_task = candidate_source.probe(task_id)
+                current_task = authoritative_source.probe(task_id)
                 if current_task is None:
                     raise ValueError(
                         f"task source no longer contains candidate task {task_id}"

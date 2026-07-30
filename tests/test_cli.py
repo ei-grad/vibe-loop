@@ -5700,6 +5700,250 @@ class CliTests(unittest.TestCase):
         self.assertNotIn(fencing_token, rendered_wrong)
         self.assertNotIn(wrong_token, rendered_wrong)
 
+    def test_worker_candidate_uses_primary_repository_task_source(self) -> None:
+        fencing_token = "repository-candidate-fencing-canary"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            worktree = root / "worktree"
+            init_planning_repo(repo, PLAN)
+            base = git_test_head(repo)
+            add_test_worktree(repo, worktree, "worker/TASK-01")
+            (worktree / "PLAN.md").write_text(
+                PLAN.replace("TASK-01", "TASK-LOCAL"),
+                encoding="utf-8",
+            )
+            (worktree / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "PLAN.md", "candidate.txt"],
+                cwd=worktree,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "candidate"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            claim = worker_claim_payload(
+                worktree,
+                task_id="TASK-01",
+                run_id="run-1",
+                branch="worker/TASK-01",
+            )
+            claim["base_commit"] = base
+            write_active_run_lock(
+                repo,
+                "TASK-01",
+                "run-1",
+                workspace=claim,
+            )
+            lock_path = repo / ".vibe-loop" / "locks" / "TASK-01.lock" / "lock.json"
+            lock_metadata = json.loads(lock_path.read_text(encoding="utf-8"))
+            lock_metadata.update(
+                {
+                    "fencing_token": fencing_token,
+                    "resources": [],
+                    "paths": ["PLAN.md", "candidate.txt"],
+                    "conflict_domains_known": True,
+                }
+            )
+            lock_path.write_text(json.dumps(lock_metadata), encoding="utf-8")
+            environment = {
+                "VIBE_LOOP_REPO": str(worktree),
+                "VIBE_LOOP_WORKTREE": str(worktree),
+                "VIBE_LOOP_BRANCH": "worker/TASK-01",
+                "VIBE_LOOP_RUN_ID": "run-1",
+                "VIBE_LOOP_TASK_ID": "TASK-01",
+            }
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with (
+                patch.dict(os.environ, environment, clear=False),
+                patch(
+                    "vibe_loop.cli.build_task_source",
+                    wraps=cli_module.build_task_source,
+                ) as build_source,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                exit_code = main(
+                    [
+                        "worker",
+                        "candidate",
+                        "--repo",
+                        str(worktree),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--head",
+                        "HEAD",
+                        "--fencing-token",
+                        fencing_token,
+                        "--json",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertTrue(payload["recorded"])
+        self.assertEqual(payload["scope_assessment"]["fence_source"], "snapshot")
+        self.assertEqual(
+            payload["scope_assessment"]["current_domains"],
+            {"resources": [], "paths": []},
+        )
+        self.assertNotIn(
+            "current_domains_refresh_error",
+            payload["scope_assessment"],
+        )
+        build_source.assert_called_once()
+        self.assertEqual(build_source.call_args.args[0], repo)
+
+    def test_worker_candidate_uses_primary_command_source_and_widens_lease(
+        self,
+    ) -> None:
+        fencing_token = "authoritative-candidate-fencing-canary"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            worktree = root / "worktree"
+            repo.mkdir()
+            (repo / "candidate.txt").write_text("base\n", encoding="utf-8")
+            task_source = repo / "task_source.py"
+            task_source.write_text(
+                "import json\n"
+                "import os\n"
+                "from pathlib import Path\n"
+                "Path('scope-probe.json').write_text(json.dumps({\n"
+                "    'cwd': str(Path.cwd()),\n"
+                "    'project': os.environ.get('LOOPYARD_PROJECT'),\n"
+                "}), encoding='utf-8')\n"
+                "print(json.dumps([{\n"
+                "    'id': 'TASK-01', 'title': 'Task', 'status': 'active',\n"
+                "    'paths': ['src'],\n"
+                "}]))\n",
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                "[task_source]\n"
+                'type = "command"\n'
+                f"list = {toml_string(f'{sys.executable} task_source.py')}\n"
+                "[project_binding]\n"
+                'require = ["LOOPYARD_PROJECT"]\n'
+                "[project_binding.context]\n"
+                'LOOPYARD_PROJECT = "authoritative-project"\n',
+                encoding="utf-8",
+            )
+            init_worker_repo(repo)
+            base = git_test_head(repo)
+            add_test_worktree(repo, worktree, "worker/TASK-01")
+            (worktree / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "add", "candidate.txt"], cwd=worktree, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "candidate"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            head = git_test_head(worktree)
+            task_source.write_text(
+                "import json\n"
+                "import os\n"
+                "from pathlib import Path\n"
+                "Path('scope-probe.json').write_text(json.dumps({\n"
+                "    'cwd': str(Path.cwd()),\n"
+                "    'project': os.environ.get('LOOPYARD_PROJECT'),\n"
+                "}), encoding='utf-8')\n"
+                "print(json.dumps([{\n"
+                "    'id': 'TASK-01', 'title': 'Task', 'status': 'active',\n"
+                "    'paths': ['src', 'candidate.txt'],\n"
+                "    'conflict_domains_actor_kind': 'operator',\n"
+                "    'conflict_domains_actor': 'alice',\n"
+                "}]))\n",
+                encoding="utf-8",
+            )
+            claim = worker_claim_payload(
+                worktree,
+                task_id="TASK-01",
+                run_id="run-1",
+                branch="worker/TASK-01",
+            )
+            claim["base_commit"] = base
+            claim["head_commit"] = head
+            write_active_run_lock(
+                repo,
+                "TASK-01",
+                "run-1",
+                workspace=claim,
+            )
+            lock_path = repo / ".vibe-loop" / "locks" / "TASK-01.lock" / "lock.json"
+            lock_metadata = json.loads(lock_path.read_text(encoding="utf-8"))
+            lock_metadata.update(
+                {
+                    "fencing_token": fencing_token,
+                    "resources": [],
+                    "paths": ["src"],
+                    "conflict_domains_known": True,
+                }
+            )
+            lock_path.write_text(json.dumps(lock_metadata), encoding="utf-8")
+            environment = {
+                "VIBE_LOOP_REPO": str(worktree),
+                "VIBE_LOOP_WORKTREE": str(worktree),
+                "VIBE_LOOP_BRANCH": "worker/TASK-01",
+                "VIBE_LOOP_RUN_ID": "run-1",
+                "VIBE_LOOP_TASK_ID": "TASK-01",
+            }
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with (
+                patch.dict(os.environ, environment, clear=False),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                exit_code = main(
+                    [
+                        "worker",
+                        "candidate",
+                        "--repo",
+                        str(worktree),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--head",
+                        "HEAD",
+                        "--fencing-token",
+                        fencing_token,
+                        "--json",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            updated_lock = json.loads(lock_path.read_text(encoding="utf-8"))
+            observation = json.loads(
+                (repo / "scope-probe.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertTrue(payload["recorded"])
+        self.assertEqual(payload["scope_assessment"]["fence_source"], "current")
+        self.assertTrue(payload["scope_assessment"]["fence_widened_mid_run"])
+        self.assertEqual(payload["scope_assessment"]["fence_widened_by"], "alice")
+        self.assertEqual(updated_lock["paths"], ["src", "candidate.txt"])
+        self.assertEqual(updated_lock["scope_fence_source"], "current")
+        self.assertEqual(observation["cwd"], str(repo))
+        self.assertEqual(observation["project"], "authoritative-project")
+        self.assertFalse((worktree / "scope-probe.json").exists())
+
     def test_worker_claim_workspace_rejects_owner_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
