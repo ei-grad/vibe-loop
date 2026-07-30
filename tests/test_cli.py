@@ -5636,7 +5636,18 @@ class CliTests(unittest.TestCase):
                 build_source.assert_called_once()
             wrong_stdout = StringIO()
             wrong_stderr = StringIO()
-            with redirect_stdout(wrong_stdout), redirect_stderr(wrong_stderr):
+            environment = {
+                "VIBE_LOOP_REPO": str(repo),
+                "VIBE_LOOP_WORKTREE": str(repo),
+                "VIBE_LOOP_BRANCH": "worker/TASK-01",
+                "VIBE_LOOP_RUN_ID": "run-1",
+                "VIBE_LOOP_TASK_ID": "TASK-01",
+            }
+            with (
+                patch.dict(os.environ, environment, clear=False),
+                redirect_stdout(wrong_stdout),
+                redirect_stderr(wrong_stderr),
+            ):
                 wrong_exit = main(
                     [
                         "worker",
@@ -5750,18 +5761,11 @@ class CliTests(unittest.TestCase):
                 }
             )
             lock_path.write_text(json.dumps(lock_metadata), encoding="utf-8")
-            environment = {
-                "VIBE_LOOP_REPO": str(worktree),
-                "VIBE_LOOP_WORKTREE": str(worktree),
-                "VIBE_LOOP_BRANCH": "worker/TASK-01",
-                "VIBE_LOOP_RUN_ID": "run-1",
-                "VIBE_LOOP_TASK_ID": "TASK-01",
-            }
             stdout = StringIO()
             stderr = StringIO()
 
             with (
-                patch.dict(os.environ, environment, clear=False),
+                patch.dict(os.environ, {}, clear=True),
                 patch(
                     "vibe_loop.cli.build_task_source",
                     wraps=cli_module.build_task_source,
