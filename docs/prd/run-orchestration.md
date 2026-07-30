@@ -480,7 +480,11 @@ Every stage subprocess result must be classified once by the runtime into
 limit means provider quota exhaustion; unlike `timeout`, it does not describe a
 local wall-clock deadline. A provider limit on one route pauses that route
 without consuming the task restart budget or triggering retries on another
-route. Usage is attributed by the
+route. Runtime-owned review grants one bounded transient retry whether the
+classification comes from a failed reviewer process or a schema-valid
+`error` verdict; that allowance is independent from the malformed-output
+re-ask and review-pass budgets, and a parsed verdict supplies the session
+identity and continuation ordinal for the retry. Usage is attributed by the
 runtime to `implementation`, `initial_review`, `remediation`, or
 `targeted_closure` phases from state-machine position, keeping worker-reported
 phase as corroboration only.

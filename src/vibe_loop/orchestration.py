@@ -394,7 +394,9 @@ class ReviewProviderLimitError(ReviewExecutionError):
 
 
 class ReviewTransientProviderError(ReviewExecutionError):
-    pass
+    def __init__(self, detail: str, *, result: ReviewResult | None = None) -> None:
+        self.result = result
+        super().__init__(detail)
 
 
 class ReviewStageResultError(ReviewExecutionError):
@@ -2422,8 +2424,16 @@ class ReviewRouter:
             except ReviewTransientProviderError as exc:
                 if not transient_retry_used:
                     transient_retry_used = True
+                    previous = continuation
+                    if exc.result is not None:
+                        previous = ContinuationContext(
+                            session_id=exc.result.session_id,
+                            session_id_source=exc.result.session_id_source,
+                            continuation_ordinal=exc.result.continuation_ordinal,
+                            resumed=exc.result.continuation_resumed,
+                        )
                     continuation = self._continuation_context(
-                        request, previous=continuation
+                        request, previous=previous
                     )
                     continue
                 self._fail_stage_for_result("transient")
@@ -2735,13 +2745,20 @@ class ReviewRouter:
             ),
         )
         if result.verdict == "error":
-            self._fail_stage_for_result(result.retry_classification)
             if result.retry_classification == "provider_limit":
+                self._fail_stage_for_result(result.retry_classification)
                 raise ReviewProviderLimitError(
                     ProviderLimitSignal(marker="reviewer reported provider limit"),
                     route=str(route["command_key"]),
                     phase=request.phase,
                 )
+            if result.retry_classification == "transient":
+                raise ReviewTransientProviderError(
+                    "reviewer provider transient failure reported by "
+                    "structured verdict",
+                    result=result,
+                )
+            self._fail_stage_for_result(result.retry_classification)
             raise ReviewStageResultError(result.retry_classification)
         return result
 

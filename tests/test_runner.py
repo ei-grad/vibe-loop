@@ -64,6 +64,7 @@ from vibe_loop.orchestration import (
     ReviewFinding,
     ReviewOutputMalformed,
     ReviewRouter,
+    ReviewStageResultError,
     RunLifecycleStateMachine,
     RunStage,
     TaskSourceCompletionError,
@@ -10242,6 +10243,82 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
         self.assertIn("candidate and passed gates preserved", result.message)
         self.assertEqual(source.status, "on-hold")
         self.assertEqual(lock_manager.outcome_at_release("T-1"), "blocked")
+        self.assertEqual(candidate["head_commit"], "b" * 40)
+        self.assertEqual(gate["exit_class"], "passed")
+
+    def test_transient_reviewer_exhaustion_fails_with_preserved_candidate(
+        self,
+    ) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+
+            def fail_after_gates(**kwargs):
+                run_id = kwargs["run_id"]
+                task_id = kwargs["task"].task_id
+                runner.run_store.append_lifecycle_event(
+                    RunLifecycleEvent.candidate_recorded(
+                        run_id=run_id,
+                        task_id=task_id,
+                        payload={
+                            "branch": "vibe-loop/T-1",
+                            "worktree": str(kwargs["provisioned_workspace"].worktree),
+                            "base_main": "a" * 40,
+                            "head_commit": "b" * 40,
+                            "changed_paths": ["candidate.txt"],
+                            "fingerprint": "sha256:candidate",
+                            "source": "derived",
+                        },
+                    )
+                )
+                runner.run_store.append_lifecycle_event(
+                    RunLifecycleEvent.gate_result(
+                        run_id=run_id,
+                        task_id=task_id,
+                        payload={
+                            "config_key": "completion.commands[0]",
+                            "exit_class": "passed",
+                            "candidate_fingerprint": "sha256:candidate",
+                        },
+                    )
+                )
+                raise ReviewStageResultError(
+                    "transient",
+                    detail=(
+                        "reviewer provider transient failure reported by "
+                        "structured verdict"
+                    ),
+                )
+
+            with patch.object(
+                runner,
+                "execute_runtime_owned_lifecycle",
+                side_effect=fail_after_gates,
+            ):
+                result = self._run_task(
+                    runner,
+                    task,
+                    self._reporting_worker(runner, "completed"),
+                )
+
+            records = runner.run_store.read_records()
+            candidate = next(
+                record
+                for record in records
+                if record.get("record_type") == "candidate_recorded"
+            )
+            gate = next(
+                record
+                for record in records
+                if record.get("record_type") == "gate_result"
+            )
+
+        self.assertEqual(result.classification, "failed")
+        self.assertEqual(result.classification_source, "reviewer_transient")
+        self.assertIn("provider transient failure", result.message)
+        self.assertEqual(source.status, "on-hold")
+        self.assertEqual(lock_manager.outcome_at_release("T-1"), "failed")
         self.assertEqual(candidate["head_commit"], "b" * 40)
         self.assertEqual(gate["exit_class"], "passed")
 
