@@ -30,6 +30,7 @@ class ProcessNode:
 class ProcessDetails:
     comm: str = ""
     cmdline: str = ""
+    argv: tuple[str, ...] = ()
 
 
 def boot_identity(proc_root: Path = PROC_ROOT) -> str:
@@ -126,12 +127,17 @@ def read_process_details(
     after = _read_process_node(node.pid, boot_id, proc_root=proc_root)
     if not _same_process_identity(after, node):
         return ProcessDetails()
+    bounded_cmdline = cmdline_bytes[:max_cmdline_bytes]
     return ProcessDetails(
         comm=comm_bytes.decode("utf-8", "replace").rstrip("\n"),
-        cmdline=cmdline_bytes[:max_cmdline_bytes]
-        .replace(b"\0", b" ")
+        cmdline=bounded_cmdline.replace(b"\0", b" ")
         .decode("utf-8", "replace")
         .rstrip(),
+        argv=tuple(
+            argument.decode("utf-8", "replace")
+            for argument in bounded_cmdline.rstrip(b"\0").split(b"\0")
+            if argument
+        ),
     )
 
 

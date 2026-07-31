@@ -102,8 +102,10 @@ class ProcessTableTests(unittest.TestCase):
 
         self.assertEqual(details.comm, "worker")
         self.assertEqual(details.cmdline, "python worker.py --flag")
+        self.assertEqual(details.argv, ("python", "worker.py", "--flag"))
         self.assertEqual(recycled.comm, "")
         self.assertEqual(recycled.cmdline, "")
+        self.assertEqual(recycled.argv, ())
 
     def test_reads_diagnostics_after_process_metadata_changes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

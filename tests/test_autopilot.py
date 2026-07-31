@@ -174,6 +174,7 @@ from vibe_loop.runs import (
 )
 from vibe_loop.cli import main, render_autopilot_status, render_autopilot_stop
 from vibe_loop.processes import (
+    ProcessDetails,
     ProcessNode,
     collect_owned_descendants,
     process_birth_identity,
@@ -2413,6 +2414,11 @@ class AutopilotRunTests(unittest.TestCase):
             for record in records
             if record["record_type"] == AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE
         )
+        self.assertEqual(started["process_group_id"], os.getpgid(os.getpid()))
+        self.assertEqual(started["session_id"], os.getsid(os.getpid()))
+        self.assertEqual(
+            started["process_birth_id"], process_birth_identity(os.getpid())
+        )
         self.assertTrue(started["code_identity"]["fingerprint"].startswith("sha256:"))
 
     def test_supervisor_code_staleness_reports_runtime_commits_and_clears(
@@ -4628,6 +4634,144 @@ class AutopilotStopTests(unittest.TestCase):
             }
         )
         return config, manager, holder
+
+    def _locked_unobserved_supervisor(
+        self,
+        repo: Path,
+        *,
+        run_id: str = "autopilot-1",
+        pid: int = 4321,
+        birth_id: str = "",
+    ):
+        configured_repo(repo, [("TASK-01", "Done", "", "finished slice")])
+        config = load_config(repo)
+        manager = build_lock_manager(
+            config.repo,
+            config.state_path / "locks",
+            config.locks,
+        )
+        holder = manager.acquire_autopilot(
+            run_id=run_id,
+            metadata={"pid": pid},
+        )
+        record = {
+            "record_type": AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+            "repo": str(config.repo),
+            "run_id": run_id,
+            "pid": pid,
+            "occurred_at": "2026-05-09T00:00:00+00:00",
+        }
+        if birth_id:
+            record.update(
+                {
+                    "process_group_id": pid,
+                    "session_id": pid,
+                    "process_birth_id": birth_id,
+                    "launch_mode": "detached_posix_session",
+                }
+            )
+        RunStore(config.state_path / "runs.jsonl").append_record(record)
+        return config, manager, holder
+
+    @unittest.skipUnless(sys.platform == "linux", "verified stop requires Linux")
+    def test_stop_recovers_identity_without_parent_observed_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder = self._locked_unobserved_supervisor(
+                Path(directory)
+            )
+            signals: list[tuple[int, int]] = []
+
+            def send_signal(pidfd: int, signal_number: int) -> None:
+                signals.append((pidfd, signal_number))
+                if signal_number == signal.SIGTERM:
+                    manager.release_autopilot(
+                        run_id="autopilot-1",
+                        fencing_token=str(holder.metadata["fencing_token"]),
+                    )
+
+            result = stop_detached_autopilot(
+                config,
+                process_exists=lambda _pid: True,
+                process_group_lookup=lambda _pid: 4321,
+                session_lookup=lambda _pid: 4321,
+                birth_identity_lookup=lambda _pid: "boot-id:123",
+                pidfd_open=lambda _pid: 27,
+                pidfd_signal=send_signal,
+                pidfd_exited=lambda _pidfd: True,
+                close_fd=lambda _pidfd: None,
+                process_node=lambda pid: ProcessNode(
+                    pid=pid,
+                    parent_pid=1,
+                    process_group_id=pid,
+                    session_id=pid,
+                    process_birth_id="boot-id:123",
+                ),
+                process_details=lambda _node: ProcessDetails(
+                    argv=(
+                        sys.executable,
+                        "-m",
+                        "vibe_loop",
+                        "autopilot",
+                        "run",
+                        "--repo",
+                        str(config.repo),
+                        "--detached-reload-signal",
+                    )
+                ),
+            )
+            lock_after = manager.status(AUTOPILOT_LOCK_NAME)
+
+        self.assertTrue(result.stopped)
+        self.assertTrue(result.lock_released)
+        self.assertIsNone(lock_after)
+        self.assertEqual(
+            signals,
+            [
+                (27, signal.SIGSTOP),
+                (27, signal.SIGTERM),
+                (27, signal.SIGCONT),
+            ],
+        )
+
+    @unittest.skipUnless(sys.platform == "linux", "verified stop requires Linux")
+    def test_stop_refuses_unobserved_supervisor_with_recycled_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder = self._locked_unobserved_supervisor(
+                Path(directory),
+                birth_id="boot-id:original",
+            )
+            signals: list[tuple[int, int]] = []
+            try:
+                result = stop_detached_autopilot(
+                    config,
+                    process_exists=lambda _pid: True,
+                    process_node=lambda pid: ProcessNode(
+                        pid=pid,
+                        parent_pid=1,
+                        process_group_id=pid,
+                        session_id=pid,
+                        process_birth_id="boot-id:recycled",
+                    ),
+                    process_details=lambda _node: ProcessDetails(),
+                    pidfd_open=lambda _pid: 28,
+                    pidfd_signal=lambda pidfd, signal_number: signals.append(
+                        (pidfd, signal_number)
+                    ),
+                )
+                lock_still_held = manager.status(AUTOPILOT_LOCK_NAME) is not None
+            finally:
+                manager.release_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token=str(holder.metadata["fencing_token"]),
+                )
+
+        self.assertFalse(result.stopped)
+        self.assertEqual(
+            result.blocker,
+            "autopilot_stop_identity_unverified:detached_identity_unrecoverable",
+        )
+        self.assertEqual(signals, [])
+        self.assertTrue(lock_still_held)
 
     @unittest.skipUnless(sys.platform == "linux", "verified stop requires Linux")
     def test_stop_signals_exact_pidfd_and_verifies_lock_release(self) -> None:
