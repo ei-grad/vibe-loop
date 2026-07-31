@@ -7160,7 +7160,45 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         self.assertEqual(result.escaped_descendants[0]["pid"], survivor.pid)
 
     @unittest.skipUnless(sys.platform == "linux", "Linux process tree required")
-    def test_accepted_report_teardown_refuses_root_exit_with_live_group(self):
+    def test_accepted_report_teardown_refuses_dead_root_with_live_ancestry(self):
+        proc = FakeWatchdogProcess(alive_polls=0)
+        root = ProcessNode(
+            pid=proc.pid,
+            parent_pid=1,
+            process_group_id=proc.pid,
+            session_id=proc.pid,
+            process_birth_id="boot:root",
+            state="Z",
+        )
+        survivor = ProcessNode(
+            pid=proc.pid + 1,
+            parent_pid=proc.pid,
+            process_group_id=proc.pid + 1,
+            session_id=proc.pid + 1,
+            process_birth_id="boot:survivor",
+            state="S",
+        )
+        nodes = {root.pid: root, survivor.pid: survivor}
+
+        result = terminate_verified_worker_containment(
+            proc,
+            StringIO(),
+            expected_birth_id=root.process_birth_id,
+            process_table=lambda: nodes.copy(),
+            process_node=nodes.get,
+        )
+
+        self.assertFalse(result.terminated)
+        self.assertTrue(result.identity_verified)
+        self.assertFalse(result.descendants_verified)
+        self.assertEqual(result.reason, "containment_boundary_not_empty")
+        self.assertEqual(result.process_count, 2)
+        self.assertEqual(result.escaped_descendants[0]["pid"], survivor.pid)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux process tree required")
+    def test_accepted_report_teardown_refuses_root_exit_with_observed_descendant(
+        self,
+    ):
         proc = FakeWatchdogProcess(alive_polls=0)
         root = ProcessNode(
             pid=proc.pid,
@@ -7172,34 +7210,39 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         dead_root = dataclasses.replace(root, state="Z")
         survivor = ProcessNode(
             pid=proc.pid + 1,
-            parent_pid=1,
-            process_group_id=proc.pid,
-            session_id=proc.pid,
+            parent_pid=proc.pid,
+            process_group_id=proc.pid + 1,
+            session_id=proc.pid + 1,
             process_birth_id="boot:survivor",
             state="S",
         )
-        initial = {root.pid: root}
-        after_exit = {dead_root.pid: dead_root, survivor.pid: survivor}
-        snapshots = iter((initial, after_exit))
+        reparented_survivor = dataclasses.replace(survivor, parent_pid=1)
+        initial = {root.pid: root, survivor.pid: survivor}
+        after_exit = {
+            dead_root.pid: dead_root,
+            reparented_survivor.pid: reparented_survivor,
+        }
+        snapshots = iter((initial, initial, after_exit))
 
         def process_table() -> dict[int, ProcessNode]:
             return next(snapshots, after_exit).copy()
 
-        result = terminate_verified_worker_containment(
-            proc,
-            StringIO(),
-            expected_birth_id=root.process_birth_id,
-            sigkill_after_seconds=0.001,
-            process_table=process_table,
-            process_node=after_exit.get,
-        )
+        with patch.object(runner_module.os, "kill", return_value=None):
+            result = terminate_verified_worker_containment(
+                proc,
+                StringIO(),
+                expected_birth_id=root.process_birth_id,
+                sigkill_after_seconds=0.001,
+                process_table=process_table,
+                process_node=after_exit.get,
+            )
 
         self.assertFalse(result.terminated)
         self.assertTrue(result.identity_verified)
         self.assertFalse(result.descendants_verified)
         self.assertEqual(result.reason, "containment_boundary_not_empty")
         self.assertEqual(result.process_count, 2)
-        self.assertEqual(result.escaped_descendants[0]["pid"], survivor.pid)
+        self.assertEqual(result.escaped_descendants[0]["pid"], reparented_survivor.pid)
 
     @unittest.skipUnless(sys.platform == "linux", "Linux process tree required")
     def test_accepted_report_teardown_accepts_root_exit_during_empty_drain(self):

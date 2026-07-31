@@ -9205,26 +9205,33 @@ def terminate_verified_worker_containment(
             False, False, False, "worker_identity_unavailable"
         )
     if root.state in {"Z", "X", "x"}:
-        surviving_group = [
+        ancestry = collect_owned_descendants(table, {process.pid: expected_birth_id})
+        group_members = [
             node
             for node in table.values()
             if node.pid != process.pid
             and node.process_group_id == process.pid
             and node.session_id == process.pid
-            and node.state not in {"Z", "X", "x"}
         ]
+        surviving_boundary = list(
+            {
+                (node.pid, node.process_birth_id): node
+                for node in (*ancestry, *group_members)
+                if node.pid != process.pid and node.state not in {"Z", "X", "x"}
+            }.values()
+        )
         return VerifiedWorkerTeardown(
-            not surviving_group,
+            not surviving_boundary,
             True,
-            not surviving_group,
+            not surviving_boundary,
             (
                 "containment_boundary_not_empty"
-                if surviving_group
+                if surviving_boundary
                 else "accepted_report_runtime_closure"
             ),
-            len(surviving_group) + 1,
+            len(surviving_boundary) + 1,
             escaped_descendant_evidence(
-                surviving_group,
+                surviving_boundary,
                 fencing_token=fencing_token,
             ),
         )
@@ -9247,11 +9254,22 @@ def terminate_verified_worker_containment(
             or current_root.process_birth_id != expected_birth_id
             or current_root.state in {"Z", "X", "x"}
         ):
+            observed_members = [
+                current
+                for pid, birth_id in observed
+                if pid != process.pid
+                and (current := current_table.get(pid)) is not None
+                and current.process_birth_id == birth_id
+            ]
+            boundary_members = {
+                (node.pid, node.process_birth_id): node
+                for node in (*observed_members, *group_members)
+            }.values()
             observed.update(
-                ((node.pid, node.process_birth_id), node) for node in group_members
+                ((node.pid, node.process_birth_id), node) for node in boundary_members
             )
             return current_root, [
-                node for node in group_members if node.state not in {"Z", "X", "x"}
+                node for node in boundary_members if node.state not in {"Z", "X", "x"}
             ]
         ancestry = collect_owned_descendants(
             current_table, {process.pid: expected_birth_id}
