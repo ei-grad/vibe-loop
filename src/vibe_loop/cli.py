@@ -188,7 +188,7 @@ def package_version() -> str:
     direct_url = package_direct_url()
     if package_is_editable(direct_url):
         return editable_package_version(version)
-    git_sha = package_git_commit_sha(version)
+    git_sha = package_git_commit_sha(version, direct_url)
     if git_sha:
         return f"{version} (git {git_sha})"
     return version
@@ -208,18 +208,23 @@ def editable_package_version(version: str) -> str:
     release_tag = source_tree_has_release_tag(git_root, version)
     if release_tag is None:
         return f"{version} (editable: {git_root}, revision unknown)"
-    if release_tag:
-        return f"{version} (editable: {git_root})"
-    git_sha = git_short_commit_sha(git_root)
     dirty = source_tree_is_dirty(git_root)
-    if not git_sha or dirty is None:
+    if dirty is None:
+        return f"{version} (editable: {git_root}, revision unknown)"
+    if release_tag:
+        dirty_suffix = ", dirty" if dirty else ""
+        return f"{version} (editable: {git_root}{dirty_suffix})"
+    git_sha = git_short_commit_sha(git_root)
+    if not git_sha:
         return f"{version} (editable: {git_root}, revision unknown)"
     dirty_suffix = "-dirty" if dirty else ""
     return f"{version} (editable: {git_root}, git {git_sha}{dirty_suffix})"
 
 
-def package_git_commit_sha(version: str) -> str:
-    direct_url = package_direct_url()
+def package_git_commit_sha(
+    version: str,
+    direct_url: dict[str, object] | None,
+) -> str:
     if direct_url is None:
         return source_tree_git_commit_sha(version)
     vcs_info = direct_url.get("vcs_info")
@@ -228,9 +233,6 @@ def package_git_commit_sha(version: str) -> str:
         if requested_revision_is_release_tag(requested_revision, version):
             return ""
         return short_git_sha(str(vcs_info.get("commit_id") or ""))
-    dir_info = direct_url.get("dir_info")
-    if isinstance(dir_info, dict) and dir_info.get("editable") is True:
-        return source_tree_git_commit_sha(version)
     return ""
 
 

@@ -32,8 +32,8 @@ Editable installs identify their live source root and revision as
 suffix when tracked or untracked source changes are present, excluding runtime
 state under `.vibe-loop`. If the source root or Git state cannot be read, the
 editable annotation reports `revision unknown`. An editable source at the
-matching release tag keeps release-revision suppression and prints only its
-source-root annotation.
+matching release tag keeps release-revision suppression: a clean tree prints
+only its source-root annotation, while modified source appends `, dirty`.
 
 ## Diagnostic Commands
 

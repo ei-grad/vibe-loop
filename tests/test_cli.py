@@ -465,21 +465,26 @@ class CliTests(unittest.TestCase):
                 "dir_info": {"editable": True},
             }
         )
-        git_root = Path("/workspace/vibe-loop")
 
-        with (
-            patch("vibe_loop.cli.metadata_version", return_value="1.2.3"),
-            patch("vibe_loop.cli.metadata_distribution", return_value=distribution),
-            patch("vibe_loop.cli.find_source_git_root", return_value=git_root),
-            patch("vibe_loop.cli.source_tree_has_release_tag", return_value=True),
-            patch("vibe_loop.cli.git_short_commit_sha") as git_short_commit_sha,
-            patch("vibe_loop.cli.source_tree_is_dirty") as source_tree_is_dirty,
-        ):
-            version = cli_module.package_version()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "vibe-loop"
+            init_version_source_repo(repo)
+            subprocess.run(["git", "tag", "v1.2.3"], cwd=repo, check=True)
+            with (
+                patch("vibe_loop.cli.metadata_version", return_value="1.2.3"),
+                patch(
+                    "vibe_loop.cli.metadata_distribution",
+                    return_value=distribution,
+                ),
+                patch("vibe_loop.cli.find_source_git_root", return_value=repo),
+            ):
+                clean_version = cli_module.package_version()
+                (repo / "source.py").write_text("changed\n", encoding="utf-8")
+                dirty_version = cli_module.package_version()
 
-        self.assertEqual(version, "1.2.3 (editable: /workspace/vibe-loop)")
-        git_short_commit_sha.assert_not_called()
-        source_tree_is_dirty.assert_not_called()
+        self.assertEqual(clean_version, f"1.2.3 (editable: {repo})")
+        self.assertEqual(dirty_version, f"1.2.3 (editable: {repo}, dirty)")
+        self.assertNotEqual(clean_version, dirty_version)
 
     def test_package_version_omits_source_tree_commit_for_regular_install(
         self,
