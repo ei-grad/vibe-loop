@@ -156,8 +156,10 @@ state and other local working-copy state, and its remote refs still describe
 the source repository rather than a freshly synchronized upstream.
 
 The runtime records bounded normalized failure signatures for both executions.
-Pytest signatures contain the failing node IDs; other commands use a bounded
-normalized output excerpt, with the exit code as the fallback for empty output.
+Pytest signatures contain failed or errored node IDs; aggregate unittest
+summaries are not treated as pytest nodes. Other commands use a bounded
+normalized output excerpt with volatile timestamps and durations replaced, and
+the exit code as the fallback for empty output.
 A candidate failure is reproduced only when its signature is a subset of the
 base signature. Reproduction classifies the gate failure as environmental,
 charges no remediation round, and terminates the gate stage with that

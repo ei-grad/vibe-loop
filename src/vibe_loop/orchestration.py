@@ -81,8 +81,17 @@ GATE_FAILURE_LOG_TAIL_BYTES = 65_536
 GATE_FAILURE_EXCERPT_LINES = 20
 GATE_FAILURE_EXCERPT_CHARS = 4_096
 GATE_FAILURE_LINE_CHARS = 1_024
-PYTEST_FAILURE_LINE = re.compile(r"^FAILED\s+(.+?)(?:\s+-\s+.*)?$")
+PYTEST_OUTCOME_LINE = re.compile(r"^(?:FAILED|ERROR)\s+(?!\()(.+?)(?:\s+-\s+.*)?$")
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+VOLATILE_TIMESTAMP = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b"
+)
+VOLATILE_DURATION = re.compile(
+    r"(?<![\w.])\d+(?:\.\d+)?\s*"
+    r"(?:ns|[µu]s|ms|s|secs?|seconds?|mins?|minutes?|h|hours?)(?!\w)",
+    re.IGNORECASE,
+)
 REVIEW_VERDICTS = ("approve", "findings", "error")
 REVIEW_CONTROL_VERDICTS = ("clean", "findings", "blocked")
 REVIEW_DIAGNOSTIC_OUTPUT_CLASSIFICATIONS = frozenset(
@@ -1807,14 +1816,6 @@ class GateRunSummary:
             result.config_key
             for result in self.results
             if result.failure_class == "environment"
-        )
-
-    @property
-    def base_environment_failed_gate_keys(self) -> tuple[str, ...]:
-        return tuple(
-            result.config_key
-            for result in self.results
-            if result.base_environment_failure
         )
 
     def require_review_ready(self) -> None:
@@ -3830,13 +3831,15 @@ def _failure_signature(
     for raw_line in text.splitlines():
         line = ANSI_ESCAPE.sub("", raw_line)
         line = line.replace(worktree_text, "<worktree>")
+        line = VOLATILE_TIMESTAMP.sub("<timestamp>", line)
+        line = VOLATILE_DURATION.sub("<duration>", line)
         line = " ".join(line.split())
         if line:
             normalized_lines.append(line)
     pytest_failures = {
         match.group(1)
         for line in normalized_lines
-        if (match := PYTEST_FAILURE_LINE.fullmatch(line)) is not None
+        if (match := PYTEST_OUTCOME_LINE.fullmatch(line)) is not None
     }
     if pytest_failures:
         return tuple(f"pytest:{node_id}" for node_id in sorted(pytest_failures))

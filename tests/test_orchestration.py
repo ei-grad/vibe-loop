@@ -2760,6 +2760,114 @@ class RuntimeGateTests(unittest.TestCase):
             ),
         )
 
+    def test_pytest_collection_error_ignores_volatile_duration(self) -> None:
+        candidate = self.collector.collect_derived()
+
+        def fail_same_collection(command, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            duration = "0.31s" if cwd == self.repo else "0.28s"
+            kwargs["stdout"].write(
+                "================ short test summary info ================\n"
+                "ERROR tests/test_import.py\n"
+                f"1 error in {duration}\n"
+            )
+            return subprocess.CompletedProcess(command, 1)
+
+        result = (
+            GateRunner(
+                completion_commands=("pytest",),
+                gate_keys=("completion.commands[0]",),
+                candidate_collector=self.collector,
+                run_store=self.store,
+                run_id="run-1",
+                task_id="TASK-01",
+                log_dir=self.repo / ".vibe-loop" / "collection-error-gates",
+                executor=fail_same_collection,
+            )
+            .run(candidate)
+            .results[0]
+        )
+
+        self.assertEqual(result.failure_class, "environment")
+        self.assertEqual(result.budget_charge, "none")
+        self.assertEqual(
+            result.failure_signature,
+            ("pytest:tests/test_import.py",),
+        )
+        self.assertEqual(result.base_failure_signature, result.failure_signature)
+
+    def test_generic_failure_excerpt_normalizes_volatile_values(self) -> None:
+        candidate = self.collector.collect_derived()
+
+        def fail_same_command(command, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            timestamp, duration = (
+                ("2026-07-31T00:30:01.123Z", "0.31s")
+                if cwd == self.repo
+                else ("2026-07-31T00:30:02.456Z", "0.28s")
+            )
+            kwargs["stdout"].write(
+                f"{timestamp} service unavailable after {duration}\n"
+            )
+            return subprocess.CompletedProcess(command, 1)
+
+        result = (
+            GateRunner(
+                completion_commands=("check-service",),
+                gate_keys=("completion.commands[0]",),
+                candidate_collector=self.collector,
+                run_store=self.store,
+                run_id="run-1",
+                task_id="TASK-01",
+                log_dir=self.repo / ".vibe-loop" / "volatile-excerpt-gates",
+                executor=fail_same_command,
+            )
+            .run(candidate)
+            .results[0]
+        )
+
+        self.assertEqual(result.failure_class, "environment")
+        self.assertEqual(result.budget_charge, "none")
+        self.assertEqual(
+            result.failure_signature,
+            ("excerpt:<timestamp> service unavailable after <duration>",),
+        )
+        self.assertEqual(result.base_failure_signature, result.failure_signature)
+
+    def test_unittest_summary_is_not_a_pytest_failure_node(self) -> None:
+        candidate = self.collector.collect_derived()
+
+        def fail_different_unittest_tests(command, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            outcome = (
+                "FAIL: test_new_feature (suite.Tests.test_new_feature)"
+                if cwd == self.repo
+                else "ERROR: test_env_broken (suite.Tests.test_env_broken)"
+            )
+            kwargs["stdout"].write(f"{outcome}\nFAILED (failures=1)\n")
+            return subprocess.CompletedProcess(command, 1)
+
+        result = (
+            GateRunner(
+                completion_commands=("python -m unittest discover",),
+                gate_keys=("completion.commands[0]",),
+                candidate_collector=self.collector,
+                run_store=self.store,
+                run_id="run-1",
+                task_id="TASK-01",
+                log_dir=self.repo / ".vibe-loop" / "unittest-failure-gates",
+                executor=fail_different_unittest_tests,
+            )
+            .run(candidate)
+            .results[0]
+        )
+
+        self.assertEqual(result.failure_class, "candidate")
+        self.assertEqual(result.budget_charge, "remediation")
+        self.assertTrue(result.base_environment_failure)
+        self.assertTrue(result.failure_signature[0].startswith("excerpt:"))
+        self.assertNotEqual(result.failure_signature, result.base_failure_signature)
+
     def test_base_control_launch_failure_fails_closed_to_remediation(self) -> None:
         candidate = self.collector.collect_derived()
         base_attempts = 0
