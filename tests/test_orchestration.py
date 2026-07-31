@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -3585,6 +3586,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
             stage_machine=stage_machine,
             conflict_resolver=conflict_resolver,
             completion_fence=completion_fence,
+            verification_cache_root=Path(self.directory.name) / "verification-cache",
         )
 
     def advance_main(self, *, content: str = "main\n") -> str:
@@ -4767,11 +4769,12 @@ class RuntimeIntegrationTests(unittest.TestCase):
             commit=commit,
         )
 
-        stable_checkout = self.repo / ".vibe-loop" / "main-verification" / "repo"
+        stable_checkout = integrator._main_verification_directory() / "repo"
         self.assertTrue(first[0].passed)
         self.assertEqual(operator_build.returncode, 0)
         self.assertTrue(second[0].passed)
         self.assertTrue(stable_checkout.is_dir())
+        self.assertFalse(stable_checkout.resolve().is_relative_to(self.repo))
         self.assertEqual(
             (target / "build-script-runs").read_text(encoding="utf-8"), "1"
         )
@@ -4781,16 +4784,17 @@ class RuntimeIntegrationTests(unittest.TestCase):
         )
 
     def test_main_verification_replaces_invalid_checkout(self) -> None:
-        checkout = self.repo / ".vibe-loop" / "main-verification" / "repo"
+        integrator = self.integrator()
+        checkout = integrator._main_verification_directory() / "repo"
         checkout.mkdir(parents=True)
         (checkout / "partial-clone-state").write_text("incomplete\n", encoding="utf-8")
         commit = git(self.repo, "rev-parse", "HEAD").stdout.strip()
 
-        first = self.integrator()._run_main_checks(
+        first = integrator._run_main_checks(
             keys=("completion.commands[1]",),
             commit=commit,
         )
-        second = self.integrator()._run_main_checks(
+        second = integrator._run_main_checks(
             keys=("completion.commands[1]",),
             commit=commit,
         )
@@ -4865,20 +4869,64 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertFalse((checkout / ".vibe-loop").exists())
         self.assertFalse((Path(self.directory.name) / "outside-cache").exists())
 
-    def test_main_verification_refuses_state_directory_symlink(self) -> None:
+    def test_main_verification_refuses_cache_directory_symlink(self) -> None:
         outside = Path(self.directory.name) / "outside-verification"
         outside.mkdir()
-        verification_dir = self.repo / ".vibe-loop" / "main-verification"
+        integrator = self.integrator()
+        verification_dir = integrator._main_verification_directory()
+        verification_dir.parent.mkdir(parents=True)
         verification_dir.symlink_to(outside, target_is_directory=True)
         commit = git(self.repo, "rev-parse", "HEAD").stdout.strip()
 
-        result = self.integrator()._run_main_checks(
+        result = integrator._run_main_checks(
             keys=("completion.commands[1]",),
             commit=commit,
         )
 
         self.assertEqual(result[0].exit_class, "execution_error")
         self.assertEqual(list(outside.iterdir()), [])
+
+    @unittest.skipUnless(shutil.which("cargo"), "cargo is required")
+    def test_main_verification_does_not_inherit_source_cargo_config(self) -> None:
+        cargo_config = self.repo / ".cargo" / "config.toml"
+        cargo_config.parent.mkdir()
+        cargo_config.write_text(
+            '[alias]\nfixture = ["build", "--manifest-path", "init/Cargo.toml"]\n',
+            encoding="utf-8",
+        )
+        git(self.repo, "add", ".cargo/config.toml")
+        git(self.repo, "commit", "-m", "add array-valued cargo alias")
+        commit = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        integrator = self.integrator()
+
+        checkout, error = integrator._prepare_main_verification_checkout(commit)
+
+        self.assertEqual(error, "")
+        self.assertIsNotNone(checkout)
+        assert checkout is not None
+        self.assertFalse(checkout.resolve().is_relative_to(self.repo))
+        command = (
+            "cargo",
+            "-Zunstable-options",
+            "config",
+            "get",
+            "alias.fixture",
+        )
+        source_value = subprocess.run(
+            command,
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        checkout_value = subprocess.run(
+            command,
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        self.assertEqual(checkout_value, source_value)
 
     def test_main_verification_failure_preserves_recovered_lock_diagnostic(
         self,

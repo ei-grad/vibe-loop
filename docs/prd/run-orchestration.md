@@ -374,13 +374,16 @@ probes confirm that neither ref contains the other. If either ref contains the
 other or the ancestry relationship cannot be read, the reason is
 `main_fast_forward_environment_failed`.
 
-Main verification runs the exact target commit in the stable standalone clone
-at `.vibe-loop/main-verification/repo`, whose refs and worktree registry are
-independent of the live primary repository. Before each verification, the
-runtime hard-resets the checkout, removes checkout-owned untracked and ignored
-state, and replaces an invalid or unclean checkout before fetching the exact
-target commit and recreating links to the primary repository's current ignored
-paths. The stable checkout path lets shared build
+Main verification runs the exact target commit in a stable standalone clone
+under the user cache at
+`$XDG_CACHE_HOME/vibe-loop/main-verification/<repository-id>/repo`, falling
+back to `~/.cache` when `XDG_CACHE_HOME` is unset or relative. The clone must
+resolve outside the live primary repository, and its refs and worktree registry
+are independent of that repository. Before each verification, the runtime
+hard-resets the checkout, removes checkout-owned untracked and ignored state,
+and replaces an invalid or unclean checkout before fetching the exact target
+commit and recreating links to the primary repository's current ignored paths.
+The stable checkout path lets shared build
 outputs such as Cargo `target/` directories safely retain embedded absolute
 manifest paths across verification runs and operator builds. Shared virtual
 environments, tool caches, and downloaded artifacts likewise retain their

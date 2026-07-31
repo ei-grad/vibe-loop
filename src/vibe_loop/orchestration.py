@@ -4573,6 +4573,7 @@ class Integrator:
         completion_fence: (
             Callable[[IntegrationResult], Mapping[str, object] | None] | None
         ) = None,
+        verification_cache_root: Path | None = None,
     ) -> None:
         if max_lock_attempts < 1:
             raise ValueError("max_lock_attempts must be positive")
@@ -4595,6 +4596,7 @@ class Integrator:
         self.stage_machine = stage_machine
         self.conflict_resolver = conflict_resolver
         self.completion_fence = completion_fence
+        self.verification_cache_root = verification_cache_root
         self._retain_integration_lock = False
 
     def run(self) -> IntegrationResult:
@@ -5299,20 +5301,19 @@ class Integrator:
         self,
         commit: str,
     ) -> tuple[Path | None, str]:
-        state_dir = self.repo / ".vibe-loop"
-        verification_dir = state_dir / "main-verification"
+        verification_dir = self._main_verification_directory()
         checkout = verification_dir / "repo"
         try:
-            if state_dir.is_symlink() or verification_dir.is_symlink():
+            if verification_dir.is_symlink():
                 return (
                     None,
-                    "main verification state path must remain inside the repository",
+                    "main verification cache directory must not be a symlink",
                 )
             verification_dir.mkdir(parents=True, exist_ok=True)
-            if not verification_dir.resolve().is_relative_to(self.repo):
+            if verification_dir.resolve().is_relative_to(self.repo):
                 return (
                     None,
-                    "main verification state path must remain inside the repository",
+                    "main verification checkout must remain outside the repository",
                 )
             if checkout.is_symlink():
                 return None, "main verification checkout must not be a symlink"
@@ -5388,6 +5389,17 @@ class Integrator:
         if checked_out.returncode != 0:
             return None, self._bounded_git_output(checked_out)
         return checkout, ""
+
+    def _main_verification_directory(self) -> Path:
+        cache_root = self.verification_cache_root
+        if cache_root is None:
+            configured_cache = os.environ.get("XDG_CACHE_HOME")
+            if configured_cache and Path(configured_cache).is_absolute():
+                cache_root = Path(configured_cache)
+            else:
+                cache_root = Path.home() / ".cache"
+        repo_id = hashlib.sha256(os.fsencode(self.repo)).hexdigest()
+        return cache_root / "vibe-loop" / "main-verification" / repo_id
 
     @staticmethod
     def _discard_main_verification_checkout(checkout: Path) -> str:
