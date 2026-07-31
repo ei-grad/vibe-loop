@@ -46,14 +46,20 @@ completed report whose resolved commit matches a recorded candidate and whose
 candidate still matches the claimed workspace. That accepted pair is the terminal
 implementation contract: the supervisor promptly verifies the captured worker
 tree through birth identities. On Linux the published worker process remains a
-child subreaper for the command's lifetime. Children orphaned by intermediate
-process exits are therefore reparented to that stable root, and neither
-`setpgid` nor `setsid` can leave its enumerable ancestry boundary. Closure
-re-scans that boundary while signalling live descendants deepest-first, uses
-SIGKILL only after the bounded SIGTERM drain fails, stops the subreaper root
-only after no live descendant remains, and then proves the root exited. An
-already-exited zombie cannot fork and does not block the drain. If repeated
-scans do not converge, closure refuses with
+child subreaper while the command executes and during teardown. Children
+orphaned by intermediate process exits are therefore reparented to that stable
+root, and neither `setpgid` nor `setsid` can leave its enumerable ancestry
+boundary. If the command exits before supervisor-initiated closure, the guard
+performs the same bounded SIGTERM/SIGKILL drain of residual descendants and
+then promptly returns the command's exit status; it does not wait for detached
+descendants to finish naturally. Closure re-scans the boundary while signalling
+live descendants deepest-first, uses SIGKILL only after the bounded SIGTERM
+drain fails, stops the subreaper root only after no live descendant remains,
+and then proves the root exited. An already-exited descendant zombie cannot
+fork and does not block the drain. A dead or zombie subreaper means the
+enumerable boundary was lost and always refuses verified closure, including
+when no surviving member remains visible. If repeated scans do not converge,
+closure refuses with
 `containment_boundary_not_empty` and retains bounded `escaped_descendants`
 identity evidence from the final live scan. When post-report activity and this
 closure failure occur together, the lifecycle reason names both while the

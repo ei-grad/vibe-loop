@@ -22,6 +22,7 @@ from unittest.mock import patch
 import vibe_loop.locks as locks_module
 import vibe_loop.runner as runner_module
 import vibe_loop.tasks as tasks_module
+import vibe_loop.worker_guard as worker_guard_module
 from vibe_loop.budget import BudgetDecision
 from vibe_loop.config import (
     AgentConfig,
@@ -4298,6 +4299,74 @@ class RunnerTests(unittest.TestCase):
             node = read_process_node(child_pid)
             self.assertTrue(node is None or node.state == "Z", node)
 
+    @unittest.skipUnless(sys.platform == "linux", "Linux worker guard required")
+    def test_worker_guard_refuses_launch_when_subreaper_setup_fails(self) -> None:
+        with (
+            patch.object(worker_guard_module.os, "getppid", return_value=123),
+            patch.object(worker_guard_module.os, "read", return_value=b"\0"),
+            patch.object(worker_guard_module.os, "close"),
+            patch.object(
+                worker_guard_module, "become_child_subreaper", return_value=False
+            ),
+            patch.object(worker_guard_module, "wait_for_contained_tree") as launch,
+        ):
+            result = worker_guard_module.main(
+                ["123", "9", "exec", "--", sys.executable, "-c", "pass"]
+            )
+
+        self.assertEqual(result, worker_guard_module.GUARD_FAILURE_EXIT)
+        launch.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux worker guard required")
+    def test_worker_guard_stops_detached_descendant_before_returning_status(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            child_pid_path = Path(directory) / "child.pid"
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import pathlib, subprocess, sys\n"
+                    "child = subprocess.Popen(\n"
+                    "    [sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+                    "    start_new_session=True,\n"
+                    "    stdout=subprocess.DEVNULL,\n"
+                    "    stderr=subprocess.DEVNULL,\n"
+                    ")\n"
+                    f"pathlib.Path({str(child_pid_path)!r}).write_text("
+                    "str(child.pid), encoding='utf-8')\n"
+                    "raise SystemExit(7)\n"
+                ),
+            ]
+            probe = (
+                "import json, time\n"
+                "from vibe_loop.worker_guard import "
+                "become_child_subreaper, wait_for_contained_tree\n"
+                f"command = {command!r}\n"
+                "assert become_child_subreaper()\n"
+                "started = time.monotonic()\n"
+                "status = wait_for_contained_tree(command)\n"
+                "print(json.dumps({"
+                "'status': status, 'elapsed': time.monotonic() - started"
+                "}))\n"
+            )
+
+            completed = subprocess.run(
+                [sys.executable, "-c", probe],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            result = json.loads(completed.stdout)
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result["status"], 7)
+        self.assertLess(result["elapsed"], 2.5)
+        child = read_process_node(child_pid)
+        self.assertTrue(child is None or child.state in {"Z", "X", "x"}, child)
+
     @unittest.skipUnless(
         hasattr(os, "killpg"), "detached process groups are POSIX-only"
     )
@@ -7026,6 +7095,42 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         self.assertEqual(result.reason, "containment_boundary_not_empty")
         self.assertEqual(result.process_count, 2)
         self.assertEqual(result.escaped_descendants[0]["pid"], escaped.pid)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux process tree required")
+    def test_accepted_report_teardown_refuses_dead_root_with_live_group(self):
+        proc = FakeWatchdogProcess(alive_polls=0)
+        root = ProcessNode(
+            pid=proc.pid,
+            parent_pid=1,
+            process_group_id=proc.pid,
+            session_id=proc.pid,
+            process_birth_id="boot:root",
+            state="Z",
+        )
+        survivor = ProcessNode(
+            pid=proc.pid + 1,
+            parent_pid=1,
+            process_group_id=proc.pid,
+            session_id=proc.pid,
+            process_birth_id="boot:survivor",
+            state="S",
+        )
+        nodes = {root.pid: root, survivor.pid: survivor}
+
+        result = terminate_verified_worker_containment(
+            proc,
+            StringIO(),
+            expected_birth_id=root.process_birth_id,
+            process_table=lambda: nodes.copy(),
+            process_node=nodes.get,
+        )
+
+        self.assertFalse(result.terminated)
+        self.assertTrue(result.identity_verified)
+        self.assertFalse(result.descendants_verified)
+        self.assertEqual(result.reason, "containment_boundary_not_empty")
+        self.assertEqual(result.process_count, 2)
+        self.assertEqual(result.escaped_descendants[0]["pid"], survivor.pid)
 
     def test_escaped_descendant_evidence_is_bounded(self):
         descendants = [
