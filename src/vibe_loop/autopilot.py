@@ -62,11 +62,9 @@ from vibe_loop.orchestration import (
     task_agent_dispatch_blocker,
 )
 from vibe_loop.processes import (
-    ProcessDetails,
     ProcessNode,
     collect_owned_descendants,
     process_birth_identity,
-    read_process_details,
     read_process_node,
     read_process_table,
 )
@@ -3133,7 +3131,7 @@ def detached_autopilot_identity(
     pid: int,
     repo: Path | None = None,
     process_node: Callable[[int], ProcessNode | None] | None = None,
-    process_details: Callable[[ProcessNode], ProcessDetails] | None = None,
+    process_argv: Callable[[ProcessNode], Sequence[str]] | None = None,
 ) -> DetachedAutopilotIdentity | None:
     for record in reversed(run_store.read_records()):
         if record.get("record_type") != AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE:
@@ -3157,7 +3155,7 @@ def detached_autopilot_identity(
             process_birth_id=process_birth_id,
             record=record,
         )
-    if repo is None or process_node is None or process_details is None:
+    if repo is None or process_node is None or process_argv is None:
         return None
     started_record = next(
         (
@@ -3190,7 +3188,7 @@ def detached_autopilot_identity(
         ):
             return None
     elif not detached_autopilot_argv_matches_repo(
-        process_details(current).argv,
+        process_argv(current),
         repo,
     ):
         return None
@@ -3220,6 +3218,30 @@ def detached_autopilot_argv_matches_repo(argv: Sequence[str], repo: Path) -> boo
             and Path(process_repo).resolve() == repo.resolve()
         )
     return False
+
+
+def read_detached_autopilot_argv(
+    node: ProcessNode,
+    *,
+    max_cmdline_bytes: int = 4096,
+) -> tuple[str, ...]:
+    before = read_process_node(node.pid)
+    if before is None or before.process_birth_id != node.process_birth_id:
+        return ()
+    try:
+        with Path(f"/proc/{node.pid}/cmdline").open("rb") as handle:
+            cmdline = handle.read(max(0, max_cmdline_bytes) + 1)
+    except OSError:
+        return ()
+    after = read_process_node(node.pid)
+    if after is None or after.process_birth_id != node.process_birth_id:
+        return ()
+    bounded_cmdline = cmdline[:max_cmdline_bytes]
+    return tuple(
+        argument.decode("utf-8", "replace")
+        for argument in bounded_cmdline.rstrip(b"\0").split(b"\0")
+        if argument
+    )
 
 
 def autopilot_child_identity(
@@ -3827,7 +3849,7 @@ def reload_detached_autopilot(
     sleep: Sleep | None = None,
     monotonic: Callable[[], float] | None = None,
     process_node: Callable[[int], ProcessNode | None] | None = None,
-    process_details: Callable[[ProcessNode], ProcessDetails] | None = None,
+    process_argv: Callable[[ProcessNode], Sequence[str]] | None = None,
 ) -> AutopilotReloadResult:
     """Request and verify a configuration reload from the detached supervisor."""
 
@@ -3865,8 +3887,8 @@ def reload_detached_autopilot(
     lookup_process_node = (
         process_node if process_node is not None else read_process_node
     )
-    lookup_process_details = (
-        process_details if process_details is not None else read_process_details
+    lookup_process_argv = (
+        process_argv if process_argv is not None else read_detached_autopilot_argv
     )
     sleeper = sleep if sleep is not None else time_module.sleep
     clock = monotonic if monotonic is not None else time_module.monotonic
@@ -3927,7 +3949,7 @@ def reload_detached_autopilot(
         pid=pid,
         repo=config.repo,
         process_node=lookup_process_node,
-        process_details=lookup_process_details,
+        process_argv=lookup_process_argv,
     )
     if identity is None:
         return AutopilotReloadResult(
@@ -4135,7 +4157,7 @@ def stop_detached_autopilot(
     monotonic: Callable[[], float] | None = None,
     process_table: Callable[[], dict[int, ProcessNode]] | None = None,
     process_node: Callable[[int], ProcessNode | None] | None = None,
-    process_details: Callable[[ProcessNode], ProcessDetails] | None = None,
+    process_argv: Callable[[ProcessNode], Sequence[str]] | None = None,
 ) -> AutopilotStopResult:
     """Stop a verified detached supervisor or explicitly recover its stale lock."""
 
@@ -4172,8 +4194,8 @@ def stop_detached_autopilot(
     lookup_process_node = (
         process_node if process_node is not None else read_process_node
     )
-    lookup_process_details = (
-        process_details if process_details is not None else read_process_details
+    lookup_process_argv = (
+        process_argv if process_argv is not None else read_detached_autopilot_argv
     )
     sleeper = sleep if sleep is not None else time_module.sleep
     clock = monotonic if monotonic is not None else time_module.monotonic
@@ -4409,7 +4431,7 @@ def stop_detached_autopilot(
         pid=pid,
         repo=config.repo,
         process_node=lookup_process_node,
-        process_details=lookup_process_details,
+        process_argv=lookup_process_argv,
     )
     if identity is None:
         return AutopilotStopResult(

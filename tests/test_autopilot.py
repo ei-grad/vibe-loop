@@ -101,6 +101,7 @@ from vibe_loop.autopilot import (
     poll_runnable_count,
     recheck_interval_for_runnable,
     recheck_sleep_slices,
+    read_detached_autopilot_argv,
     reload_detached_autopilot,
     reload_autopilot_cycle_config,
     runtime_code_identity,
@@ -174,7 +175,6 @@ from vibe_loop.runs import (
 )
 from vibe_loop.cli import main, render_autopilot_status, render_autopilot_stop
 from vibe_loop.processes import (
-    ProcessDetails,
     ProcessNode,
     collect_owned_descendants,
     process_birth_identity,
@@ -4602,6 +4602,20 @@ class AutopilotRunTests(unittest.TestCase):
 
 
 class AutopilotStopTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "linux", "process argv requires Linux")
+    def test_process_argv_read_is_anchored_to_birth_identity(self) -> None:
+        current = read_process_node(os.getpid())
+        self.assertIsNotNone(current)
+        assert current is not None
+
+        argv = read_detached_autopilot_argv(current)
+        recycled = read_detached_autopilot_argv(
+            dataclasses.replace(current, process_birth_id="other-boot:1")
+        )
+
+        self.assertTrue(argv)
+        self.assertEqual(recycled, ())
+
     def _locked_detached_supervisor(
         self,
         repo: Path,
@@ -4706,17 +4720,15 @@ class AutopilotStopTests(unittest.TestCase):
                     session_id=pid,
                     process_birth_id="boot-id:123",
                 ),
-                process_details=lambda _node: ProcessDetails(
-                    argv=(
-                        sys.executable,
-                        "-m",
-                        "vibe_loop",
-                        "autopilot",
-                        "run",
-                        "--repo",
-                        str(config.repo),
-                        "--detached-reload-signal",
-                    )
+                process_argv=lambda _node: (
+                    sys.executable,
+                    "-m",
+                    "vibe_loop",
+                    "autopilot",
+                    "run",
+                    "--repo",
+                    str(config.repo),
+                    "--detached-reload-signal",
                 ),
             )
             lock_after = manager.status(AUTOPILOT_LOCK_NAME)
@@ -4752,7 +4764,7 @@ class AutopilotStopTests(unittest.TestCase):
                         session_id=pid,
                         process_birth_id="boot-id:recycled",
                     ),
-                    process_details=lambda _node: ProcessDetails(),
+                    process_argv=lambda _node: (),
                     pidfd_open=lambda _pid: 28,
                     pidfd_signal=lambda pidfd, signal_number: signals.append(
                         (pidfd, signal_number)
