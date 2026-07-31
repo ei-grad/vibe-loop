@@ -9178,7 +9178,7 @@ def escaped_descendant_evidence(
     return tuple(evidence)
 
 
-def terminate_verified_worker_process_group(
+def terminate_verified_worker_containment(
     process: subprocess.Popen,
     log: TextIO,
     *,
@@ -9188,7 +9188,7 @@ def terminate_verified_worker_process_group(
     process_node: Callable[[int], ProcessNode | None] = read_process_node,
     fencing_token: str = "",
 ) -> VerifiedWorkerTeardown:
-    """Stop only the verified worker group and prove its captured tree exited."""
+    """Drain a verified subreaper boundary and prove that it is empty."""
     if not expected_birth_id:
         return VerifiedWorkerTeardown(
             False, False, False, "worker_identity_unavailable"
@@ -9202,120 +9202,186 @@ def terminate_verified_worker_process_group(
         or root.session_id != process.pid
     ):
         return VerifiedWorkerTeardown(False, False, False, "worker_identity_mismatch")
-
-    descendants = collect_owned_descendants(table, {process.pid: expected_birth_id})
-    group = [node for node in table.values() if node.process_group_id == process.pid]
-    if any(node.session_id != process.pid for node in group):
-        return VerifiedWorkerTeardown(
-            False, True, False, "process_group_contains_unowned_member"
-        )
-    escaped_descendants = [
-        node
-        for node in descendants
-        if node.process_group_id != process.pid and node.state not in {"Z", "X", "x"}
-    ]
-    if escaped_descendants:
-        # The process-group stop cannot signal an escaped descendant, and a
-        # one-time ancestry snapshot cannot attribute children it forks and
-        # reparents during teardown. Refuse before signalling rather than claim
-        # closure from the disappearance of only the captured process.
+    if root.state in {"Z", "X", "x"}:
+        surviving_group = [
+            node
+            for node in table.values()
+            if node.pid != process.pid
+            and node.process_group_id == process.pid
+            and node.session_id == process.pid
+            and node.state not in {"Z", "X", "x"}
+        ]
         return VerifiedWorkerTeardown(
             False,
             True,
             False,
-            "descendant_outside_worker_process_group",
-            escaped_descendants=escaped_descendant_evidence(
-                escaped_descendants,
+            (
+                "containment_boundary_not_empty"
+                if surviving_group
+                else "worker_identity_unavailable"
+            ),
+            len(surviving_group) + 1,
+            escaped_descendant_evidence(
+                surviving_group,
                 fencing_token=fencing_token,
             ),
         )
-    owned = {node.pid: node for node in group}
-    owned.update((node.pid, node) for node in descendants)
-    for node in owned.values():
-        current = process_node(node.pid)
-        if current is None:
-            if node.pid == process.pid:
-                return VerifiedWorkerTeardown(
-                    False,
-                    False,
-                    False,
-                    "worker_identity_unavailable",
-                    len(owned),
-                )
-            continue
-        if (
-            current.process_birth_id != node.process_birth_id
-            or current.parent_pid != node.parent_pid
-            or current.process_group_id != node.process_group_id
-            or current.session_id != node.session_id
-        ):
-            return VerifiedWorkerTeardown(
-                False,
-                True,
-                False,
-                "descendant_identity_unverified",
-                len(owned),
-            )
 
-    terminate_worker_process_group(
-        process,
-        log,
-        sigkill_after_seconds=sigkill_after_seconds,
-    )
-    deadline = time.monotonic() + sigkill_after_seconds
-    remaining = list(owned.values())
-    while remaining and time.monotonic() < deadline:
-        remaining = [
+    observed = {(process.pid, root.process_birth_id): root}
+    remaining: list[ProcessNode] = []
+
+    def live_descendants() -> tuple[ProcessNode | None, list[ProcessNode]]:
+        current_table = process_table()
+        current_root = current_table.get(process.pid)
+        if (
+            current_root is None
+            or current_root.process_birth_id != expected_birth_id
+            or current_root.state in {"Z", "X", "x"}
+        ):
+            return current_root, []
+        ancestry = collect_owned_descendants(
+            current_table, {process.pid: expected_birth_id}
+        )
+        group_members = [
             node
-            for node in remaining
-            if (
-                (current := process_node(node.pid)) is not None
-                and current.process_birth_id == node.process_birth_id
-                and current.state not in {"Z", "X", "x"}
-            )
+            for node in current_table.values()
+            if node.pid != process.pid
+            and node.process_group_id == process.pid
+            and node.session_id == process.pid
         ]
-        if remaining:
+        descendants = {
+            (node.pid, node.process_birth_id): node
+            for node in (*ancestry, *group_members)
+        }.values()
+        observed.update(
+            ((node.pid, node.process_birth_id), node) for node in descendants
+        )
+        return current_root, [
+            node
+            for node in descendants
+            if node.pid != process.pid and node.state not in {"Z", "X", "x"}
+        ]
+
+    def signal_descendants(sig: int, deadline: float) -> bool:
+        nonlocal remaining
+        empty_scans = 0
+        while time.monotonic() < deadline:
+            current_root, current_remaining = live_descendants()
+            if (
+                current_root is None
+                or current_root.process_birth_id != expected_birth_id
+                or current_root.state in {"Z", "X", "x"}
+            ):
+                return False
+            remaining = current_remaining
+            if not remaining:
+                empty_scans += 1
+                if empty_scans >= 2:
+                    return True
+            else:
+                empty_scans = 0
+                for node in remaining:
+                    current = process_node(node.pid)
+                    if (
+                        current is None
+                        or current.process_birth_id != node.process_birth_id
+                        or current.state in {"Z", "X", "x"}
+                    ):
+                        continue
+                    try:
+                        os.kill(node.pid, sig)
+                    except ProcessLookupError:
+                        pass
+                    except (PermissionError, OSError):
+                        return False
             time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
-    if remaining:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except (PermissionError, OSError):
-            return VerifiedWorkerTeardown(
-                False,
-                True,
-                True,
-                "verified_processes_remain",
-                len(owned),
-            )
-        deadline = time.monotonic() + sigkill_after_seconds
-        while remaining and time.monotonic() < deadline:
-            remaining = [
-                node
-                for node in remaining
-                if (
-                    (current := process_node(node.pid)) is not None
-                    and current.process_birth_id == node.process_birth_id
-                    and current.state not in {"Z", "X", "x"}
-                )
-            ]
-            if remaining:
-                time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
-    if remaining:
+        return False
+
+    term_deadline = time.monotonic() + sigkill_after_seconds
+    drained = signal_descendants(signal.SIGTERM, term_deadline)
+    if not drained:
+        kill_deadline = time.monotonic() + sigkill_after_seconds
+        drained = signal_descendants(signal.SIGKILL, kill_deadline)
+    if not drained:
+        return VerifiedWorkerTeardown(
+            False,
+            True,
+            False,
+            "containment_boundary_not_empty",
+            len(observed),
+            escaped_descendant_evidence(
+                remaining,
+                fencing_token=fencing_token,
+            ),
+        )
+
+    current = process_node(process.pid)
+    if (
+        current is None
+        or current.process_birth_id != expected_birth_id
+        or current.state in {"Z", "X", "x"}
+    ):
+        return VerifiedWorkerTeardown(
+            False,
+            False,
+            True,
+            "worker_identity_unavailable",
+            len(observed),
+        )
+    try:
+        os.kill(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except (PermissionError, OSError):
         return VerifiedWorkerTeardown(
             False,
             True,
             True,
             "verified_processes_remain",
-            len(owned),
+            len(observed),
+        )
+    try:
+        process.wait(timeout=sigkill_after_seconds)
+    except subprocess.TimeoutExpired:
+        current = process_node(process.pid)
+        if current is not None and current.process_birth_id == expected_birth_id:
+            try:
+                os.kill(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except (PermissionError, OSError):
+                return VerifiedWorkerTeardown(
+                    False,
+                    True,
+                    True,
+                    "verified_processes_remain",
+                    len(observed),
+                )
+        try:
+            process.wait(timeout=sigkill_after_seconds)
+        except subprocess.TimeoutExpired:
+            return VerifiedWorkerTeardown(
+                False,
+                True,
+                True,
+                "verified_processes_remain",
+                len(observed),
+            )
+    final_root = process_node(process.pid)
+    if final_root is not None and final_root.process_birth_id == expected_birth_id:
+        return VerifiedWorkerTeardown(
+            False,
+            True,
+            True,
+            "verified_processes_remain",
+            len(observed),
         )
     return VerifiedWorkerTeardown(
         True,
         True,
         True,
         "accepted_report_runtime_closure",
-        len(owned),
+        len(observed),
     )
 
 
@@ -9324,8 +9390,8 @@ class WaitOutcome:
     exit_code: int
     # True when the wall-clock deadline fired and the process group was killed.
     timed_out: bool = False
-    # True when the worker's verified process group was stopped at a post-report
-    # boundary, either for structured activity or accepted runtime closure.
+    # True when post-report enforcement stopped the worker through either the
+    # activity process-group path or the accepted-report containment boundary.
     # Distinct from timed_out so an accepted report remains authoritative.
     post_report_enforced: bool = False
     post_report_teardown_reason: str = ""
@@ -9542,8 +9608,8 @@ def wait_with_reap_watchdog(
                     if closure_teardown.terminated:
                         report_status(
                             f"worker pid={process.pid} accepted completed report "
-                            "and candidate; verified runtime closure stopped its "
-                            "process group",
+                            "and candidate; verified runtime closure emptied its "
+                            "containment boundary",
                             log,
                         )
                         return _wait_outcome(process.wait())
@@ -9807,7 +9873,7 @@ def run_streaming_command(
         post_report_closure_check=(
             post_report_closure_check if expected_birth_id else None
         ),
-        post_report_teardown=lambda: terminate_verified_worker_process_group(
+        post_report_teardown=lambda: terminate_verified_worker_containment(
             process,
             log,
             expected_birth_id=expected_birth_id,

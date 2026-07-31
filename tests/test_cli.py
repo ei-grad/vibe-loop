@@ -37,7 +37,11 @@ from vibe_loop.locks import (
     LockManager,
     build_lock_manager,
 )
-from vibe_loop.processes import read_process_node
+from vibe_loop.processes import (
+    collect_owned_descendants,
+    read_process_node,
+    read_process_table,
+)
 from vibe_loop.runs import (
     AUTOPILOT_CHILD_STARTED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
@@ -10437,7 +10441,6 @@ class AutopilotCliTests(unittest.TestCase):
                 agent_pid = int(agent_payload["pid"])
                 cleanup_groups.append((agent_pid, worker_pid))
 
-                self.assertEqual(agent_payload["parent_pid"], worker_pid)
                 self.assertEqual(worker["worker_process_group_id"], worker_pid)
                 self.assertEqual(worker["worker_session_id"], worker_pid)
                 self.assertEqual(worker["pid_source"], "popen")
@@ -10450,9 +10453,16 @@ class AutopilotCliTests(unittest.TestCase):
                     read_process_node(worker_pid).parent_pid,
                     child_pid,
                 )
-                self.assertEqual(
-                    read_process_node(agent_pid).parent_pid,
-                    worker_pid,
+                worker_node = read_process_node(worker_pid)
+                self.assertIsNotNone(worker_node)
+                worker_descendants = collect_owned_descendants(
+                    read_process_table(),
+                    {worker_pid: worker_node.process_birth_id},
+                )
+                self.assertIn(agent_pid, {node.pid for node in worker_descendants})
+                self.assertIn(
+                    agent_payload["parent_pid"],
+                    {node.pid for node in worker_descendants},
                 )
                 worker_records = [
                     record

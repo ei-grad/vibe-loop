@@ -22,6 +22,7 @@ from unittest.mock import patch
 import vibe_loop.locks as locks_module
 import vibe_loop.runner as runner_module
 import vibe_loop.tasks as tasks_module
+import vibe_loop.worker_guard as worker_guard_module
 from vibe_loop.budget import BudgetDecision
 from vibe_loop.config import (
     AgentConfig,
@@ -64,6 +65,7 @@ from vibe_loop.orchestration import (
     ReviewFinding,
     ReviewOutputMalformed,
     ReviewRouter,
+    ReviewStageResultError,
     RunLifecycleStateMachine,
     RunStage,
     TaskSourceCompletionError,
@@ -124,7 +126,7 @@ from vibe_loop.runner import (
     resolve_codex_home,
     resolve_codex_rollout,
     run_streaming_command,
-    terminate_verified_worker_process_group,
+    terminate_verified_worker_containment,
     terminate_worker_process_group,
     validate_analysis_prompt_delivery,
     validate_selected_task_batch,
@@ -4297,6 +4299,74 @@ class RunnerTests(unittest.TestCase):
             node = read_process_node(child_pid)
             self.assertTrue(node is None or node.state == "Z", node)
 
+    @unittest.skipUnless(sys.platform == "linux", "Linux worker guard required")
+    def test_worker_guard_refuses_launch_when_subreaper_setup_fails(self) -> None:
+        with (
+            patch.object(worker_guard_module.os, "getppid", return_value=123),
+            patch.object(worker_guard_module.os, "read", return_value=b"\0"),
+            patch.object(worker_guard_module.os, "close"),
+            patch.object(
+                worker_guard_module, "become_child_subreaper", return_value=False
+            ),
+            patch.object(worker_guard_module, "wait_for_contained_tree") as launch,
+        ):
+            result = worker_guard_module.main(
+                ["123", "9", "exec", "--", sys.executable, "-c", "pass"]
+            )
+
+        self.assertEqual(result, worker_guard_module.GUARD_FAILURE_EXIT)
+        launch.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux worker guard required")
+    def test_worker_guard_stops_detached_descendant_before_returning_status(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            child_pid_path = Path(directory) / "child.pid"
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import pathlib, subprocess, sys\n"
+                    "child = subprocess.Popen(\n"
+                    "    [sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+                    "    start_new_session=True,\n"
+                    "    stdout=subprocess.DEVNULL,\n"
+                    "    stderr=subprocess.DEVNULL,\n"
+                    ")\n"
+                    f"pathlib.Path({str(child_pid_path)!r}).write_text("
+                    "str(child.pid), encoding='utf-8')\n"
+                    "raise SystemExit(7)\n"
+                ),
+            ]
+            probe = (
+                "import json, time\n"
+                "from vibe_loop.worker_guard import "
+                "become_child_subreaper, wait_for_contained_tree\n"
+                f"command = {command!r}\n"
+                "assert become_child_subreaper()\n"
+                "started = time.monotonic()\n"
+                "status = wait_for_contained_tree(command)\n"
+                "print(json.dumps({"
+                "'status': status, 'elapsed': time.monotonic() - started"
+                "}))\n"
+            )
+
+            completed = subprocess.run(
+                [sys.executable, "-c", probe],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            result = json.loads(completed.stdout)
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result["status"], 7)
+        self.assertLess(result["elapsed"], 2.5)
+        child = read_process_node(child_pid)
+        self.assertTrue(child is None or child.state in {"Z", "X", "x"}, child)
+
     @unittest.skipUnless(
         hasattr(os, "killpg"), "detached process groups are POSIX-only"
     )
@@ -6952,11 +7022,9 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
             killed, [(proc.pid, signal.SIGTERM), (proc.pid, signal.SIGKILL)]
         )
 
-    @unittest.skipUnless(
-        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
-    )
-    def test_accepted_report_teardown_refuses_unowned_descendant_before_stop(self):
-        proc = FakeWatchdogProcess(alive_polls=10_000)
+    @unittest.skipUnless(sys.platform == "linux", "Linux process tree required")
+    def test_accepted_report_teardown_drains_setsid_descendant(self):
+        proc = FakeWatchdogProcess(alive_polls=0)
         root = ProcessNode(
             pid=proc.pid,
             parent_pid=1,
@@ -6972,26 +7040,12 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
             process_birth_id="boot:child",
         )
         nodes = {root.pid: root, escaped.pid: escaped}
-        terminate_calls = 0
 
-        def terminate_group(*args, **kwargs) -> None:
-            nonlocal terminate_calls
-            terminate_calls += 1
-            nodes.pop(escaped.pid)
-            nodes[escaped.pid + 1] = ProcessNode(
-                pid=escaped.pid + 1,
-                parent_pid=1,
-                process_group_id=escaped.process_group_id,
-                session_id=escaped.session_id,
-                process_birth_id="boot:late-child",
-            )
+        def signal_process(pid: int, _signal: int) -> None:
+            nodes.pop(pid, None)
 
-        with patch.object(
-            runner_module,
-            "terminate_worker_process_group",
-            side_effect=terminate_group,
-        ):
-            result = terminate_verified_worker_process_group(
+        with patch.object(runner_module.os, "kill", side_effect=signal_process):
+            result = terminate_verified_worker_containment(
                 proc,
                 StringIO(),
                 expected_birth_id=root.process_birth_id,
@@ -6999,27 +7053,84 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
                 process_node=nodes.get,
             )
 
+        self.assertTrue(result.terminated)
+        self.assertTrue(result.identity_verified)
+        self.assertTrue(result.descendants_verified)
+        self.assertEqual(result.reason, "accepted_report_runtime_closure")
+        self.assertEqual(result.process_count, 2)
+        self.assertFalse(result.escaped_descendants)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux process tree required")
+    def test_accepted_report_teardown_refuses_nonconvergent_boundary(self):
+        proc = FakeWatchdogProcess(alive_polls=0)
+        root = ProcessNode(
+            pid=proc.pid,
+            parent_pid=1,
+            process_group_id=proc.pid,
+            session_id=proc.pid,
+            process_birth_id="boot:root",
+        )
+        escaped = ProcessNode(
+            pid=proc.pid + 1,
+            parent_pid=proc.pid,
+            process_group_id=proc.pid + 1,
+            session_id=proc.pid + 1,
+            process_birth_id="boot:child",
+        )
+        nodes = {root.pid: root, escaped.pid: escaped}
+
+        with patch.object(runner_module.os, "kill", return_value=None):
+            result = terminate_verified_worker_containment(
+                proc,
+                StringIO(),
+                expected_birth_id=root.process_birth_id,
+                sigkill_after_seconds=0.001,
+                process_table=lambda: nodes.copy(),
+                process_node=nodes.get,
+            )
+
         self.assertFalse(result.terminated)
         self.assertTrue(result.identity_verified)
         self.assertFalse(result.descendants_verified)
-        self.assertEqual(result.reason, "descendant_outside_worker_process_group")
-        self.assertEqual(
-            result.escaped_descendants,
-            (
-                {
-                    "pid": escaped.pid,
-                    "ppid": escaped.parent_pid,
-                    "pgid": escaped.process_group_id,
-                    "sid": escaped.session_id,
-                    "comm": "",
-                    "cmdline": "",
-                    "state": escaped.state,
-                    "process_birth_id": escaped.process_birth_id,
-                },
-            ),
+        self.assertEqual(result.reason, "containment_boundary_not_empty")
+        self.assertEqual(result.process_count, 2)
+        self.assertEqual(result.escaped_descendants[0]["pid"], escaped.pid)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux process tree required")
+    def test_accepted_report_teardown_refuses_dead_root_with_live_group(self):
+        proc = FakeWatchdogProcess(alive_polls=0)
+        root = ProcessNode(
+            pid=proc.pid,
+            parent_pid=1,
+            process_group_id=proc.pid,
+            session_id=proc.pid,
+            process_birth_id="boot:root",
+            state="Z",
         )
-        self.assertEqual(terminate_calls, 0)
-        self.assertNotIn(escaped.pid + 1, nodes)
+        survivor = ProcessNode(
+            pid=proc.pid + 1,
+            parent_pid=1,
+            process_group_id=proc.pid,
+            session_id=proc.pid,
+            process_birth_id="boot:survivor",
+            state="S",
+        )
+        nodes = {root.pid: root, survivor.pid: survivor}
+
+        result = terminate_verified_worker_containment(
+            proc,
+            StringIO(),
+            expected_birth_id=root.process_birth_id,
+            process_table=lambda: nodes.copy(),
+            process_node=nodes.get,
+        )
+
+        self.assertFalse(result.terminated)
+        self.assertTrue(result.identity_verified)
+        self.assertFalse(result.descendants_verified)
+        self.assertEqual(result.reason, "containment_boundary_not_empty")
+        self.assertEqual(result.process_count, 2)
+        self.assertEqual(result.escaped_descendants[0]["pid"], survivor.pid)
 
     def test_escaped_descendant_evidence_is_bounded(self):
         descendants = [
@@ -7083,7 +7194,7 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         self.assertNotIn(token[:8], cmdline)
 
     def test_accepted_report_teardown_ignores_exited_out_of_group_descendant(self):
-        proc = FakeWatchdogProcess(alive_polls=10_000)
+        proc = FakeWatchdogProcess(alive_polls=0)
         root = ProcessNode(
             pid=proc.pid,
             parent_pid=1,
@@ -7101,15 +7212,10 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         )
         nodes = {root.pid: root, exited.pid: exited}
 
-        def terminate_group(*args, **kwargs) -> None:
-            nodes.clear()
-
         with patch.object(
-            runner_module,
-            "terminate_worker_process_group",
-            side_effect=terminate_group,
+            runner_module.os, "kill", side_effect=lambda pid, _signal: nodes.pop(pid)
         ):
-            result = terminate_verified_worker_process_group(
+            result = terminate_verified_worker_containment(
                 proc,
                 StringIO(),
                 expected_birth_id=root.process_birth_id,
@@ -7124,7 +7230,7 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         self.assertEqual(result.process_count, 2)
 
     def test_accepted_report_teardown_owns_reparented_same_group_child(self):
-        proc = FakeWatchdogProcess(alive_polls=10_000)
+        proc = FakeWatchdogProcess(alive_polls=0)
         root = ProcessNode(
             pid=proc.pid,
             parent_pid=1,
@@ -7134,22 +7240,17 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         )
         orphan = ProcessNode(
             pid=proc.pid + 1,
-            parent_pid=1,
+            parent_pid=proc.pid,
             process_group_id=proc.pid,
             session_id=proc.pid,
             process_birth_id="boot:orphan",
         )
         nodes = {root.pid: root, orphan.pid: orphan}
 
-        def terminated_group(*args, **kwargs) -> None:
-            nodes.clear()
-
         with patch.object(
-            runner_module,
-            "terminate_worker_process_group",
-            side_effect=terminated_group,
+            runner_module.os, "kill", side_effect=lambda pid, _signal: nodes.pop(pid)
         ):
-            result = terminate_verified_worker_process_group(
+            result = terminate_verified_worker_containment(
                 proc,
                 StringIO(),
                 expected_birth_id=root.process_birth_id,
@@ -7423,12 +7524,12 @@ class ClassifyPostReportActivityTests(unittest.TestCase):
             (
                 "surviving_orphan_only",
                 "",
-                "descendant_outside_worker_process_group",
+                "containment_boundary_not_empty",
             ),
             (
                 "both",
                 "tool_call",
-                "descendant_outside_worker_process_group",
+                "containment_boundary_not_empty",
             ),
             ("neither", "", "accepted_report_runtime_closure"),
         )
@@ -8377,10 +8478,7 @@ class RunStreamingPostReportTests(unittest.TestCase):
         sys.platform == "linux" and hasattr(os, "killpg"),
         "verified process-tree teardown requires Linux",
     )
-    def test_escaped_descendant_refusal_records_exact_redacted_identity(self):
-        escaped_pid = 0
-        escaped_birth_id = ""
-        token = "escaped-token-canary"
+    def test_accepted_report_contains_setsid_descendant(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             child_pid_path = root / "child.pid"
@@ -8401,62 +8499,35 @@ class RunStreamingPostReportTests(unittest.TestCase):
                 encoding="utf-8",
             )
             environment = os.environ.copy()
-            environment["VIBE_LOOP_FENCING_TOKEN"] = token
+            environment["VIBE_LOOP_FENCING_TOKEN"] = "escaped-token-canary"
             log_path = root / "run.log"
-            try:
-                with log_path.open("w", encoding="utf-8") as log:
-                    result = run_streaming_command(
-                        f"{sys.executable} cmd.py",
-                        root,
-                        log,
-                        env=environment,
-                        reap_check=report_path.exists,
-                        reap_grace_seconds=0.05,
-                        reap_poll_seconds=0.01,
-                        post_report_closure_check=(
-                            lambda: "accepted_completed_candidate"
-                        ),
-                        provider="anthropic",
-                    )
-                escaped_pid = int(child_pid_path.read_text(encoding="utf-8"))
-                current = read_process_node(escaped_pid)
-                self.assertIsNotNone(current)
-                escaped_birth_id = current.process_birth_id
-
-                self.assertIsNotNone(result.post_report)
-                self.assertEqual(
-                    result.post_report.teardown_reason,
-                    "descendant_outside_worker_process_group",
+            with log_path.open("w", encoding="utf-8") as log:
+                result = run_streaming_command(
+                    f"{sys.executable} cmd.py",
+                    root,
+                    log,
+                    env=environment,
+                    reap_check=report_path.exists,
+                    reap_grace_seconds=0.05,
+                    reap_poll_seconds=0.01,
+                    post_report_closure_check=lambda: "accepted_completed_candidate",
+                    provider="anthropic",
                 )
-                self.assertFalse(result.post_report.enforced_stop)
-                self.assertEqual(len(result.post_report.escaped_descendants), 1)
-                identity = result.post_report.escaped_descendants[0]
-                self.assertEqual(identity["pid"], escaped_pid)
-                self.assertGreater(identity["ppid"], 1)
-                self.assertEqual(identity["pgid"], escaped_pid)
-                self.assertEqual(identity["sid"], escaped_pid)
-                self.assertTrue(identity["comm"])
-                self.assertIn("<redacted>", identity["cmdline"])
-                self.assertNotIn(token, identity["cmdline"])
-                self.assertTrue(identity["state"])
-                self.assertNotIn(identity["state"], {"Z", "X", "x"})
-                self.assertEqual(identity["process_birth_id"], escaped_birth_id)
-            finally:
-                if escaped_pid:
-                    current = read_process_node(escaped_pid)
-                    if (
-                        current is not None
-                        and current.process_birth_id == escaped_birth_id
-                    ):
-                        os.kill(escaped_pid, signal.SIGTERM)
-                        deadline = time.monotonic() + 2
-                        while time.monotonic() < deadline:
-                            current = read_process_node(escaped_pid)
-                            if current is None or current.state in {"Z", "X", "x"}:
-                                break
-                            time.sleep(0.01)
-                        else:
-                            os.kill(escaped_pid, signal.SIGKILL)
+            escaped_pid = int(child_pid_path.read_text(encoding="utf-8"))
+
+            self.assertIsNotNone(result.post_report)
+            self.assertEqual(
+                result.post_report.teardown_reason,
+                "accepted_report_runtime_closure",
+            )
+            self.assertTrue(result.post_report.enforced_stop)
+            self.assertTrue(result.post_report.descendants_verified)
+            self.assertGreaterEqual(result.post_report.teardown_process_count, 3)
+            escaped = read_process_node(escaped_pid)
+            self.assertTrue(
+                escaped is None or escaped.state in {"Z", "X", "x"},
+                "setsid descendant survived the containment drain",
+            )
 
     @unittest.skipUnless(
         sys.platform == "linux" and hasattr(os, "killpg"),
@@ -8478,14 +8549,16 @@ class RunStreamingPostReportTests(unittest.TestCase):
                 report_path = root / "reported"
                 spawner = root / "spawn_child.py"
                 spawner.write_text(
-                    "import pathlib, subprocess, sys\n"
+                    "import os, pathlib, subprocess, sys\n"
                     "child = subprocess.Popen([sys.executable, '-c', "
-                    '"import os, pathlib, time; '
+                    '"import os, pathlib, sys, time; '
+                    "original_parent = int(sys.argv[1]); "
                     "deadline = time.monotonic() + 10; "
-                    "\\nwhile os.getppid() != 1 and time.monotonic() < deadline: "
+                    "\\nwhile os.getppid() == original_parent "
+                    "and time.monotonic() < deadline: "
                     "time.sleep(0.01); "
                     "\\npathlib.Path('orphan.ready').write_text('ready'); "
-                    'time.sleep(60)"])\n'
+                    'time.sleep(60)", str(os.getpid())])\n'
                     "pathlib.Path('child.pid').write_text(str(child.pid))\n",
                     encoding="utf-8",
                 )
@@ -10531,6 +10604,82 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
         self.assertIn("candidate and passed gates preserved", result.message)
         self.assertEqual(source.status, "on-hold")
         self.assertEqual(lock_manager.outcome_at_release("T-1"), "blocked")
+        self.assertEqual(candidate["head_commit"], "b" * 40)
+        self.assertEqual(gate["exit_class"], "passed")
+
+    def test_transient_reviewer_exhaustion_fails_with_preserved_candidate(
+        self,
+    ) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+
+            def fail_after_gates(**kwargs):
+                run_id = kwargs["run_id"]
+                task_id = kwargs["task"].task_id
+                runner.run_store.append_lifecycle_event(
+                    RunLifecycleEvent.candidate_recorded(
+                        run_id=run_id,
+                        task_id=task_id,
+                        payload={
+                            "branch": "vibe-loop/T-1",
+                            "worktree": str(kwargs["provisioned_workspace"].worktree),
+                            "base_main": "a" * 40,
+                            "head_commit": "b" * 40,
+                            "changed_paths": ["candidate.txt"],
+                            "fingerprint": "sha256:candidate",
+                            "source": "derived",
+                        },
+                    )
+                )
+                runner.run_store.append_lifecycle_event(
+                    RunLifecycleEvent.gate_result(
+                        run_id=run_id,
+                        task_id=task_id,
+                        payload={
+                            "config_key": "completion.commands[0]",
+                            "exit_class": "passed",
+                            "candidate_fingerprint": "sha256:candidate",
+                        },
+                    )
+                )
+                raise ReviewStageResultError(
+                    "transient",
+                    detail=(
+                        "reviewer provider transient failure reported by "
+                        "structured verdict"
+                    ),
+                )
+
+            with patch.object(
+                runner,
+                "execute_runtime_owned_lifecycle",
+                side_effect=fail_after_gates,
+            ):
+                result = self._run_task(
+                    runner,
+                    task,
+                    self._reporting_worker(runner, "completed"),
+                )
+
+            records = runner.run_store.read_records()
+            candidate = next(
+                record
+                for record in records
+                if record.get("record_type") == "candidate_recorded"
+            )
+            gate = next(
+                record
+                for record in records
+                if record.get("record_type") == "gate_result"
+            )
+
+        self.assertEqual(result.classification, "failed")
+        self.assertEqual(result.classification_source, "reviewer_transient")
+        self.assertIn("provider transient failure", result.message)
+        self.assertEqual(source.status, "on-hold")
+        self.assertEqual(lock_manager.outcome_at_release("T-1"), "failed")
         self.assertEqual(candidate["head_commit"], "b" * 40)
         self.assertEqual(gate["exit_class"], "passed")
 

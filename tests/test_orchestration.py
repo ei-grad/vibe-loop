@@ -6342,6 +6342,21 @@ class ReviewRouterTests(unittest.TestCase):
             task_id="TASK-01",
             candidate_fingerprint=current,
         )
+        require_candidate_review_clear(
+            [
+                {
+                    **clean,
+                    "control_verdict": "blocked",
+                    "engine_verdict": "error",
+                    "output_classification": "parsed",
+                    "retry_classification": "transient",
+                },
+                clean,
+            ],
+            run_id="run-1",
+            task_id="TASK-01",
+            candidate_fingerprint=current,
+        )
         cases = (
             (
                 [{**clean, "candidate_fingerprint": stale}],
@@ -6353,6 +6368,19 @@ class ReviewRouterTests(unittest.TestCase):
             ),
             (
                 [{**clean, "control_verdict": "blocked"}, clean],
+                "review_verdict_blocked",
+            ),
+            (
+                [
+                    {
+                        **clean,
+                        "control_verdict": "blocked",
+                        "engine_verdict": "error",
+                        "output_classification": "parsed",
+                        "retry_classification": "fatal",
+                    },
+                    clean,
+                ],
                 "review_verdict_blocked",
             ),
             (
@@ -7000,6 +7028,435 @@ class ReviewRouterTests(unittest.TestCase):
         )
         self.assertIn("usually temporary", verdicts[0]["reviewer_output"]["text"])
 
+    def test_structured_transient_retries_with_parsed_session_fallback(self) -> None:
+        commands: list[str] = []
+        machine = RunLifecycleStateMachine(lambda _transition: None)
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            machine.transition(stage, reason="setup")
+        outputs = iter(
+            (
+                json.dumps(
+                    {
+                        "verdict": "error",
+                        "findings": [],
+                        "session_id": "parsed-transient-session",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 0,
+                        "retry_classification": "transient",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [],
+                        "session_id": "fresh-retry-session",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 1,
+                    }
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout=next(outputs))
+
+        router = self.router("codex", execute)
+        router.stage_machine = machine
+        result = router.review(self.gates)
+
+        self.assertTrue(result.approved)
+        self.assertEqual(machine.stage, RunStage.INTEGRATION)
+        self.assertEqual(result.attempt_ordinal, 2)
+        self.assertEqual(len(commands), 2)
+        records = self.store.read_records()
+        verdicts = [
+            record for record in records if record["record_type"] == "review_verdict"
+        ]
+        self.assertEqual(
+            [
+                (
+                    record["verdict"],
+                    record["retry_classification"],
+                    record["output_classification"],
+                    record["attempt_ordinal"],
+                    record["pass_ordinal"],
+                )
+                for record in verdicts
+            ],
+            [
+                ("blocked", "transient", "parsed", 1, 1),
+                ("clean", "ok", "parsed", 2, 1),
+            ],
+        )
+        self.assertEqual(verdicts[0]["engine_verdict"], "error")
+        self.assertNotIn("reviewer_output", verdicts[0])
+        self.assertNotIn("malformed_output", verdicts[0])
+        self.assertNotIn("parse_error", verdicts[0])
+        self.assertEqual(verdicts[0]["findings_count"], 0)
+        fallback = next(
+            record
+            for record in records
+            if record["record_type"] == "continuation_fallback"
+        )
+        self.assertEqual(fallback["reason"], "provider_unsupported")
+        self.assertEqual(
+            fallback["prior_session_id"],
+            "parsed-transient-session",
+        )
+        starts = [
+            record for record in records if record["record_type"] == "review_started"
+        ]
+        self.assertEqual(
+            [
+                (
+                    record["attempt_ordinal"],
+                    record["pass_ordinal"],
+                    record["phase"],
+                    record["candidate_fingerprint"],
+                    record["prior_reviewer_session_id"],
+                )
+                for record in starts
+            ],
+            [
+                (1, 1, "initial_review", self.candidate.fingerprint, ""),
+                (
+                    2,
+                    1,
+                    "initial_review",
+                    self.candidate.fingerprint,
+                    "parsed-transient-session",
+                ),
+            ],
+        )
+        budgets = [
+            record for record in records if record["record_type"] == "review_budget"
+        ]
+        self.assertEqual(
+            [record["action"] for record in budgets], ["initialized", "consumed"]
+        )
+        self.assertEqual(budgets[-1]["pass_ordinal"], 1)
+
+    def test_structured_transient_resumes_runtime_owned_claude_session(self) -> None:
+        commands: list[str] = []
+        outputs = iter(
+            (
+                json.dumps(
+                    {
+                        "verdict": "error",
+                        "findings": [],
+                        "session_id": "claude-session",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 0,
+                        "retry_classification": "transient",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [],
+                        "session_id": "claude-session",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 1,
+                    }
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout=next(outputs))
+
+        result = self.router("claude", execute).review(self.gates)
+
+        self.assertTrue(result.approved)
+        self.assertIn("--session-id claude-session", commands[0])
+        self.assertIn("--resume claude-session", commands[1])
+        records = self.store.read_records()
+        self.assertFalse(
+            any(record["record_type"] == "continuation_fallback" for record in records)
+        )
+        starts = [
+            record for record in records if record["record_type"] == "review_started"
+        ]
+        self.assertEqual(
+            [
+                (
+                    record["session_id"],
+                    record["continuation_ordinal"],
+                    record["continuation_resumed"],
+                )
+                for record in starts
+            ],
+            [
+                ("claude-session", 0, False),
+                ("claude-session", 1, True),
+            ],
+        )
+
+    def test_fresh_closure_transient_resumes_session_and_preserves_lineage(
+        self,
+    ) -> None:
+        commands: list[str] = []
+        finding = {
+            "id": "F1",
+            "severity": "P2",
+            "summary": "missing guard",
+            "evidence": "reproduction",
+            "files": ["src/example.py"],
+            "lines": [],
+            "state": "open",
+        }
+        outputs = iter(
+            (
+                json.dumps(
+                    {
+                        "verdict": "findings",
+                        "findings": [finding],
+                        "session_id": "original-session",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 0,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "verdict": "error",
+                        "findings": [],
+                        "session_id": "fresh-session",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 1,
+                        "retry_classification": "transient",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [
+                            {
+                                **finding,
+                                "evidence": "guard now passes",
+                                "state": "remediated",
+                            }
+                        ],
+                        "session_id": "fresh-session",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 2,
+                    }
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout=next(outputs))
+
+        machine = RunLifecycleStateMachine(lambda _transition: None)
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            machine.transition(stage, reason="setup")
+        session_ids = iter(("original-session", "fresh-session"))
+        router = self.router("claude", execute)
+        router.stage_machine = machine
+        router.session_id_factory = lambda: next(session_ids)
+        router.continuation_availability = lambda _provider, _role, session_id: (
+            "transcript_missing" if session_id == "original-session" else ""
+        )
+
+        initial = router.review(self.gates)
+        self.assertEqual(initial.verdict, "findings")
+        machine.transition(RunStage.CANDIDATE, reason="remediated")
+        machine.transition(RunStage.GATES, reason="regated")
+        closure_gates = self.gates_for(
+            dataclasses.replace(self.candidate, head_commit="c" * 40)
+        )
+
+        result = router.review(closure_gates, pass_kind="closure:1")
+
+        self.assertTrue(result.approved)
+        self.assertEqual(machine.stage, RunStage.INTEGRATION)
+        self.assertIn("--session-id fresh-session", commands[1])
+        self.assertIn("--resume fresh-session", commands[2])
+        self.assertNotIn("previous response was malformed", commands[2])
+        records = self.store.read_records()
+        closure_starts = [
+            record
+            for record in records
+            if record["record_type"] == "review_started"
+            and record["pass_kind"] == "closure:1"
+        ]
+        self.assertEqual(
+            [
+                (
+                    record["session_id"],
+                    record["continuation_ordinal"],
+                    record["continuation_resumed"],
+                    record["reviewer_provenance"],
+                    record["prior_reviewer_session_id"],
+                )
+                for record in closure_starts
+            ],
+            [
+                (
+                    "fresh-session",
+                    1,
+                    False,
+                    "fresh_closure",
+                    "original-session",
+                ),
+                (
+                    "fresh-session",
+                    2,
+                    True,
+                    "fresh_closure",
+                    "original-session",
+                ),
+            ],
+        )
+        closure_verdicts = [
+            record
+            for record in records
+            if record["record_type"] == "review_verdict"
+            and record["pass_kind"] == "closure:1"
+        ]
+        self.assertEqual(
+            [
+                (
+                    record["engine_verdict"],
+                    record["output_classification"],
+                    record["findings_count"],
+                    record["reviewer_provenance"],
+                    record["prior_reviewer_session_id"],
+                )
+                for record in closure_verdicts
+            ],
+            [
+                (
+                    "error",
+                    "parsed",
+                    0,
+                    "fresh_closure",
+                    "original-session",
+                ),
+                (
+                    "approve",
+                    "parsed",
+                    1,
+                    "fresh_closure",
+                    "original-session",
+                ),
+            ],
+        )
+        fallbacks = [
+            record
+            for record in records
+            if record["record_type"] == "continuation_fallback"
+        ]
+        self.assertEqual(len(fallbacks), 1)
+        self.assertEqual(fallbacks[0]["reason"], "transcript_missing")
+        self.assertEqual(fallbacks[0]["prior_session_id"], "original-session")
+
+    def test_structured_transient_and_malformed_allowances_are_independent(
+        self,
+    ) -> None:
+        transient = json.dumps(
+            {
+                "verdict": "error",
+                "findings": [],
+                "session_id": "claude-session",
+                "session_id_source": "provider",
+                "continuation_ordinal": 0,
+                "retry_classification": "transient",
+            }
+        )
+        approve = json.dumps(
+            {
+                "verdict": "approve",
+                "findings": [],
+                "session_id": "claude-session",
+                "session_id_source": "provider",
+                "continuation_ordinal": 2,
+            }
+        )
+        for order in ("transient_first", "malformed_first"):
+            with self.subTest(order=order):
+                store = RunStore(self.repo / f"{order}.jsonl")
+                if order == "transient_first":
+                    outputs = iter((transient, "not json", approve))
+                else:
+                    transient_after_reask = json.dumps(
+                        {
+                            **json.loads(transient),
+                            "continuation_ordinal": 1,
+                        }
+                    )
+                    outputs = iter(("not json", transient_after_reask, approve))
+                commands: list[str] = []
+
+                def execute(command: str, **kwargs):
+                    commands.append(command)
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        stdout=next(outputs),
+                    )
+
+                router = ReviewRouter(
+                    reviewer=self.agent("claude"),
+                    reviewer_profile="review",
+                    run_store=store,
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    worktree=self.repo,
+                    policy_references=("REVIEW.md",),
+                    max_initial_passes=1,
+                    max_closure_passes=2,
+                    concurrency=ReviewConcurrencyBudget(1),
+                    executor=execute,
+                    continuation_availability=lambda _provider, _role, _session: "",
+                    session_id_factory=lambda: "claude-session",
+                )
+
+                result = router.review(self.gates)
+
+                self.assertTrue(result.approved)
+                self.assertEqual(len(commands), 3)
+                verdicts = [
+                    record
+                    for record in store.read_records()
+                    if record["record_type"] == "review_verdict"
+                ]
+                self.assertEqual(
+                    [record["attempt_ordinal"] for record in verdicts],
+                    [1, 2, 3],
+                )
+                self.assertEqual(
+                    sorted(record["output_classification"] for record in verdicts[:2]),
+                    ["malformed", "parsed"],
+                )
+                self.assertEqual(verdicts[-1]["output_classification"], "parsed")
+                self.assertEqual(
+                    len(
+                        [
+                            record
+                            for record in store.read_records()
+                            if record["record_type"] == "review_budget"
+                            and record["action"] == "consumed"
+                        ]
+                    ),
+                    1,
+                )
+
     def test_transient_retry_does_not_consume_malformed_reask(self) -> None:
         outputs = iter(
             (
@@ -7090,6 +7547,145 @@ class ReviewRouterTests(unittest.TestCase):
                 for record in verdicts
             )
         )
+
+    def test_repeated_structured_transient_terminates_once_as_provider_failure(
+        self,
+    ) -> None:
+        transitions: list[dict[str, object]] = []
+        machine = RunLifecycleStateMachine(
+            lambda transition: transitions.append(transition.to_payload())
+        )
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            machine.transition(stage, reason="setup")
+        outputs = iter(
+            (
+                json.dumps(
+                    {
+                        "verdict": "error",
+                        "findings": [],
+                        "session_id": "first-transient-session",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 0,
+                        "retry_classification": "transient",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "verdict": "error",
+                        "findings": [],
+                        "session_id": "second-transient-session",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 1,
+                        "retry_classification": "transient",
+                    }
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(command, 0, stdout=next(outputs))
+
+        router = self.router("codex", execute)
+        router.stage_machine = machine
+        with self.assertRaises(ReviewStageResultError) as raised:
+            router.review(self.gates)
+
+        self.assertEqual(raised.exception.retry_classification, "transient")
+        self.assertIn("provider transient failure", str(raised.exception))
+        self.assertEqual(machine.stage, RunStage.CLASSIFICATION)
+        terminal_transitions = [
+            transition
+            for transition in transitions
+            if transition["to_stage"] == RunStage.CLASSIFICATION.value
+        ]
+        self.assertEqual(len(terminal_transitions), 1)
+        self.assertEqual(
+            terminal_transitions[0]["reason"],
+            "reviewer_error:transient",
+        )
+        verdicts = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_verdict"
+        ]
+        self.assertEqual(len(verdicts), 2)
+        self.assertTrue(
+            all(
+                record["retry_classification"] == "transient"
+                and record["output_classification"] == "parsed"
+                and "reviewer_output" not in record
+                and "malformed_output" not in record
+                and "parse_error" not in record
+                for record in verdicts
+            )
+        )
+
+    def test_structured_non_transient_errors_are_terminal_without_retry(self) -> None:
+        for classification, exception_type in (
+            ("provider_limit", ReviewProviderLimitError),
+            ("timeout", ReviewStageResultError),
+            ("fatal", ReviewStageResultError),
+        ):
+            with self.subTest(classification=classification):
+                store = RunStore(self.repo / f"{classification}.jsonl")
+                launches = 0
+
+                def execute(command: str, **kwargs):
+                    nonlocal launches
+                    launches += 1
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        stdout=json.dumps(
+                            {
+                                "verdict": "error",
+                                "findings": [],
+                                "session_id": "review-session",
+                                "session_id_source": "provider",
+                                "continuation_ordinal": 0,
+                                "retry_classification": classification,
+                            }
+                        ),
+                    )
+
+                router = ReviewRouter(
+                    reviewer=self.agent("codex"),
+                    reviewer_profile="review",
+                    run_store=store,
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    worktree=self.repo,
+                    policy_references=("REVIEW.md",),
+                    max_initial_passes=1,
+                    max_closure_passes=2,
+                    concurrency=ReviewConcurrencyBudget(1),
+                    executor=execute,
+                    continuation_availability=lambda _provider, _role, _session: "",
+                    session_id_factory=lambda: "codex-session",
+                )
+                with self.assertRaises(exception_type) as raised:
+                    router.review(self.gates)
+
+                self.assertEqual(launches, 1)
+                if isinstance(raised.exception, ReviewStageResultError):
+                    self.assertEqual(
+                        raised.exception.retry_classification,
+                        classification,
+                    )
+                verdict = next(
+                    record
+                    for record in store.read_records()
+                    if record["record_type"] == "review_verdict"
+                )
+                self.assertEqual(verdict["output_classification"], "parsed")
+                self.assertNotIn("malformed_output", verdict)
+                self.assertNotIn("reviewer_output", verdict)
 
     def test_quoted_overload_outside_terminal_output_does_not_trigger_retry(
         self,

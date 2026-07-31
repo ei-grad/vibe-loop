@@ -1186,6 +1186,117 @@ class F3ReviewLaunchTests(unittest.TestCase):
             reconciled[0]["reservation_id"].startswith("run-1:initial_review:")
         )
 
+    def test_structured_transient_retry_reserves_and_reconciles_each_launch(
+        self,
+    ) -> None:
+        store = self._store(
+            make_config(default_declared=500.0, limits=(BudgetLimit(limit=1e12),))
+        )
+        outputs = iter(
+            (
+                "\n".join(
+                    (
+                        json.dumps(
+                            {
+                                "type": "result",
+                                "usage": {
+                                    "input_tokens": 80,
+                                    "output_tokens": 20,
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "verdict": "error",
+                                "findings": [],
+                                "session_id": "session",
+                                "session_id_source": "provider",
+                                "continuation_ordinal": 0,
+                                "retry_classification": "transient",
+                            }
+                        ),
+                    )
+                ),
+                "\n".join(
+                    (
+                        json.dumps(
+                            {
+                                "type": "result",
+                                "usage": {
+                                    "input_tokens": 40,
+                                    "output_tokens": 10,
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "verdict": "approve",
+                                "findings": [],
+                                "session_id": "session",
+                                "session_id_source": "provider",
+                                "continuation_ordinal": 1,
+                            }
+                        ),
+                    )
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(command, 0, stdout=next(outputs))
+
+        result = self._router(store, execute).review(self.gates)
+
+        self.assertTrue(result.approved)
+        budget_records = store.read_records()
+        reserved = [
+            record
+            for record in budget_records
+            if record.get("record_type") == BUDGET_RESERVED_RECORD_TYPE
+        ]
+        reconciled = [
+            record
+            for record in budget_records
+            if record.get("record_type") == BUDGET_RECONCILED_RECORD_TYPE
+        ]
+        self.assertEqual(len(reserved), 2)
+        self.assertEqual(len(reconciled), 2)
+        self.assertEqual(
+            {record["reservation_id"] for record in reserved},
+            {record["reservation_id"] for record in reconciled},
+        )
+        self.assertEqual(
+            [record["phase"] for record in reserved],
+            ["initial_review", "initial_review"],
+        )
+        self.assertEqual(
+            [record["charge"] for record in reconciled],
+            [100.0, 50.0],
+        )
+        verdicts = [
+            record
+            for record in self.run_store.read_records()
+            if record["record_type"] == "review_verdict"
+        ]
+        self.assertEqual(
+            [record["stats"]["phase"] for record in verdicts],
+            ["initial_review", "initial_review"],
+        )
+        self.assertEqual(
+            [record["stats"]["provider_usage"]["input_tokens"] for record in verdicts],
+            [80, 40],
+        )
+        review_budgets = [
+            record
+            for record in self.run_store.read_records()
+            if record["record_type"] == "review_budget"
+        ]
+        self.assertEqual(
+            [record["action"] for record in review_budgets],
+            ["initialized", "consumed"],
+        )
+        self.assertEqual(review_budgets[-1]["pass_ordinal"], 1)
+
     def test_review_timeout_charges_fail_safe(self) -> None:
         store = self._store(
             make_config(default_declared=500.0, limits=(BudgetLimit(limit=1e12),))
