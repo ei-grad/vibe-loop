@@ -287,6 +287,8 @@ uses the cycle's active-run/conflict snapshot so the fallback does not introduce
 an independently timed lock-backend query; a lock-only change is observed
 through the trusted wake adapter or at the outer deadline.
 
+### Detached lifecycle and verified termination
+
 `autopilot run` remains the foreground supervisor contract. On POSIX systems,
 `autopilot start` must provide the supported detached lifecycle by starting
 that same supervisor in a new session with standard streams disconnected or
@@ -306,15 +308,29 @@ lifecycle in harnesses that reap child jobs.
 live lock with an append-only detached observation and a stable process
 identity. The verified live path is Linux-only and must use the recorded run,
 PID, process-group/session identity, kernel process-birth identity, and pidfd
-signaling so PID reuse cannot redirect the signal. It must return success only
-after both the exact process and supervisor lock are absent; timeout,
-interruption, missing or foreign identity, and backend errors fail closed
-without automatic `SIGKILL`. The foreground supervisor must translate
-supported termination signals into normal unwinding, terminate any active
-child process group, stop its heartbeat, and release its lock with the acquired
-fencing token. Once signal cleanup begins, repeated supported signals must be
-coalesced until bounded child and backend cleanup completes so a second signal
-cannot interrupt fenced release.
+signaling so PID reuse cannot redirect the signal. A detached observation
+written by `autopilot start` is an optimization, not the sole source of truth.
+When that observation is missing, `stop` and `reload` may reconstruct it only
+from a matching repository/run/PID supervisor-started record and the live
+process identity. The process must be its own process-group and session leader.
+For current started records, the recorded birth, process-group, and session
+identity must match the live process. For legacy started records without those
+fields, the process start time derived from the kernel birth ticks and uptime
+must precede the started-record timestamp by no more than 30 seconds; a process
+started after the record is treated as PID reuse. A successful reconstruction
+must append an `autopilot_supervisor_observed` record with the recovered birth,
+process-group, and session identity before opening or signaling through a
+pidfd. Missing records, malformed or out-of-window timestamps, PID reuse, and
+process-group/session mismatches fail closed with distinct diagnostics.
+
+`autopilot stop` must return success only after both the exact process and
+supervisor lock are absent; timeout, interruption, missing or foreign identity,
+and backend errors fail closed without automatic `SIGKILL`. The foreground
+supervisor must translate supported termination signals into normal unwinding,
+terminate any active child process group, stop its heartbeat, and release its
+lock with the acquired fencing token. Once signal cleanup begins, repeated
+supported signals must be coalesced until bounded child and backend cleanup
+completes so a second signal cannot interrupt fenced release.
 
 Signalling the supervisor alone is not a stop. Its `run-until-done` child, that
 child's workers, and any process those workers detached into their own group or
