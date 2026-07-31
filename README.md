@@ -130,9 +130,9 @@ vibe-loop --version
 ```
 
 `runs list` groups records by run id and shows the latest status plus log path;
-`runs inspect <run-id>` prints the detailed record history. `vibe-loop
---version` prints the package version; editable source-tree and non-tag Git
-installs append `(git <short-sha>)`.
+`runs inspect <run-id>` prints the detailed record history. The
+[CLI reference](docs/cli-reference.md#vibe-loop---version) owns `--version`
+output conventions, including editable source provenance.
 
 ### Evaluation commands
 

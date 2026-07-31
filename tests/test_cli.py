@@ -366,13 +366,120 @@ class CliTests(unittest.TestCase):
             patch("vibe_loop.cli.metadata_version", return_value="1.2.3"),
             patch("vibe_loop.cli.metadata_distribution", return_value=distribution),
             patch(
-                "vibe_loop.cli.source_tree_git_commit_sha",
-                return_value="123456789abc",
+                "vibe_loop.cli.find_source_git_root",
+                return_value=Path("/workspace/vibe-loop"),
             ),
+            patch("vibe_loop.cli.source_tree_has_release_tag", return_value=False),
+            patch("vibe_loop.cli.git_short_commit_sha", return_value="123456789abc"),
+            patch("vibe_loop.cli.source_tree_is_dirty", return_value=False),
         ):
             version = cli_module.package_version()
 
-        self.assertEqual(version, "1.2.3 (git 123456789abc)")
+        self.assertEqual(
+            version,
+            "1.2.3 (editable: /workspace/vibe-loop, git 123456789abc)",
+        )
+
+    def test_editable_package_version_distinguishes_dirty_source_tree(self) -> None:
+        distribution = DirectUrlDistribution(
+            {
+                "url": "file:///workspace/vibe-loop",
+                "dir_info": {"editable": True},
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "vibe-loop"
+            init_version_source_repo(repo)
+            (repo / ".vibe-loop").mkdir()
+            (repo / ".vibe-loop" / "runtime.json").write_text(
+                "runtime state",
+                encoding="utf-8",
+            )
+            git_sha = git_test_head(repo)[:12]
+            with (
+                patch("vibe_loop.cli.metadata_version", return_value="1.2.3"),
+                patch(
+                    "vibe_loop.cli.metadata_distribution",
+                    return_value=distribution,
+                ),
+                patch("vibe_loop.cli.find_source_git_root", return_value=repo),
+            ):
+                clean_version = cli_module.package_version()
+                (repo / "source.py").write_text("changed\n", encoding="utf-8")
+                dirty_version = cli_module.package_version()
+
+        self.assertEqual(
+            clean_version,
+            f"1.2.3 (editable: {repo}, git {git_sha})",
+        )
+        self.assertEqual(
+            dirty_version,
+            f"1.2.3 (editable: {repo}, git {git_sha}-dirty)",
+        )
+        self.assertNotEqual(clean_version, dirty_version)
+
+    def test_editable_package_version_reports_unknown_when_git_fails(self) -> None:
+        distribution = DirectUrlDistribution(
+            {
+                "url": "file:///workspace/vibe-loop",
+                "dir_info": {"editable": True},
+            }
+        )
+        git_root = Path("/workspace/vibe-loop")
+
+        with (
+            patch("vibe_loop.cli.metadata_version", return_value="1.2.3"),
+            patch("vibe_loop.cli.metadata_distribution", return_value=distribution),
+            patch("vibe_loop.cli.find_source_git_root", return_value=git_root),
+            patch("vibe_loop.cli.run_git", return_value=None),
+        ):
+            version = cli_module.package_version()
+
+        self.assertEqual(
+            version,
+            "1.2.3 (editable: /workspace/vibe-loop, revision unknown)",
+        )
+
+    def test_editable_package_version_reports_unknown_outside_git_repo(self) -> None:
+        distribution = DirectUrlDistribution(
+            {
+                "url": "file:///workspace/vibe-loop",
+                "dir_info": {"editable": True},
+            }
+        )
+
+        with (
+            patch("vibe_loop.cli.metadata_version", return_value="1.2.3"),
+            patch("vibe_loop.cli.metadata_distribution", return_value=distribution),
+            patch("vibe_loop.cli.find_source_git_root", return_value=None),
+        ):
+            version = cli_module.package_version()
+
+        self.assertEqual(version, "1.2.3 (editable, revision unknown)")
+
+    def test_editable_package_version_suppresses_release_tag_revision(self) -> None:
+        distribution = DirectUrlDistribution(
+            {
+                "url": "file:///workspace/vibe-loop",
+                "dir_info": {"editable": True},
+            }
+        )
+        git_root = Path("/workspace/vibe-loop")
+
+        with (
+            patch("vibe_loop.cli.metadata_version", return_value="1.2.3"),
+            patch("vibe_loop.cli.metadata_distribution", return_value=distribution),
+            patch("vibe_loop.cli.find_source_git_root", return_value=git_root),
+            patch("vibe_loop.cli.source_tree_has_release_tag", return_value=True),
+            patch("vibe_loop.cli.git_short_commit_sha") as git_short_commit_sha,
+            patch("vibe_loop.cli.source_tree_is_dirty") as source_tree_is_dirty,
+        ):
+            version = cli_module.package_version()
+
+        self.assertEqual(version, "1.2.3 (editable: /workspace/vibe-loop)")
+        git_short_commit_sha.assert_not_called()
+        source_tree_is_dirty.assert_not_called()
 
     def test_package_version_omits_source_tree_commit_for_regular_install(
         self,
@@ -12090,6 +12197,32 @@ def init_planning_repo(repo: Path, plan_text: str) -> None:
     subprocess.run(["git", "add", "PLAN.md", ".vibe-loop.toml"], cwd=repo, check=True)
     subprocess.run(
         ["git", "commit", "--allow-empty", "-m", "baseline"],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def init_version_source_repo(repo: Path) -> None:
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "--initial-branch", "main"],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "tester@example.com"],
+        cwd=repo,
+        check=True,
+    )
+    (repo / "source.py").write_text("original\n", encoding="utf-8")
+    subprocess.run(["git", "add", "source.py"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "baseline"],
         cwd=repo,
         check=True,
         stdout=subprocess.PIPE,

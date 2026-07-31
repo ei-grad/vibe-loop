@@ -19,6 +19,22 @@ product behavior:
 | `eval` | [Evals and release PRD](prd/evals-release.md) | The PRD owns evaluation behavior, artifact contracts, external adapters, and release policy; the [evaluation strategy](skill-evaluation-strategy.md) provides methodology and rationale. |
 | Session linkage, recovery, and usage telemetry | [Autopilot PRD](prd/autopilot.md#prd-aut-013-observed-agent-session-id-and-transcript-linkage) | PRD-AUT-013, PRD-AUT-014, and PRD-AUT-016 own these run-provenance contracts. |
 
+## Global Options
+
+### `vibe-loop --version`
+
+Print the installed package version and exit. Fixed non-tag Git installs append
+the recorded revision as `(git <short-sha>)`; release-tag and regular package
+installs print only the package version.
+
+Editable installs identify their live source root and revision as
+`(editable: <source-root>, git <short-sha>)`. The revision gains a `-dirty`
+suffix when tracked or untracked source changes are present, excluding runtime
+state under `.vibe-loop`. If the source root or Git state cannot be read, the
+editable annotation reports `revision unknown`. An editable source at the
+matching release tag keeps release-revision suppression and prints only its
+source-root annotation.
+
 ## Diagnostic Commands
 
 ### `vibe-loop doctor`

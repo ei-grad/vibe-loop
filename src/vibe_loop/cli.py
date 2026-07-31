@@ -158,6 +158,7 @@ from vibe_loop.workers import (
     claim_worker_workspace,
     clean_stale_locks,
     collect_stale_locks,
+    git_status_args,
     record_expired_locks,
 )
 
@@ -184,10 +185,37 @@ def package_version() -> str:
         version = metadata_version(PACKAGE_NAME)
     except PackageNotFoundError:
         version = "0+unknown"
+    direct_url = package_direct_url()
+    if package_is_editable(direct_url):
+        return editable_package_version(version)
     git_sha = package_git_commit_sha(version)
     if git_sha:
         return f"{version} (git {git_sha})"
     return version
+
+
+def package_is_editable(direct_url: dict[str, object] | None) -> bool:
+    if direct_url is None:
+        return False
+    dir_info = direct_url.get("dir_info")
+    return isinstance(dir_info, dict) and dir_info.get("editable") is True
+
+
+def editable_package_version(version: str) -> str:
+    git_root = find_source_git_root(Path(__file__).resolve())
+    if git_root is None:
+        return f"{version} (editable, revision unknown)"
+    release_tag = source_tree_has_release_tag(git_root, version)
+    if release_tag is None:
+        return f"{version} (editable: {git_root}, revision unknown)"
+    if release_tag:
+        return f"{version} (editable: {git_root})"
+    git_sha = git_short_commit_sha(git_root)
+    dirty = source_tree_is_dirty(git_root)
+    if not git_sha or dirty is None:
+        return f"{version} (editable: {git_root}, revision unknown)"
+    dirty_suffix = "-dirty" if dirty else ""
+    return f"{version} (editable: {git_root}, git {git_sha}{dirty_suffix})"
 
 
 def package_git_commit_sha(version: str) -> str:
@@ -227,7 +255,7 @@ def requested_revision_is_release_tag(revision: str, version: str) -> bool:
 
 def source_tree_git_commit_sha(version: str) -> str:
     git_root = find_source_git_root(Path(__file__).resolve())
-    if git_root is None or source_tree_has_release_tag(git_root, version):
+    if git_root is None or source_tree_has_release_tag(git_root, version) is not False:
         return ""
     return git_short_commit_sha(git_root)
 
@@ -239,10 +267,10 @@ def find_source_git_root(path: Path) -> Path | None:
     return None
 
 
-def source_tree_has_release_tag(git_root: Path, version: str) -> bool:
+def source_tree_has_release_tag(git_root: Path, version: str) -> bool | None:
     result = run_git(git_root, "tag", "--points-at", "HEAD")
     if result is None or result.returncode != 0:
-        return False
+        return None
     release_tags = {version, f"v{version}"}
     return any(tag.strip() in release_tags for tag in result.stdout.splitlines())
 
@@ -252,6 +280,13 @@ def git_short_commit_sha(git_root: Path) -> str:
     if result is None or result.returncode != 0:
         return ""
     return short_git_sha(result.stdout.strip())
+
+
+def source_tree_is_dirty(git_root: Path) -> bool | None:
+    result = run_git(git_root, *git_status_args(git_root, ()))
+    if result is None or result.returncode != 0:
+        return None
+    return bool(result.stdout.strip())
 
 
 def run_git(git_root: Path, *args: str) -> subprocess.CompletedProcess[str] | None:
