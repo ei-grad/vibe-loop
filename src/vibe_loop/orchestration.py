@@ -77,6 +77,21 @@ CANDIDATE_BASE_ANCHOR_OUTCOMES = (
 GATE_EXIT_CLASSES = ("passed", "failed", "candidate_changed", "execution_error")
 GATE_FAILURE_CLASSES = ("none", "candidate", "environment")
 GATE_BUDGET_CHARGES = ("none", "remediation")
+GATE_FAILURE_LOG_TAIL_BYTES = 65_536
+GATE_FAILURE_EXCERPT_LINES = 20
+GATE_FAILURE_EXCERPT_CHARS = 4_096
+GATE_FAILURE_LINE_CHARS = 1_024
+PYTEST_OUTCOME_LINE = re.compile(r"^(?:FAILED|ERROR)\s+(?!\()(.+?)(?:\s+-\s+.*)?$")
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+VOLATILE_TIMESTAMP = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b"
+)
+VOLATILE_DURATION = re.compile(
+    r"(?<![\w.])\d+(?:\.\d+)?\s*"
+    r"(?:ns|[µu]s|ms|s|secs?|seconds?|mins?|minutes?|h|hours?)(?!\w)",
+    re.IGNORECASE,
+)
 REVIEW_VERDICTS = ("approve", "findings", "error")
 REVIEW_CONTROL_VERDICTS = ("clean", "findings", "blocked")
 REVIEW_DIAGNOSTIC_OUTPUT_CLASSIFICATIONS = frozenset(
@@ -1608,6 +1623,12 @@ class CandidateBaseReanchorer:
         return self.candidate_collector._git_result(*args)
 
 
+def _is_string_sequence(value: object) -> bool:
+    return isinstance(value, (list, tuple)) and all(
+        isinstance(item, str) for item in value
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class GateResult:
     config_key: str
@@ -1624,6 +1645,9 @@ class GateResult:
     base_log_reference: str = ""
     base_evidence_digest: str = ""
     comparison_base: str = ""
+    failure_signature: tuple[str, ...] = ()
+    base_failure_signature: tuple[str, ...] = ()
+    base_environment_failure: bool = False
     base_control_resumed: bool = False
     resumed: bool = False
 
@@ -1632,6 +1656,10 @@ class GateResult:
             raise ValueError(f"unsupported gate failure class: {self.failure_class}")
         if self.budget_charge not in GATE_BUDGET_CHARGES:
             raise ValueError(f"unsupported gate budget charge: {self.budget_charge}")
+        if self.base_environment_failure != (self.base_exit_class == "failed"):
+            raise ValueError(
+                "base-environment finding must match the base control exit class"
+            )
         if self.passed:
             if self.failure_class != "none" or self.budget_charge != "none":
                 raise ValueError("passing gate evidence cannot carry a failure charge")
@@ -1647,10 +1675,6 @@ class GateResult:
         ):
             raise ValueError(
                 "environment gate failures require a reproduced command failure"
-            )
-        if self.base_exit_class == "failed" and self.failure_class != "environment":
-            raise ValueError(
-                "a reproduced base failure requires environment classification"
             )
 
     @property
@@ -1668,6 +1692,7 @@ class GateResult:
             "candidate_fingerprint": self.candidate_fingerprint,
             "failure_class": self.failure_class,
             "budget_charge": self.budget_charge,
+            "failure_signature": list(self.failure_signature),
         }
         if self.exit_code is not None:
             payload["exit_code"] = self.exit_code
@@ -1676,6 +1701,8 @@ class GateResult:
             payload["base_log_reference"] = self.base_log_reference
             payload["base_evidence_digest"] = self.base_evidence_digest
             payload["comparison_base"] = self.comparison_base
+            payload["base_failure_signature"] = list(self.base_failure_signature)
+            payload["base_environment_failure"] = self.base_environment_failure
             payload["base_control_resumed"] = self.base_control_resumed
             if self.base_exit_code is not None:
                 payload["base_exit_code"] = self.base_exit_code
@@ -1699,6 +1726,11 @@ class GateResult:
         base_log_reference = record.get("base_log_reference", "")
         base_evidence_digest = record.get("base_evidence_digest", "")
         comparison_base = record.get("comparison_base", "")
+        failure_signature = record.get("failure_signature", ())
+        base_failure_signature = record.get("base_failure_signature", ())
+        base_environment_failure = record.get(
+            "base_environment_failure", base_exit_class == "failed"
+        )
         base_control_resumed = record.get("base_control_resumed", False)
         if failure_class is None:
             failure_class = "none" if exit_class == "passed" else "candidate"
@@ -1723,6 +1755,9 @@ class GateResult:
             or not isinstance(base_log_reference, str)
             or not isinstance(base_evidence_digest, str)
             or not isinstance(comparison_base, str)
+            or not _is_string_sequence(failure_signature)
+            or not _is_string_sequence(base_failure_signature)
+            or not isinstance(base_environment_failure, bool)
             or not isinstance(base_control_resumed, bool)
             or (
                 failure_class == "environment"
@@ -1751,6 +1786,9 @@ class GateResult:
                 base_log_reference=base_log_reference,
                 base_evidence_digest=base_evidence_digest,
                 comparison_base=comparison_base,
+                failure_signature=tuple(failure_signature),
+                base_failure_signature=tuple(base_failure_signature),
+                base_environment_failure=base_environment_failure,
                 base_control_resumed=base_control_resumed,
                 resumed=True,
             )
@@ -3768,6 +3806,54 @@ class ReviewRouter:
 GateExecutor = Callable[..., subprocess.CompletedProcess[str]]
 
 
+def _failure_signature(
+    log_path: Path,
+    *,
+    exit_code: int | None,
+    worktree: Path,
+) -> tuple[str, ...]:
+    try:
+        with log_path.open("rb") as log:
+            log.seek(0, os.SEEK_END)
+            size = log.tell()
+            log.seek(max(0, size - GATE_FAILURE_LOG_TAIL_BYTES))
+            raw = log.read(GATE_FAILURE_LOG_TAIL_BYTES)
+    except OSError:
+        return ("log:unreadable",)
+    text = raw.decode("utf-8", errors="replace")
+    if size > GATE_FAILURE_LOG_TAIL_BYTES:
+        _, _, text = text.partition("\n")
+    text = redact_evidence_text(
+        "\n".join(line[:GATE_FAILURE_LINE_CHARS] for line in text.splitlines())
+    )
+    normalized_lines: list[str] = []
+    worktree_text = str(worktree.resolve())
+    for raw_line in text.splitlines():
+        line = ANSI_ESCAPE.sub("", raw_line)
+        line = line.replace(worktree_text, "<worktree>")
+        line = " ".join(line.split())
+        if line:
+            normalized_lines.append(line)
+    pytest_failures = {
+        match.group(1)
+        for line in normalized_lines
+        if (match := PYTEST_OUTCOME_LINE.fullmatch(line)) is not None
+    }
+    if pytest_failures:
+        return tuple(f"pytest:{node_id}" for node_id in sorted(pytest_failures))
+    excerpt_lines = [
+        VOLATILE_DURATION.sub(
+            "<duration>",
+            VOLATILE_TIMESTAMP.sub("<timestamp>", line),
+        )
+        for line in normalized_lines[-GATE_FAILURE_EXCERPT_LINES:]
+    ]
+    excerpt = "\n".join(excerpt_lines)
+    if excerpt:
+        return (f"excerpt:{excerpt[-GATE_FAILURE_EXCERPT_CHARS:]}",)
+    return (f"exit-code:{exit_code}",)
+
+
 class GateRunner:
     def __init__(
         self,
@@ -3900,6 +3986,15 @@ class GateRunner:
             candidate_fingerprint=candidate.fingerprint,
             failure_class="none" if exit_class == "passed" else "candidate",
             budget_charge="none" if exit_class == "passed" else "remediation",
+            failure_signature=(
+                _failure_signature(
+                    log_path,
+                    exit_code=exit_code,
+                    worktree=self.candidate_collector.worktree,
+                )
+                if exit_class == "failed"
+                else ()
+            ),
         )
 
     def _classify_failed_gate(
@@ -3916,25 +4011,28 @@ class GateRunner:
             comparison_base=comparison_base,
         )
         if prior is not None:
-            return dataclasses.replace(
-                result,
-                failure_class=prior.failure_class,
-                budget_charge=prior.budget_charge,
-                base_exit_class=prior.base_exit_class,
-                base_exit_code=prior.base_exit_code,
-                base_log_reference=prior.base_log_reference,
-                base_evidence_digest=prior.base_evidence_digest,
-                comparison_base=comparison_base,
-                base_control_resumed=True,
+            exit_class = prior.base_exit_class
+            exit_code = prior.base_exit_code
+            log_path = Path(prior.base_log_reference)
+            base_evidence_digest = prior.base_evidence_digest
+            base_failure_signature = prior.base_failure_signature
+            resumed = True
+        else:
+            fingerprint = candidate.fingerprint.removeprefix("sha256:")[:16]
+            log_path = self.log_dir / f"gate-{fingerprint}-{index + 1}-base.log"
+            exit_class, exit_code, base_failure_signature = self._run_base_control(
+                command=command,
+                candidate=candidate,
+                log_path=log_path,
             )
-        fingerprint = candidate.fingerprint.removeprefix("sha256:")[:16]
-        log_path = self.log_dir / f"gate-{fingerprint}-{index + 1}-base.log"
-        exit_class, exit_code = self._run_base_control(
-            command=command,
-            candidate=candidate,
-            log_path=log_path,
+            base_evidence_digest = (
+                "sha256:" + hashlib.sha256(log_path.read_bytes()).hexdigest()
+            )
+            resumed = False
+        base_failed = exit_class == "failed"
+        reproduced = base_failed and set(result.failure_signature).issubset(
+            base_failure_signature
         )
-        reproduced = exit_class == "failed"
         return dataclasses.replace(
             result,
             failure_class="environment" if reproduced else "candidate",
@@ -3942,10 +4040,11 @@ class GateRunner:
             base_exit_class=exit_class,
             base_exit_code=exit_code,
             base_log_reference=str(log_path),
-            base_evidence_digest=(
-                "sha256:" + hashlib.sha256(log_path.read_bytes()).hexdigest()
-            ),
+            base_evidence_digest=base_evidence_digest,
             comparison_base=comparison_base,
+            base_failure_signature=base_failure_signature,
+            base_environment_failure=base_failed,
+            base_control_resumed=resumed,
         )
 
     def _run_base_control(
@@ -3954,7 +4053,7 @@ class GateRunner:
         command: str,
         candidate: CandidateRecord,
         log_path: Path,
-    ) -> tuple[str, int | None]:
+    ) -> tuple[str, int | None, tuple[str, ...]]:
         comparison_base = candidate.comparison_base or candidate.base_main
         try:
             with tempfile.TemporaryDirectory(
@@ -3982,9 +4081,16 @@ class GateRunner:
                         "base control checkout could not be prepared\n",
                         encoding="utf-8",
                     )
-                    return "execution_error", None
+                    return "execution_error", None, ()
                 checked_out = subprocess.run(
-                    ["git", "checkout", "--detach", "--quiet", comparison_base],
+                    [
+                        "git",
+                        "checkout",
+                        "--quiet",
+                        "-B",
+                        self.candidate_collector.main_branch,
+                        comparison_base,
+                    ],
                     cwd=checkout,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -3997,7 +4103,7 @@ class GateRunner:
                         "base control checkout could not be prepared\n",
                         encoding="utf-8",
                     )
-                    return "execution_error", None
+                    return "execution_error", None, ()
                 try:
                     with log_path.open("w", encoding="utf-8") as log:
                         completed = run_configured_command(
@@ -4011,17 +4117,27 @@ class GateRunner:
                         "base control gate command could not be executed\n",
                         encoding="utf-8",
                     )
-                    return "execution_error", None
+                    return "execution_error", None, ()
+                exit_class = "passed" if completed.returncode == 0 else "failed"
                 return (
-                    "passed" if completed.returncode == 0 else "failed",
+                    exit_class,
                     completed.returncode,
+                    (
+                        _failure_signature(
+                            log_path,
+                            exit_code=completed.returncode,
+                            worktree=checkout,
+                        )
+                        if exit_class == "failed"
+                        else ()
+                    ),
                 )
         except OSError:
             log_path.write_text(
                 "base control checkout could not be prepared\n",
                 encoding="utf-8",
             )
-            return "execution_error", None
+            return "execution_error", None, ()
 
     def _prior_results(self, candidate: CandidateRecord) -> dict[str, GateResult]:
         prior: dict[str, GateResult] = {}
@@ -4033,6 +4149,8 @@ class GateRunner:
                 continue
             result = GateResult.from_record(record)
             if result is None or result.candidate_fingerprint != candidate.fingerprint:
+                continue
+            if result.exit_class == "failed" and not result.failure_signature:
                 continue
             if not gate_evidence_is_valid(result):
                 continue
@@ -4058,6 +4176,10 @@ class GateRunner:
                 or result.exit_class != "failed"
                 or result.comparison_base != comparison_base
                 or result.base_exit_class not in {"passed", "failed"}
+                or (
+                    result.base_exit_class == "failed"
+                    and not result.base_failure_signature
+                )
                 or not base_gate_evidence_is_valid(result)
             ):
                 continue
