@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import signal
 import shlex
 import subprocess
 import sys
@@ -2811,6 +2812,68 @@ class TaskSourceCapabilitiesDiagnosticTests(unittest.TestCase):
         self.assertEqual(report["reason"], "command_timeout")
         self.assertNotIn(secret, json.dumps(report))
         self.assert_process_exited(child_pid)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX process isolation")
+    def test_timeout_returns_when_escaped_descendant_keeps_pipes_open(self) -> None:
+        child_pid = 0
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            pid_path = repo / "escaped.pid"
+            command = self.command(
+                "import os, pathlib, time\n"
+                "child = os.fork()\n"
+                "if child == 0:\n"
+                "    os.setsid()\n"
+                "    time.sleep(30)\n"
+                "    os._exit(0)\n"
+                f"pathlib.Path({str(pid_path)!r}).write_text(str(child))\n"
+                "time.sleep(30)\n"
+            )
+            started = time.monotonic()
+            try:
+                report = tasks_module.task_source_adapter_report(
+                    repo,
+                    TaskSourceConfig(
+                        capabilities_command=command,
+                        command_timeout_seconds=0.1,
+                    ),
+                )
+                elapsed = time.monotonic() - started
+                child_pid = int(pid_path.read_text(encoding="utf-8"))
+            finally:
+                if child_pid:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+        self.assertEqual(report["reason"], "command_timeout")
+        self.assertLess(elapsed, 2.0)
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group assertion")
+    def test_sigterm_grace_reaps_leader_before_testing_process_group(self) -> None:
+        process = mock.Mock(pid=12345)
+        process.returncode = None
+        polled = False
+        sent_signals: list[int] = []
+
+        def poll() -> int:
+            nonlocal polled
+            polled = True
+            process.returncode = -signal.SIGTERM
+            return process.returncode
+
+        def killpg(_pid: int, sent_signal: int) -> None:
+            sent_signals.append(sent_signal)
+            if sent_signal == 0 and polled:
+                raise ProcessLookupError
+
+        process.poll.side_effect = poll
+        with mock.patch("vibe_loop.tasks.os.killpg", side_effect=killpg):
+            tasks_module._terminate_capabilities_process_group(process)
+
+        self.assertEqual(sent_signals, [signal.SIGTERM, 0])
+        process.wait.assert_called_once_with()
 
     def assert_process_exited(self, pid: int) -> None:
         deadline = time.monotonic() + 2.0

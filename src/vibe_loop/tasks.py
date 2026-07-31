@@ -2744,6 +2744,7 @@ def run_bounded_capabilities_command(
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            bufsize=0,
             env=environment,
             **popen_kwargs,
         )
@@ -2755,16 +2756,35 @@ def run_bounded_capabilities_command(
     stdout = bytearray()
     stderr = bytearray()
     stdout_overflow = threading.Event()
+    stop_readers = threading.Event()
     lock = threading.Lock()
+    nonblocking_reads = os.name != "nt"
+    if nonblocking_reads:
+        os.set_blocking(process.stdout.fileno(), False)
+        os.set_blocking(process.stderr.fileno(), False)
     readers = (
         threading.Thread(
             target=_drain_bounded_stream,
-            args=(process.stdout, stdout, lock, stdout_overflow),
+            args=(
+                process.stdout,
+                stdout,
+                lock,
+                stdout_overflow,
+                stop_readers,
+                nonblocking_reads,
+            ),
             daemon=True,
         ),
         threading.Thread(
             target=_drain_bounded_stream,
-            args=(process.stderr, stderr, lock, None),
+            args=(
+                process.stderr,
+                stderr,
+                lock,
+                None,
+                stop_readers,
+                nonblocking_reads,
+            ),
             daemon=True,
         ),
     )
@@ -2788,10 +2808,7 @@ def run_bounded_capabilities_command(
     else:
         process.wait()
 
-    for reader in readers:
-        reader.join(timeout=1.0)
-    for stream in (process.stdout, process.stderr):
-        stream.close()
+    stop_readers.set()
     for reader in readers:
         reader.join(timeout=1.0)
     if reason is not None:
@@ -2806,10 +2823,21 @@ def _drain_bounded_stream(
     retained: bytearray,
     lock: threading.Lock,
     overflow: threading.Event | None,
+    stop: threading.Event,
+    nonblocking: bool,
 ) -> None:
     try:
-        read_available = getattr(stream, "read1", stream.read)
-        while chunk := read_available(8192):
+        while not stop.is_set():
+            try:
+                chunk = stream.read(8192)
+            except BlockingIOError:
+                stop.wait(0.01)
+                continue
+            if chunk is None and nonblocking:
+                stop.wait(0.01)
+                continue
+            if not chunk:
+                return
             with lock:
                 remaining = TASK_SOURCE_CAPABILITIES_STREAM_LIMIT - len(retained)
                 if remaining > 0:
@@ -2818,6 +2846,11 @@ def _drain_bounded_stream(
                     overflow.set()
     except (OSError, ValueError):
         return
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
 
 
 def _terminate_capabilities_process_group(
@@ -2843,6 +2876,7 @@ def _terminate_capabilities_process_group(
         pass
     deadline = time.monotonic() + 0.25
     while time.monotonic() < deadline:
+        process.poll()
         try:
             os.killpg(process.pid, 0)
         except ProcessLookupError:

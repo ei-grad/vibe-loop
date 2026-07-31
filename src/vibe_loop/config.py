@@ -464,6 +464,8 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
         "next",
         "probe",
         "activate",
+        "capabilities",
+        "capabilities_command",
         "complete",
         "reset",
         "park",

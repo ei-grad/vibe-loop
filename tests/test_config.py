@@ -974,6 +974,8 @@ class ConfigTests(unittest.TestCase):
         )
 
         for key in (
+            "capabilities",
+            "capabilities_command",
             "health_command",
             "summary_command",
             "troubleshoot_command",
@@ -984,9 +986,17 @@ class ConfigTests(unittest.TestCase):
         ):
             self.assertIn(key, GENERATED_TASK_PROFILE_FORBIDDEN_KEYS)
         forbidden = find_forbidden_generated_command_keys(
-            {"profile": {"planning_command": "do bad"}}
+            {
+                "profile": {
+                    "planning_command": "do bad",
+                    "capabilities": "adapter capabilities",
+                    "capabilities_command": "adapter capabilities internal",
+                }
+            }
         )
         self.assertTrue(any("planning_command" in path for path in forbidden))
+        self.assertTrue(any("capabilities" in path for path in forbidden))
+        self.assertTrue(any("capabilities_command" in path for path in forbidden))
 
     def test_supervision_config_parses_restart_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
