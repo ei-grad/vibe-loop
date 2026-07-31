@@ -7097,6 +7097,33 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         self.assertEqual(result.escaped_descendants[0]["pid"], escaped.pid)
 
     @unittest.skipUnless(sys.platform == "linux", "Linux process tree required")
+    def test_accepted_report_teardown_accepts_dead_root_with_empty_boundary(self):
+        proc = FakeWatchdogProcess(alive_polls=0)
+        root = ProcessNode(
+            pid=proc.pid,
+            parent_pid=1,
+            process_group_id=proc.pid,
+            session_id=proc.pid,
+            process_birth_id="boot:root",
+            state="Z",
+        )
+
+        result = terminate_verified_worker_containment(
+            proc,
+            StringIO(),
+            expected_birth_id=root.process_birth_id,
+            process_table=lambda: {root.pid: root},
+            process_node=lambda _pid: root,
+        )
+
+        self.assertTrue(result.terminated)
+        self.assertTrue(result.identity_verified)
+        self.assertTrue(result.descendants_verified)
+        self.assertEqual(result.reason, "accepted_report_runtime_closure")
+        self.assertEqual(result.process_count, 1)
+        self.assertFalse(result.escaped_descendants)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux process tree required")
     def test_accepted_report_teardown_refuses_dead_root_with_live_group(self):
         proc = FakeWatchdogProcess(alive_polls=0)
         root = ProcessNode(
@@ -7131,6 +7158,74 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         self.assertEqual(result.reason, "containment_boundary_not_empty")
         self.assertEqual(result.process_count, 2)
         self.assertEqual(result.escaped_descendants[0]["pid"], survivor.pid)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux process tree required")
+    def test_accepted_report_teardown_refuses_root_exit_with_live_group(self):
+        proc = FakeWatchdogProcess(alive_polls=0)
+        root = ProcessNode(
+            pid=proc.pid,
+            parent_pid=1,
+            process_group_id=proc.pid,
+            session_id=proc.pid,
+            process_birth_id="boot:root",
+        )
+        dead_root = dataclasses.replace(root, state="Z")
+        survivor = ProcessNode(
+            pid=proc.pid + 1,
+            parent_pid=1,
+            process_group_id=proc.pid,
+            session_id=proc.pid,
+            process_birth_id="boot:survivor",
+            state="S",
+        )
+        initial = {root.pid: root}
+        after_exit = {dead_root.pid: dead_root, survivor.pid: survivor}
+        snapshots = iter((initial, after_exit))
+
+        def process_table() -> dict[int, ProcessNode]:
+            return next(snapshots, after_exit).copy()
+
+        result = terminate_verified_worker_containment(
+            proc,
+            StringIO(),
+            expected_birth_id=root.process_birth_id,
+            sigkill_after_seconds=0.001,
+            process_table=process_table,
+            process_node=after_exit.get,
+        )
+
+        self.assertFalse(result.terminated)
+        self.assertTrue(result.identity_verified)
+        self.assertFalse(result.descendants_verified)
+        self.assertEqual(result.reason, "containment_boundary_not_empty")
+        self.assertEqual(result.process_count, 2)
+        self.assertEqual(result.escaped_descendants[0]["pid"], survivor.pid)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux process tree required")
+    def test_accepted_report_teardown_accepts_root_exit_during_empty_drain(self):
+        proc = FakeWatchdogProcess(alive_polls=0)
+        root = ProcessNode(
+            pid=proc.pid,
+            parent_pid=1,
+            process_group_id=proc.pid,
+            session_id=proc.pid,
+            process_birth_id="boot:root",
+        )
+        snapshots = iter(({root.pid: root}, {}))
+
+        result = terminate_verified_worker_containment(
+            proc,
+            StringIO(),
+            expected_birth_id=root.process_birth_id,
+            process_table=lambda: next(snapshots, {}).copy(),
+            process_node=lambda _pid: None,
+        )
+
+        self.assertTrue(result.terminated)
+        self.assertTrue(result.identity_verified)
+        self.assertTrue(result.descendants_verified)
+        self.assertEqual(result.reason, "accepted_report_runtime_closure")
+        self.assertEqual(result.process_count, 1)
 
     def test_escaped_descendant_evidence_is_bounded(self):
         descendants = [

@@ -9201,7 +9201,9 @@ def terminate_verified_worker_containment(
         or root.process_group_id != process.pid
         or root.session_id != process.pid
     ):
-        return VerifiedWorkerTeardown(False, False, False, "worker_identity_mismatch")
+        return VerifiedWorkerTeardown(
+            False, False, False, "worker_identity_unavailable"
+        )
     if root.state in {"Z", "X", "x"}:
         surviving_group = [
             node
@@ -9212,13 +9214,13 @@ def terminate_verified_worker_containment(
             and node.state not in {"Z", "X", "x"}
         ]
         return VerifiedWorkerTeardown(
-            False,
+            not surviving_group,
             True,
-            False,
+            not surviving_group,
             (
                 "containment_boundary_not_empty"
                 if surviving_group
-                else "worker_identity_unavailable"
+                else "accepted_report_runtime_closure"
             ),
             len(surviving_group) + 1,
             escaped_descendant_evidence(
@@ -9233,15 +9235,6 @@ def terminate_verified_worker_containment(
     def live_descendants() -> tuple[ProcessNode | None, list[ProcessNode]]:
         current_table = process_table()
         current_root = current_table.get(process.pid)
-        if (
-            current_root is None
-            or current_root.process_birth_id != expected_birth_id
-            or current_root.state in {"Z", "X", "x"}
-        ):
-            return current_root, []
-        ancestry = collect_owned_descendants(
-            current_table, {process.pid: expected_birth_id}
-        )
         group_members = [
             node
             for node in current_table.values()
@@ -9249,6 +9242,20 @@ def terminate_verified_worker_containment(
             and node.process_group_id == process.pid
             and node.session_id == process.pid
         ]
+        if (
+            current_root is None
+            or current_root.process_birth_id != expected_birth_id
+            or current_root.state in {"Z", "X", "x"}
+        ):
+            observed.update(
+                ((node.pid, node.process_birth_id), node) for node in group_members
+            )
+            return current_root, [
+                node for node in group_members if node.state not in {"Z", "X", "x"}
+            ]
+        ancestry = collect_owned_descendants(
+            current_table, {process.pid: expected_birth_id}
+        )
         descendants = {
             (node.pid, node.process_birth_id): node
             for node in (*ancestry, *group_members)
@@ -9267,13 +9274,13 @@ def terminate_verified_worker_containment(
         empty_scans = 0
         while time.monotonic() < deadline:
             current_root, current_remaining = live_descendants()
+            remaining = current_remaining
             if (
                 current_root is None
                 or current_root.process_birth_id != expected_birth_id
                 or current_root.state in {"Z", "X", "x"}
             ):
-                return False
-            remaining = current_remaining
+                return not remaining
             if not remaining:
                 empty_scans += 1
                 if empty_scans >= 2:
@@ -9316,16 +9323,20 @@ def terminate_verified_worker_containment(
         )
 
     current = process_node(process.pid)
-    if (
-        current is None
-        or current.process_birth_id != expected_birth_id
-        or current.state in {"Z", "X", "x"}
-    ):
+    if current is not None and current.process_birth_id != expected_birth_id:
         return VerifiedWorkerTeardown(
             False,
             False,
             True,
             "worker_identity_unavailable",
+            len(observed),
+        )
+    if current is None or current.state in {"Z", "X", "x"}:
+        return VerifiedWorkerTeardown(
+            True,
+            True,
+            True,
+            "accepted_report_runtime_closure",
             len(observed),
         )
     try:

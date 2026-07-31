@@ -56,10 +56,15 @@ descendants to finish naturally. Closure re-scans the boundary while signalling
 live descendants deepest-first, uses SIGKILL only after the bounded SIGTERM
 drain fails, stops the subreaper root only after no live descendant remains,
 and then proves the root exited. An already-exited descendant zombie cannot
-fork and does not block the drain. A dead or zombie subreaper means the
-enumerable boundary was lost and always refuses verified closure, including
-when no surviving member remains visible. If repeated scans do not converge,
-closure refuses with
+fork and does not block the drain. The subreaper guard's normal exit path drains
+its adopted ancestry boundary before returning, so a dead or zombie guard with
+an empty session and process-group boundary is successful verified closure. A
+dead guard with a surviving boundary member still refuses closure. This
+post-exit snapshot cannot independently prove what an abruptly terminated guard
+previously spawned; the guarantee comes from launching the command only beneath
+the established subreaper and allowing that guard to exit normally only after
+its own bounded descendant drain. If repeated scans do not converge, closure
+refuses with
 `containment_boundary_not_empty` and retains bounded `escaped_descendants`
 identity evidence from the final live scan. When post-report activity and this
 closure failure occur together, the lifecycle reason names both while the
