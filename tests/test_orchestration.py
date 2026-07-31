@@ -2760,6 +2760,44 @@ class RuntimeGateTests(unittest.TestCase):
             ),
         )
 
+    def test_different_parametrized_pytest_nodes_charge_remediation(self) -> None:
+        candidate = self.collector.collect_derived()
+
+        def fail_different_parameters(command, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            parameter = "5s" if cwd == self.repo else "10s"
+            kwargs["stdout"].write(
+                f"FAILED tests/test_t.py::test_wait[{parameter}] - AssertionError\n"
+            )
+            return subprocess.CompletedProcess(command, 1)
+
+        result = (
+            GateRunner(
+                completion_commands=("pytest",),
+                gate_keys=("completion.commands[0]",),
+                candidate_collector=self.collector,
+                run_store=self.store,
+                run_id="run-1",
+                task_id="TASK-01",
+                log_dir=self.repo / ".vibe-loop" / "parameterized-failure-gates",
+                executor=fail_different_parameters,
+            )
+            .run(candidate)
+            .results[0]
+        )
+
+        self.assertEqual(result.failure_class, "candidate")
+        self.assertEqual(result.budget_charge, "remediation")
+        self.assertTrue(result.base_environment_failure)
+        self.assertEqual(
+            result.failure_signature,
+            ("pytest:tests/test_t.py::test_wait[5s]",),
+        )
+        self.assertEqual(
+            result.base_failure_signature,
+            ("pytest:tests/test_t.py::test_wait[10s]",),
+        )
+
     def test_pytest_collection_error_ignores_volatile_duration(self) -> None:
         candidate = self.collector.collect_derived()
 

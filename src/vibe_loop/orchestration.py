@@ -3831,8 +3831,6 @@ def _failure_signature(
     for raw_line in text.splitlines():
         line = ANSI_ESCAPE.sub("", raw_line)
         line = line.replace(worktree_text, "<worktree>")
-        line = VOLATILE_TIMESTAMP.sub("<timestamp>", line)
-        line = VOLATILE_DURATION.sub("<duration>", line)
         line = " ".join(line.split())
         if line:
             normalized_lines.append(line)
@@ -3843,7 +3841,14 @@ def _failure_signature(
     }
     if pytest_failures:
         return tuple(f"pytest:{node_id}" for node_id in sorted(pytest_failures))
-    excerpt = "\n".join(normalized_lines[-GATE_FAILURE_EXCERPT_LINES:])
+    excerpt_lines = [
+        VOLATILE_DURATION.sub(
+            "<duration>",
+            VOLATILE_TIMESTAMP.sub("<timestamp>", line),
+        )
+        for line in normalized_lines[-GATE_FAILURE_EXCERPT_LINES:]
+    ]
+    excerpt = "\n".join(excerpt_lines)
     if excerpt:
         return (f"excerpt:{excerpt[-GATE_FAILURE_EXCERPT_CHARS:]}",)
     return (f"exit-code:{exit_code}",)
