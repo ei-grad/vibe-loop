@@ -2552,6 +2552,15 @@ class DetachedAutopilotIdentity:
 
 
 @dataclasses.dataclass(frozen=True)
+class DetachedAutopilotIdentityResolution:
+    identity: DetachedAutopilotIdentity | None = None
+    blocker: str = ""
+
+
+DETACHED_START_RECORD_MAX_DELAY_SECONDS = 30.0
+
+
+@dataclasses.dataclass(frozen=True)
 class AutopilotReloadResult:
     repo: Path
     reloaded: bool
@@ -3131,9 +3140,10 @@ def detached_autopilot_identity(
     pid: int,
     repo: Path | None = None,
     process_node: Callable[[int], ProcessNode | None] | None = None,
-    process_argv: Callable[[ProcessNode], Sequence[str]] | None = None,
-) -> DetachedAutopilotIdentity | None:
-    for record in reversed(run_store.read_records()):
+    process_started_at: Callable[[ProcessNode], datetime | None] | None = None,
+) -> DetachedAutopilotIdentityResolution:
+    records = run_store.read_records()
+    for record in reversed(records):
         if record.get("record_type") != AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE:
             continue
         if record.get("launch_mode") != "detached_posix_session":
@@ -3146,21 +3156,23 @@ def detached_autopilot_identity(
         session_id = int_value(record.get("session_id"))
         process_birth_id = str(record.get("process_birth_id") or "")
         if process_group_id is None or session_id is None or not process_birth_id:
-            return None
-        return DetachedAutopilotIdentity(
-            run_id=run_id,
-            pid=pid,
-            process_group_id=process_group_id,
-            session_id=session_id,
-            process_birth_id=process_birth_id,
-            record=record,
+            continue
+        return DetachedAutopilotIdentityResolution(
+            identity=DetachedAutopilotIdentity(
+                run_id=run_id,
+                pid=pid,
+                process_group_id=process_group_id,
+                session_id=session_id,
+                process_birth_id=process_birth_id,
+                record=record,
+            )
         )
-    if repo is None or process_node is None or process_argv is None:
-        return None
+    if repo is None or process_node is None or process_started_at is None:
+        return DetachedAutopilotIdentityResolution(blocker="missing_detached_record")
     started_record = next(
         (
             record
-            for record in reversed(run_store.read_records())
+            for record in reversed(records)
             if record.get("record_type") == AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE
             and str(record.get("repo") or "") == str(repo)
             and str(record.get("run_id") or "") == run_id
@@ -3169,15 +3181,14 @@ def detached_autopilot_identity(
         None,
     )
     if started_record is None:
-        return None
+        return DetachedAutopilotIdentityResolution(blocker="missing_started_record")
     current = process_node(pid)
-    if (
-        current is None
-        or current.process_group_id != pid
-        or current.session_id != pid
-        or not current.process_birth_id
-    ):
-        return None
+    if current is None or not current.process_birth_id:
+        return DetachedAutopilotIdentityResolution(blocker="process_state_missing")
+    if current.process_group_id != pid or current.session_id != pid:
+        return DetachedAutopilotIdentityResolution(
+            blocker="process_group_or_session_mismatch"
+        )
     recorded_birth_id = str(started_record.get("process_birth_id") or "")
     recorded_detached = started_record.get("launch_mode") == "detached_posix_session"
     if recorded_birth_id and recorded_detached:
@@ -3186,62 +3197,89 @@ def detached_autopilot_identity(
             or int_value(started_record.get("process_group_id")) != pid
             or int_value(started_record.get("session_id")) != pid
         ):
-            return None
-    elif not detached_autopilot_argv_matches_repo(
-        process_argv(current),
-        repo,
-    ):
-        return None
-    return DetachedAutopilotIdentity(
-        run_id=run_id,
-        pid=pid,
-        process_group_id=current.process_group_id,
-        session_id=current.session_id,
-        process_birth_id=current.process_birth_id,
-        record=started_record,
+            return DetachedAutopilotIdentityResolution(
+                blocker="pid_reuse_or_identity_mismatch"
+            )
+        identity_source = "supervisor_started_identity"
+    else:
+        # The started record is written by the supervisor itself after it owns
+        # the lock and installs termination handlers. Its timestamp therefore
+        # bounds the original process birth: a recycled PID starts after that
+        # record, while a large wall-clock discrepancy fails the short launch
+        # window instead of weakening identity to a command-line match.
+        try:
+            recorded_at = datetime.fromisoformat(
+                str(started_record.get("occurred_at") or "").replace("Z", "+00:00")
+            )
+        except ValueError:
+            return DetachedAutopilotIdentityResolution(
+                blocker="started_record_time_invalid"
+            )
+        actual_started_at = process_started_at(current)
+        if actual_started_at is None or recorded_at.tzinfo is None:
+            return DetachedAutopilotIdentityResolution(
+                blocker="process_start_time_unverified"
+            )
+        start_record_delay = recorded_at - actual_started_at
+        if start_record_delay < timedelta(0):
+            return DetachedAutopilotIdentityResolution(
+                blocker="pid_reuse_or_identity_mismatch"
+            )
+        if start_record_delay > timedelta(
+            seconds=DETACHED_START_RECORD_MAX_DELAY_SECONDS
+        ):
+            return DetachedAutopilotIdentityResolution(
+                blocker="process_start_time_unverified"
+            )
+        identity_source = "recovered_from_process_start_time"
+    observed_record: dict[str, Any] = {
+        "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+        "record_type": AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
+        "occurred_at": utc_now_iso(),
+        "repo": str(repo),
+        "run_id": run_id,
+        "pid": pid,
+        "process_group_id": current.process_group_id,
+        "session_id": current.session_id,
+        "process_birth_id": current.process_birth_id,
+        "launch_mode": "detached_posix_session",
+        "observed_state": "recovered",
+        "identity_source": identity_source,
+    }
+    run_store.append_record(observed_record)
+    return DetachedAutopilotIdentityResolution(
+        identity=DetachedAutopilotIdentity(
+            run_id=run_id,
+            pid=pid,
+            process_group_id=current.process_group_id,
+            session_id=current.session_id,
+            process_birth_id=current.process_birth_id,
+            record=observed_record,
+        )
     )
 
 
-def detached_autopilot_argv_matches_repo(argv: Sequence[str], repo: Path) -> bool:
-    command = ("-m", "vibe_loop", "autopilot", "run")
-    for index in range(max(0, len(argv) - len(command) + 1)):
-        if tuple(argv[index : index + len(command)]) != command:
-            continue
-        remaining = argv[index + len(command) :]
-        try:
-            repo_index = remaining.index("--repo")
-            process_repo = remaining[repo_index + 1]
-        except (ValueError, IndexError):
-            return False
-        return (
-            "--detached-reload-signal" in remaining
-            and Path(process_repo).resolve() == repo.resolve()
-        )
-    return False
-
-
-def read_detached_autopilot_argv(
+def process_started_at_from_proc(
     node: ProcessNode,
     *,
-    max_cmdline_bytes: int = 4096,
-) -> tuple[str, ...]:
-    before = read_process_node(node.pid)
-    if before is None or before.process_birth_id != node.process_birth_id:
-        return ()
+    proc_root: Path = Path("/proc"),
+    now: datetime | None = None,
+) -> datetime | None:
+    _boot_id, separator, start_ticks_text = node.process_birth_id.partition(":")
+    if not separator or not start_ticks_text.isdigit():
+        return None
     try:
-        with Path(f"/proc/{node.pid}/cmdline").open("rb") as handle:
-            cmdline = handle.read(max(0, max_cmdline_bytes) + 1)
-    except OSError:
-        return ()
-    after = read_process_node(node.pid)
-    if after is None or after.process_birth_id != node.process_birth_id:
-        return ()
-    bounded_cmdline = cmdline[:max_cmdline_bytes]
-    return tuple(
-        argument.decode("utf-8", "replace")
-        for argument in bounded_cmdline.rstrip(b"\0").split(b"\0")
-        if argument
-    )
+        uptime = float((proc_root / "uptime").read_text(encoding="utf-8").split()[0])
+        clock_ticks = os.sysconf("SC_CLK_TCK")
+    except (OSError, TypeError, ValueError, IndexError):
+        return None
+    if not isinstance(clock_ticks, int) or clock_ticks <= 0:
+        return None
+    process_age = uptime - (int(start_ticks_text) / clock_ticks)
+    if not math.isfinite(process_age) or process_age < 0:
+        return None
+    observed_now = now if now is not None else datetime.now(UTC)
+    return observed_now - timedelta(seconds=process_age)
 
 
 def autopilot_child_identity(
@@ -3849,7 +3887,7 @@ def reload_detached_autopilot(
     sleep: Sleep | None = None,
     monotonic: Callable[[], float] | None = None,
     process_node: Callable[[int], ProcessNode | None] | None = None,
-    process_argv: Callable[[ProcessNode], Sequence[str]] | None = None,
+    process_started_at: Callable[[ProcessNode], datetime | None] | None = None,
 ) -> AutopilotReloadResult:
     """Request and verify a configuration reload from the detached supervisor."""
 
@@ -3887,8 +3925,10 @@ def reload_detached_autopilot(
     lookup_process_node = (
         process_node if process_node is not None else read_process_node
     )
-    lookup_process_argv = (
-        process_argv if process_argv is not None else read_detached_autopilot_argv
+    lookup_process_started_at = (
+        process_started_at
+        if process_started_at is not None
+        else process_started_at_from_proc
     )
     sleeper = sleep if sleep is not None else time_module.sleep
     clock = monotonic if monotonic is not None else time_module.monotonic
@@ -3943,14 +3983,15 @@ def reload_detached_autopilot(
             pid=pid,
             blocker="autopilot_reload_identity_unverified:missing_lock_identity",
         )
-    identity = detached_autopilot_identity(
+    identity_resolution = detached_autopilot_identity(
         run_store,
         run_id=owner_run_id,
         pid=pid,
         repo=config.repo,
         process_node=lookup_process_node,
-        process_argv=lookup_process_argv,
+        process_started_at=lookup_process_started_at,
     )
+    identity = identity_resolution.identity
     if identity is None:
         return AutopilotReloadResult(
             repo=config.repo,
@@ -3958,7 +3999,10 @@ def reload_detached_autopilot(
             state="blocked",
             run_id=owner_run_id,
             pid=pid,
-            blocker="autopilot_reload_identity_unverified:detached_identity_unrecoverable",
+            blocker=(
+                "autopilot_reload_identity_unverified:"
+                + (identity_resolution.blocker or "detached_identity_unrecoverable")
+            ),
         )
     started_record = next(
         (
@@ -4157,7 +4201,7 @@ def stop_detached_autopilot(
     monotonic: Callable[[], float] | None = None,
     process_table: Callable[[], dict[int, ProcessNode]] | None = None,
     process_node: Callable[[int], ProcessNode | None] | None = None,
-    process_argv: Callable[[ProcessNode], Sequence[str]] | None = None,
+    process_started_at: Callable[[ProcessNode], datetime | None] | None = None,
 ) -> AutopilotStopResult:
     """Stop a verified detached supervisor or explicitly recover its stale lock."""
 
@@ -4194,8 +4238,10 @@ def stop_detached_autopilot(
     lookup_process_node = (
         process_node if process_node is not None else read_process_node
     )
-    lookup_process_argv = (
-        process_argv if process_argv is not None else read_detached_autopilot_argv
+    lookup_process_started_at = (
+        process_started_at
+        if process_started_at is not None
+        else process_started_at_from_proc
     )
     sleeper = sleep if sleep is not None else time_module.sleep
     clock = monotonic if monotonic is not None else time_module.monotonic
@@ -4425,14 +4471,15 @@ def stop_detached_autopilot(
             pid=pid,
             blocker="autopilot_stop_identity_unverified:missing_lock_identity",
         )
-    identity = detached_autopilot_identity(
+    identity_resolution = detached_autopilot_identity(
         run_store,
         run_id=owner_run_id,
         pid=pid,
         repo=config.repo,
         process_node=lookup_process_node,
-        process_argv=lookup_process_argv,
+        process_started_at=lookup_process_started_at,
     )
+    identity = identity_resolution.identity
     if identity is None:
         return AutopilotStopResult(
             repo=config.repo,
@@ -4440,7 +4487,10 @@ def stop_detached_autopilot(
             state="blocked",
             run_id=owner_run_id,
             pid=pid,
-            blocker="autopilot_stop_identity_unverified:detached_identity_unrecoverable",
+            blocker=(
+                "autopilot_stop_identity_unverified:"
+                + (identity_resolution.blocker or "detached_identity_unrecoverable")
+            ),
         )
     return stop_verified_detached_autopilot(
         config=config,

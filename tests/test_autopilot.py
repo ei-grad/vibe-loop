@@ -101,7 +101,7 @@ from vibe_loop.autopilot import (
     poll_runnable_count,
     recheck_interval_for_runnable,
     recheck_sleep_slices,
-    read_detached_autopilot_argv,
+    process_started_at_from_proc,
     reload_detached_autopilot,
     reload_autopilot_cycle_config,
     runtime_code_identity,
@@ -2414,8 +2414,12 @@ class AutopilotRunTests(unittest.TestCase):
             for record in records
             if record["record_type"] == AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE
         )
-        self.assertEqual(started["process_group_id"], os.getpgid(os.getpid()))
-        self.assertEqual(started["session_id"], os.getsid(os.getpid()))
+        expected_process_group = (
+            os.getpgid(os.getpid()) if hasattr(os, "getpgid") else None
+        )
+        expected_session = os.getsid(os.getpid()) if hasattr(os, "getsid") else None
+        self.assertEqual(started["process_group_id"], expected_process_group)
+        self.assertEqual(started["session_id"], expected_session)
         self.assertEqual(
             started["process_birth_id"], process_birth_identity(os.getpid())
         )
@@ -4602,19 +4606,28 @@ class AutopilotRunTests(unittest.TestCase):
 
 
 class AutopilotStopTests(unittest.TestCase):
-    @unittest.skipUnless(sys.platform == "linux", "process argv requires Linux")
-    def test_process_argv_read_is_anchored_to_birth_identity(self) -> None:
-        current = read_process_node(os.getpid())
-        self.assertIsNotNone(current)
-        assert current is not None
+    @unittest.skipUnless(hasattr(os, "sysconf"), "proc clock requires sysconf")
+    def test_process_start_time_uses_injected_proc_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            proc_root = Path(directory)
+            (proc_root / "uptime").write_text("100.0 20.0\n", encoding="utf-8")
+            clock_ticks = os.sysconf("SC_CLK_TCK")
+            now = datetime.datetime(2026, 5, 9, tzinfo=datetime.UTC)
+            node = ProcessNode(
+                pid=4321,
+                parent_pid=1,
+                process_group_id=4321,
+                session_id=4321,
+                process_birth_id=f"boot-id:{90 * clock_ticks}",
+            )
 
-        argv = read_detached_autopilot_argv(current)
-        recycled = read_detached_autopilot_argv(
-            dataclasses.replace(current, process_birth_id="other-boot:1")
-        )
+            started_at = process_started_at_from_proc(
+                node,
+                proc_root=proc_root,
+                now=now,
+            )
 
-        self.assertTrue(argv)
-        self.assertEqual(recycled, ())
+        self.assertEqual(started_at, now - datetime.timedelta(seconds=10))
 
     def _locked_detached_supervisor(
         self,
@@ -4674,6 +4687,8 @@ class AutopilotStopTests(unittest.TestCase):
             "run_id": run_id,
             "pid": pid,
             "occurred_at": "2026-05-09T00:00:00+00:00",
+            "config_key_fingerprints": dict(config.config_key_fingerprints),
+            "reload_config_jobs": True,
         }
         if birth_id:
             record.update(
@@ -4720,15 +4735,14 @@ class AutopilotStopTests(unittest.TestCase):
                     session_id=pid,
                     process_birth_id="boot-id:123",
                 ),
-                process_argv=lambda _node: (
-                    sys.executable,
-                    "-m",
-                    "vibe_loop",
-                    "autopilot",
-                    "run",
-                    "--repo",
-                    str(config.repo),
-                    "--detached-reload-signal",
+                process_started_at=lambda _node: datetime.datetime(
+                    2026,
+                    5,
+                    8,
+                    23,
+                    59,
+                    59,
+                    tzinfo=datetime.UTC,
                 ),
             )
             lock_after = manager.status(AUTOPILOT_LOCK_NAME)
@@ -4764,7 +4778,6 @@ class AutopilotStopTests(unittest.TestCase):
                         session_id=pid,
                         process_birth_id="boot-id:recycled",
                     ),
-                    process_argv=lambda _node: (),
                     pidfd_open=lambda _pid: 28,
                     pidfd_signal=lambda pidfd, signal_number: signals.append(
                         (pidfd, signal_number)
@@ -4780,10 +4793,130 @@ class AutopilotStopTests(unittest.TestCase):
         self.assertFalse(result.stopped)
         self.assertEqual(
             result.blocker,
-            "autopilot_stop_identity_unverified:detached_identity_unrecoverable",
+            "autopilot_stop_identity_unverified:pid_reuse_or_identity_mismatch",
         )
         self.assertEqual(signals, [])
         self.assertTrue(lock_still_held)
+
+    @unittest.skipUnless(sys.platform == "linux", "verified stop requires Linux")
+    def test_stop_refuses_legacy_pid_started_after_start_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder = self._locked_unobserved_supervisor(
+                Path(directory)
+            )
+            signals: list[tuple[int, int]] = []
+            try:
+                result = stop_detached_autopilot(
+                    config,
+                    process_exists=lambda _pid: True,
+                    process_node=lambda pid: ProcessNode(
+                        pid=pid,
+                        parent_pid=1,
+                        process_group_id=pid,
+                        session_id=pid,
+                        process_birth_id="boot-id:recycled",
+                    ),
+                    process_started_at=lambda _node: datetime.datetime(
+                        2026,
+                        5,
+                        9,
+                        0,
+                        0,
+                        1,
+                        tzinfo=datetime.UTC,
+                    ),
+                    pidfd_open=lambda _pid: 29,
+                    pidfd_signal=lambda pidfd, signal_number: signals.append(
+                        (pidfd, signal_number)
+                    ),
+                )
+                lock_still_held = manager.status(AUTOPILOT_LOCK_NAME) is not None
+            finally:
+                manager.release_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token=str(holder.metadata["fencing_token"]),
+                )
+
+        self.assertFalse(result.stopped)
+        self.assertEqual(
+            result.blocker,
+            "autopilot_stop_identity_unverified:pid_reuse_or_identity_mismatch",
+        )
+        self.assertEqual(signals, [])
+        self.assertTrue(lock_still_held)
+
+    @unittest.skipUnless(sys.platform == "linux", "verified reload requires Linux")
+    def test_reload_recovers_identity_without_parent_observed_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder = self._locked_unobserved_supervisor(
+                Path(directory)
+            )
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            signals: list[tuple[int, int]] = []
+
+            def send_signal(pidfd: int, signal_number: int) -> None:
+                signals.append((pidfd, signal_number))
+                request = next(
+                    record
+                    for record in reversed(run_store.read_records())
+                    if record.get("record_type")
+                    == AUTOPILOT_CONFIG_RELOAD_REQUESTED_RECORD_TYPE
+                )
+                run_store.append_record(
+                    {
+                        "record_type": AUTOPILOT_CONFIG_RELOAD_RESULT_RECORD_TYPE,
+                        "run_id": "autopilot-1",
+                        "request_id": request["request_id"],
+                        "state": "unchanged",
+                        "changed_keys": [],
+                    }
+                )
+
+            try:
+                result = reload_detached_autopilot(
+                    config,
+                    process_exists=lambda _pid: True,
+                    process_group_lookup=lambda _pid: 4321,
+                    session_lookup=lambda _pid: 4321,
+                    birth_identity_lookup=lambda _pid: "boot-id:123",
+                    pidfd_open=lambda _pid: 30,
+                    pidfd_signal=send_signal,
+                    close_fd=lambda _pidfd: None,
+                    process_node=lambda pid: ProcessNode(
+                        pid=pid,
+                        parent_pid=1,
+                        process_group_id=pid,
+                        session_id=pid,
+                        process_birth_id="boot-id:123",
+                    ),
+                    process_started_at=lambda _node: datetime.datetime(
+                        2026,
+                        5,
+                        8,
+                        23,
+                        59,
+                        59,
+                        tzinfo=datetime.UTC,
+                    ),
+                )
+                observed = [
+                    record
+                    for record in run_store.read_records()
+                    if record.get("record_type")
+                    == AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE
+                ]
+            finally:
+                manager.release_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token=str(holder.metadata["fencing_token"]),
+                )
+
+        self.assertTrue(result.reloaded)
+        self.assertEqual(result.state, "unchanged")
+        self.assertEqual(signals, [(30, signal.SIGHUP)])
+        self.assertEqual(
+            observed[-1]["identity_source"], "recovered_from_process_start_time"
+        )
 
     @unittest.skipUnless(sys.platform == "linux", "verified stop requires Linux")
     def test_stop_signals_exact_pidfd_and_verifies_lock_release(self) -> None:
