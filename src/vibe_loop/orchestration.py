@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -5321,29 +5322,40 @@ class Integrator:
                 f"{type(exc).__name__}"
             )
 
-        if checkout.exists():
+        clone_required = not checkout.exists()
+        if not clone_required:
             if not checkout.is_dir():
-                return None, "main verification checkout path is not a directory"
-            top_level = self._git(checkout, "rev-parse", "--show-toplevel")
-            git_dir = self._git(checkout, "rev-parse", "--absolute-git-dir")
-            try:
-                valid_checkout = (
-                    top_level.returncode == 0
-                    and Path(top_level.stdout.strip()).resolve() == checkout
-                    and git_dir.returncode == 0
-                    and Path(git_dir.stdout.strip()).resolve() == checkout / ".git"
-                )
-            except OSError:
-                valid_checkout = False
-            if not valid_checkout:
-                return None, "existing main verification checkout is not standalone"
-            reset = self._git(checkout, "reset", "--hard", "--quiet")
-            if reset.returncode != 0:
-                return None, self._bounded_git_output(reset)
-            clean = self._git(checkout, "clean", "-ffdx", "--quiet")
-            if clean.returncode != 0:
-                return None, self._bounded_git_output(clean)
-        else:
+                replacement_error = self._discard_main_verification_checkout(checkout)
+                if replacement_error:
+                    return None, replacement_error
+                clone_required = True
+            else:
+                top_level = self._git(checkout, "rev-parse", "--show-toplevel")
+                git_dir = self._git(checkout, "rev-parse", "--absolute-git-dir")
+                try:
+                    valid_checkout = (
+                        top_level.returncode == 0
+                        and Path(top_level.stdout.strip()).resolve() == checkout
+                        and git_dir.returncode == 0
+                        and Path(git_dir.stdout.strip()).resolve() == checkout / ".git"
+                    )
+                except OSError:
+                    valid_checkout = False
+                if valid_checkout:
+                    reset = self._git(checkout, "reset", "--hard", "--quiet")
+                    valid_checkout = reset.returncode == 0
+                if valid_checkout:
+                    clean = self._git(checkout, "clean", "-ffdx", "--quiet")
+                    valid_checkout = clean.returncode == 0
+                if not valid_checkout:
+                    replacement_error = self._discard_main_verification_checkout(
+                        checkout
+                    )
+                    if replacement_error:
+                        return None, replacement_error
+                    clone_required = True
+
+        if clone_required:
             clone = self._git(
                 self.repo,
                 "clone",
@@ -5376,6 +5388,20 @@ class Integrator:
         if checked_out.returncode != 0:
             return None, self._bounded_git_output(checked_out)
         return checkout, ""
+
+    @staticmethod
+    def _discard_main_verification_checkout(checkout: Path) -> str:
+        try:
+            if checkout.is_dir():
+                shutil.rmtree(checkout)
+            else:
+                checkout.unlink()
+        except OSError as exc:
+            return (
+                f"main verification checkout at {checkout} could not be replaced; "
+                f"remove that path and retry: {type(exc).__name__}"
+            )
+        return ""
 
     def _link_ignored_verification_state(self, checkout: Path) -> str:
         ignored = self._git(

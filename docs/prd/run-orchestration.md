@@ -378,8 +378,9 @@ Main verification runs the exact target commit in the stable standalone clone
 at `.vibe-loop/main-verification/repo`, whose refs and worktree registry are
 independent of the live primary repository. Before each verification, the
 runtime hard-resets the checkout, removes checkout-owned untracked and ignored
-state, fetches the exact target commit, and recreates links to the primary
-repository's current ignored paths. The stable checkout path lets shared build
+state, and replaces an invalid or unclean checkout before fetching the exact
+target commit and recreating links to the primary repository's current ignored
+paths. The stable checkout path lets shared build
 outputs such as Cargo `target/` directories safely retain embedded absolute
 manifest paths across verification runs and operator builds. Shared virtual
 environments, tool caches, and downloaded artifacts likewise retain their
