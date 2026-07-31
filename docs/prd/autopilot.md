@@ -310,9 +310,12 @@ identity. The verified live path is Linux-only and must use the recorded run,
 PID, process-group/session identity, kernel process-birth identity, and pidfd
 signaling so PID reuse cannot redirect the signal. A detached observation
 written by `autopilot start` is an optimization, not the sole source of truth.
-When that observation is missing, `stop` and `reload` may reconstruct it only
-from a matching repository/run/PID supervisor-started record and the live
-process identity. The process must be its own process-group and session leader.
+When that observation is missing, `stop` may reconstruct it only from a
+matching repository/run/PID supervisor-started record and the live process
+identity. `reload` may use the reconstructed identity only when the started
+record also proves the supervisor installed the reload signal handler;
+otherwise it must refuse without opening a pidfd or sending a signal. The
+process must be its own process-group and session leader.
 For current started records, the recorded birth, process-group, and session
 identity must match the live process. For legacy started records without those
 fields, the process start time derived from the kernel birth ticks and uptime

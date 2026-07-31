@@ -3190,12 +3190,26 @@ def detached_autopilot_identity(
             blocker="process_group_or_session_mismatch"
         )
     recorded_birth_id = str(started_record.get("process_birth_id") or "")
-    recorded_detached = started_record.get("launch_mode") == "detached_posix_session"
-    if recorded_birth_id and recorded_detached:
+    recorded_process_group_id = int_value(started_record.get("process_group_id"))
+    recorded_session_id = int_value(started_record.get("session_id"))
+    recorded_identity_present = (
+        bool(recorded_birth_id)
+        or recorded_process_group_id is not None
+        or recorded_session_id is not None
+    )
+    if recorded_identity_present:
+        if (
+            not recorded_birth_id
+            or recorded_process_group_id is None
+            or recorded_session_id is None
+        ):
+            return DetachedAutopilotIdentityResolution(
+                blocker="started_record_identity_incomplete"
+            )
         if (
             recorded_birth_id != current.process_birth_id
-            or int_value(started_record.get("process_group_id")) != pid
-            or int_value(started_record.get("session_id")) != pid
+            or recorded_process_group_id != pid
+            or recorded_session_id != pid
         ):
             return DetachedAutopilotIdentityResolution(
                 blocker="pid_reuse_or_identity_mismatch"
@@ -3242,7 +3256,10 @@ def detached_autopilot_identity(
         "process_group_id": current.process_group_id,
         "session_id": current.session_id,
         "process_birth_id": current.process_birth_id,
-        "launch_mode": "detached_posix_session",
+        "launch_mode": started_record.get("launch_mode"),
+        "reload_signal_supported": (
+            started_record.get("launch_mode") == "detached_posix_session"
+        ),
         "observed_state": "recovered",
         "identity_source": identity_source,
     }
@@ -4003,6 +4020,21 @@ def reload_detached_autopilot(
                 "autopilot_reload_identity_unverified:"
                 + (identity_resolution.blocker or "detached_identity_unrecoverable")
             ),
+        )
+    recorded_reload_support = identity.record.get("reload_signal_supported")
+    reload_signal_supported = (
+        recorded_reload_support
+        if isinstance(recorded_reload_support, bool)
+        else identity.record.get("launch_mode") == "detached_posix_session"
+    )
+    if not reload_signal_supported:
+        return AutopilotReloadResult(
+            repo=config.repo,
+            reloaded=False,
+            state="blocked",
+            run_id=owner_run_id,
+            pid=pid,
+            blocker="autopilot_reload_signal_unsupported",
         )
     started_record = next(
         (
