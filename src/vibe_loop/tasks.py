@@ -5,10 +5,13 @@ import difflib
 import json
 import os
 import re
+import signal
 import subprocess
+import threading
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
-from typing import Protocol
+from typing import BinaryIO, Protocol
 
 from vibe_loop.config import (
     DEFAULT_PLAN_PATHS,
@@ -31,6 +34,11 @@ TASK_SOURCE_ERROR_LAST_LINE_LIMIT = 500
 TASK_SOURCE_ERROR_LINE_LIMIT = 1024
 TASK_SOURCE_ERROR_RAW_WINDOW_LIMIT = 4096
 TASK_SOURCE_ERROR_TRUNCATION_MARKER = "[truncated] "
+TASK_SOURCE_CAPABILITIES_STREAM_LIMIT = 64 * 1024
+TASK_SOURCE_CAPABILITIES_STRING_LIMIT = 256
+TASK_SOURCE_CAPABILITIES_LIST_LIMIT = 256
+TASK_SOURCE_FENCED_RESET_CAPABILITY = "task-source-reset:fenced-owner:v1"
+TASK_SOURCE_FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 # Names whose *absence* from an adapter invocation is an assertion the runtime
 # makes, not an accident. The session attribution names say "this run recorded
 # no such session or quality"; the review-carryover pair says "this settlement
@@ -2665,6 +2673,230 @@ def build_adapter_environment(
             environment.pop(name, None)
     environment.update(supplied)
     return environment
+
+
+def task_source_adapter_report(
+    repo: Path,
+    config: TaskSourceConfig,
+    *,
+    runtime_context: Mapping[str, str] | None = None,
+) -> dict[str, object]:
+    configured = bool(config.capabilities_command)
+    report: dict[str, object] = {
+        "capabilities_command_configured": configured,
+        "capabilities_command_redacted": configured,
+        "status": "not_configured" if not configured else "deployment_gap",
+        "reason": None,
+        "identity": None,
+    }
+    if not config.capabilities_command:
+        return report
+
+    stdout, reason = run_bounded_capabilities_command(
+        repo,
+        config.capabilities_command,
+        timeout=config.command_timeout_seconds,
+        runtime_context=runtime_context,
+    )
+    if reason is not None:
+        report["reason"] = reason
+        return report
+    try:
+        payload = json.loads(stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        report["reason"] = "invalid_json"
+        return report
+    identity = validate_task_source_adapter_identity(payload)
+    if identity is None:
+        report["reason"] = "invalid_document"
+        return report
+    if (
+        config.reset_command is not None
+        and TASK_SOURCE_FENCED_RESET_CAPABILITY not in identity["capabilities"]
+    ):
+        report["reason"] = "required_capability_missing"
+        return report
+    report.update(status="available", reason=None, identity=identity)
+    return report
+
+
+def run_bounded_capabilities_command(
+    repo: Path,
+    command: str,
+    *,
+    timeout: float,
+    runtime_context: Mapping[str, str] | None = None,
+) -> tuple[bytes, str | None]:
+    environment = build_adapter_environment(runtime_context)
+    popen_kwargs: dict[str, object] = {}
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(
+            subprocess,
+            "CREATE_NEW_PROCESS_GROUP",
+            0,
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=repo,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            **popen_kwargs,
+        )
+    except (OSError, ValueError):
+        return b"", "command_start_failed"
+
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout = bytearray()
+    stderr = bytearray()
+    stdout_overflow = threading.Event()
+    lock = threading.Lock()
+    readers = (
+        threading.Thread(
+            target=_drain_bounded_stream,
+            args=(process.stdout, stdout, lock, stdout_overflow),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_drain_bounded_stream,
+            args=(process.stderr, stderr, lock, None),
+            daemon=True,
+        ),
+    )
+    for reader in readers:
+        reader.start()
+
+    reason: str | None = None
+    deadline = time.monotonic() + timeout
+    while process.poll() is None or any(reader.is_alive() for reader in readers):
+        if stdout_overflow.is_set():
+            reason = "stdout_limit_exceeded"
+            break
+        if time.monotonic() >= deadline:
+            reason = "command_timeout"
+            break
+        time.sleep(0.01)
+    if stdout_overflow.is_set():
+        reason = "stdout_limit_exceeded"
+    if reason is not None:
+        _terminate_capabilities_process_group(process)
+    else:
+        process.wait()
+
+    for reader in readers:
+        reader.join(timeout=1.0)
+    for stream in (process.stdout, process.stderr):
+        stream.close()
+    for reader in readers:
+        reader.join(timeout=1.0)
+    if reason is not None:
+        return bytes(stdout), reason
+    if process.returncode != 0:
+        return bytes(stdout), "command_failed"
+    return bytes(stdout), None
+
+
+def _drain_bounded_stream(
+    stream: BinaryIO,
+    retained: bytearray,
+    lock: threading.Lock,
+    overflow: threading.Event | None,
+) -> None:
+    try:
+        read_available = getattr(stream, "read1", stream.read)
+        while chunk := read_available(8192):
+            with lock:
+                remaining = TASK_SOURCE_CAPABILITIES_STREAM_LIMIT - len(retained)
+                if remaining > 0:
+                    retained.extend(chunk[:remaining])
+                if overflow is not None and len(chunk) > remaining:
+                    overflow.set()
+    except (OSError, ValueError):
+        return
+
+
+def _terminate_capabilities_process_group(
+    process: subprocess.Popen[bytes],
+) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        return
+
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + 0.25
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    process.wait()
+
+
+def validate_task_source_adapter_identity(payload: object) -> dict[str, object] | None:
+    if not isinstance(payload, dict):
+        return None
+    schema_version = payload.get("schema_version")
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool):
+        return None
+    if schema_version != 1:
+        return None
+    identity: dict[str, object] = {"schema_version": schema_version}
+    for key in ("adapter", "package", "package_version"):
+        value = payload.get(key)
+        if not _bounded_nonempty_string(value):
+            return None
+        identity[key] = value
+    fingerprint = payload.get("source_fingerprint")
+    if not isinstance(fingerprint, str) or not TASK_SOURCE_FINGERPRINT_RE.fullmatch(
+        fingerprint
+    ):
+        return None
+    identity["source_fingerprint"] = fingerprint
+    editable_install = payload.get("editable_install")
+    if editable_install is not None and not isinstance(editable_install, bool):
+        return None
+    identity["editable_install"] = editable_install
+    capabilities = payload.get("capabilities")
+    if (
+        not isinstance(capabilities, list)
+        or len(capabilities) > TASK_SOURCE_CAPABILITIES_LIST_LIMIT
+        or not all(_bounded_nonempty_string(item) for item in capabilities)
+    ):
+        return None
+    identity["capabilities"] = list(capabilities)
+    return identity
+
+
+def _bounded_nonempty_string(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and len(value) <= TASK_SOURCE_CAPABILITIES_STRING_LIMIT
+    )
 
 
 def run_json_command(

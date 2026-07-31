@@ -1617,6 +1617,37 @@ class ConfigTests(unittest.TestCase):
 
         self.assertIsNone(config.task_source.health_command)
 
+    def test_task_source_capabilities_hook_is_diagnostics_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                '[task_source]\ncapabilities = "loopyard vibe capabilities"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(
+            config.task_source.capabilities_command,
+            "loopyard vibe capabilities",
+        )
+        self.assertTrue(config.task_source.is_explicit("capabilities"))
+        self.assertEqual(config.task_source.explicit_source_keys, ())
+        self.assertTrue(config.task_source.allows_generated_cache)
+        self.assertEqual(
+            config.task_source.to_json()["capabilities_command"],
+            "loopyard vibe capabilities",
+        )
+
+    def test_task_source_capabilities_hook_defaults_to_none(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text("[task_source]\n", encoding="utf-8")
+
+            config = load_config(repo)
+
+        self.assertIsNone(config.task_source.capabilities_command)
+
     def test_task_source_completion_and_park_hooks_are_explicit_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

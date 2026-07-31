@@ -50,6 +50,7 @@ plan_path = "PLAN.md"
 plan_paths = ["PLAN.md", "docs/PLAN.md", "ROADMAP.md", "TODO.md"]
 runnable_statuses = ["Active", "Next", "Planned"]
 # health = "tracker db verify"
+# capabilities = "loopyard vibe capabilities"
 
 [completion]
 commands = [
@@ -315,6 +316,14 @@ statuses without disabling a generated parser.
 not select a source or disable generated discovery; its cycle behavior is
 authoritative in
 [PRD-AUT-005](prd/autopilot.md#prd-aut-005-configured-maintenance-hooks).
+`task_source.capabilities` is an optional, explicit adapter deployment
+diagnostic command. It runs only from `vibe-loop doctor`, does not select a task
+source or disable generated discovery, and is never inferred from other task
+source settings or installed executables. Its execution and validation behavior
+is defined by
+[PRD-TSK-008](prd/task-discovery.md#prd-tsk-008-adapter-capability-diagnostics),
+while its redacted output is defined by the
+[CLI reference](cli-reference.md#vibe-loop-doctor).
 
 The generated `markdown-profile` source type is emitted by `tasks configure
 --promotion-toml`; see
@@ -379,6 +388,7 @@ configuration section now lives.
 | `agent.profiles.*`; routing `profile`, `match_hazards_any`, `match_paths_glob`, `match_task_id_regex`, `match_title_regex`, `match_priority`; per-task `agent`, `model`, `hazards` | Per-task agent routing above. |
 | `task_source.type`, `plan_path`, `plan_paths`, `profile`, `runnable_statuses`, `list`, `next`, `probe`, `activate`, `complete`, `reset`, `park` | [Generated Task Discovery](generated-task-discovery.md) and [Task Discovery PRD](prd/task-discovery.md). |
 | `task_source.health` | [PRD-AUT-005](prd/autopilot.md#prd-aut-005-configured-maintenance-hooks). |
+| `task_source.capabilities` | Task-source configuration above and [PRD-TSK-008](prd/task-discovery.md#prd-tsk-008-adapter-capability-diagnostics). |
 | Profile fields `resources`, `paths`, `column`, `none_values`; ralphex conflict surfaces; `spec-kit`, `kiro`, `openspec` | [Generated Task Discovery](generated-task-discovery.md) and the [ralphex example](examples/ralphex-markdown-plan.md). |
 | `completion.commands` | Other configuration groups above and [PRD-CLI-003](prd/cli-runtime.md#prd-cli-003-completion-checks). |
 | `orchestration.mode`, `reviewer_profile`; reviewer routing `profile`, `match_implementer_profile`, `match_implementer_provider`; `task_provenance_mode`, `external_completion_actor`, `max_initial_review_passes`, `max_closure_review_passes`, `reviewer_concurrency_budget`, `max_candidate_reanchors`, `integration_lock_timeout_seconds` | Reviewer routing above, [PRD-ORC-005](prd/run-orchestration.md#prd-orc-005-reviewer-routing-identity-and-continuation), and [runtime integration](prd/run-orchestration.md#prd-orc-007-runtime-integration-and-task-provenance). |

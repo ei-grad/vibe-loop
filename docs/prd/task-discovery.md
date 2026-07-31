@@ -190,3 +190,42 @@ reported as repository-owned recovery guidance and are not run automatically.
 
 Related implementation IDs: `CORE-02`, `DISC-10`, `PAR-01`, `PAR-07`,
 `PAR-08`.
+
+## PRD-TSK-008 Adapter Capability Diagnostics
+
+An external task-source adapter may expose a versioned deployment identity
+through an explicitly configured diagnostic command. The option spelling is
+owned by the
+[configuration reference](../configuration.md#task-source-configuration).
+It is observed deployment evidence only: it does not select a task source,
+disable generated discovery, run during dispatch, gate lock acquisition, or
+infer an expected adapter or fingerprint from PATH, other task-source commands,
+adapter names, or local checkouts.
+
+`doctor` runs the diagnostic only when explicitly configured, with the existing
+task-source command timeout. It streams stdout and stderr concurrently, retains
+at most 64 KiB from each, and drains/discards stderr beyond its retention cap.
+On timeout or stdout overflow it terminates the owned process group and reaps
+the process. Other task-source command execution semantics remain unchanged.
+
+The consumer accepts schema version 1; bounded non-empty adapter, package, and
+package-version strings; a complete `sha256:` fingerprint with 64 lowercase
+hexadecimal characters; nullable boolean editable-install classification; and a
+bounded list of bounded non-empty capability strings. It forwards only those
+known producer fields. When reset is configured, the observed capabilities must
+include `task-source-reset:fenced-owner:v1`; without reset, absence of that
+capability is not a deployment gap. Vibe-loop does not label the observed
+identity current, stale, intended, or matching because it has no independent
+expected fingerprint.
+
+The diagnostic contract produced by Loopyard remains owned by
+[Loopyard's vibe-loop contracts](https://github.com/ei-grad/loopyard/blob/main/docs/vibe-loop-contracts.md).
+The [CLI reference](../cli-reference.md#vibe-loop-doctor) owns the public doctor
+subtree, statuses, reasons, and redaction-safe output shape.
+
+Acceptance must cover opt-in execution, absent-option compatibility, bounded
+live collection, timeout/overflow termination and reap, strict v1 validation,
+complete fingerprint preservation, nullable editable-install classification,
+unknown-field omission, conditional fenced-reset capability, fixed doctor
+projection, command and stream secrecy, complete/park/capabilities command
+redaction, and comparison against the real Loopyard producer.

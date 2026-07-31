@@ -316,6 +316,7 @@ TASK_SOURCE_CONFIG_KEYS = frozenset(
         "probe",
         "activate",
         "health",
+        "capabilities",
         "complete",
         "reset",
         "park",
@@ -994,6 +995,10 @@ class TaskSourceConfig:
     # does not select or replace the active source; it lets every repository
     # depending on an external backend verify that dependency independently.
     health_command: str | None = None
+    # Optional deployment diagnostic for the configured task-source adapter.
+    # It is intentionally not a source-selection key and is invoked only by
+    # doctor when explicitly configured.
+    capabilities_command: str | None = None
     # Optional runtime-owned completion adapter. The command performs the
     # project-owned terminal transition and returns the normalized task JSON
     # that confirms it.
@@ -1049,6 +1054,7 @@ class TaskSourceConfig:
             "probe_command": self.probe_command,
             "activate_command": self.activate_command,
             "health_command": self.health_command,
+            "capabilities_command": self.capabilities_command,
             "complete_command": self.complete_command,
             "reset_command": self.reset_command,
             "park_command": self.park_command,
@@ -2780,6 +2786,7 @@ def parse_task_source(data: object) -> TaskSourceConfig:
         probe_command=optional_string(table.get("probe")),
         activate_command=optional_string(table.get("activate")),
         health_command=optional_string(table.get("health")),
+        capabilities_command=optional_string(table.get("capabilities")),
         complete_command=optional_string(table.get("complete")),
         reset_command=optional_string(table.get("reset")),
         park_command=optional_string(table.get("park")),

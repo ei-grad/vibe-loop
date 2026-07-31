@@ -34,7 +34,15 @@ over generated cache and auto-detected behavior.
 Acceptance must cover `main_branch`, `state_dir`, `agent`, `task_source`,
 `completion`, and `planning_analytics` settings; explicit-versus-default source
 tracking; safe reporting that does not print raw command strings where those may
-include local sensitive details; and validation errors for unsupported values.
+include local sensitive details; complete redaction of task-source list, probe,
+activation, health, completion, reset, park, and capability-diagnostic commands;
+no projection of capability-command output or error streams outside the
+validated identity; preservation of doctor fields that intentionally report
+repository and runtime paths; and validation errors for unsupported values.
+The task-source capability behavior is owned by
+[PRD-TSK-008](task-discovery.md#prd-tsk-008-adapter-capability-diagnostics), and
+its immediate output shape is owned by the
+[CLI reference](../cli-reference.md#vibe-loop-doctor).
 
 Related implementation IDs: `AGENT-02`, `AGENT-04`, `CORE-03`, `DISC-01`,
 `DISC-04`, `GANTT-01`, `GANTT-05`.

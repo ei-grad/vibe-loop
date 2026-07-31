@@ -146,7 +146,7 @@ from vibe_loop.task_views import (
     render_task_tree,
     task_tree_json,
 )
-from vibe_loop.tasks import Task, build_task_source
+from vibe_loop.tasks import Task, build_task_source, task_source_adapter_report
 from vibe_loop.workers import (
     ActiveRunState,
     StaleLock,
@@ -1172,6 +1172,11 @@ def dispatch(args: argparse.Namespace) -> int:
     if args.command == "doctor":
         contract_blockers = config_contract_blockers(config)
         task_source_runtime = runtime_task_source_report(config)
+        task_source_adapter = task_source_adapter_report(
+            config.repo,
+            config.task_source,
+            runtime_context=config.runtime_environment,
+        )
         runner = VibeRunner(config)
         workers = build_worker_views(
             runner.lock_manager,
@@ -1240,6 +1245,7 @@ def dispatch(args: argparse.Namespace) -> int:
                     "task_source_runtime": redacted_task_source_report(
                         task_source_runtime,
                     ),
+                    "task_source_adapter": task_source_adapter,
                     "generated_task_profile": generated_task_cache_report(config),
                     "specs": build_spec_diagnostics_report(
                         config,
@@ -1435,7 +1441,10 @@ def redact_task_source_payload(payload: dict[str, object]) -> dict[str, object]:
         "probe_command",
         "activate_command",
         "health_command",
+        "capabilities_command",
+        "complete_command",
         "reset_command",
+        "park_command",
     ):
         configured = bool(redacted.pop(key, None))
         redacted[f"{key}_configured"] = configured

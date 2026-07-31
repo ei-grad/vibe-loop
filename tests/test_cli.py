@@ -2487,6 +2487,16 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
             repo.mkdir()
+            complete_secret = "COMPLETE_COMMAND_SENTINEL"
+            park_secret = "PARK_COMMAND_SENTINEL"
+            capability_secret = "CAPABILITY_COMMAND_SENTINEL"
+            stderr_secret = "CAPABILITY_STDERR_SENTINEL"
+            capability_command = shell_command(
+                sys.executable,
+                "-c",
+                f"import sys; sys.stderr.write({stderr_secret!r}); raise SystemExit(7)",
+                capability_secret,
+            )
             lock_acquire_command = shell_command(
                 sys.executable,
                 "-c",
@@ -2516,6 +2526,9 @@ class CliTests(unittest.TestCase):
                 'list = "PRIVATE_VALUE tracker list"\n'
                 'next = "PRIVATE_VALUE tracker next"\n'
                 'probe = "PRIVATE_VALUE tracker probe"\n'
+                f"complete = {json.dumps(complete_secret + ' complete {{task_id}}')}\n"
+                f"park = {json.dumps(park_secret + ' park {{task_id}}')}\n"
+                f"capabilities = {json.dumps(capability_command)}\n"
                 "[locks]\n"
                 'type = "command"\n'
                 f"acquire_command = {json.dumps(lock_acquire_command)}\n"
@@ -2540,16 +2553,113 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("tracker list", stdout.getvalue())
         self.assertNotIn("locks acquire", stdout.getvalue())
         self.assertNotIn("PRIVATE_VALUE completion", stdout.getvalue())
+        self.assertNotIn(complete_secret, stdout.getvalue())
+        self.assertNotIn(park_secret, stdout.getvalue())
+        self.assertNotIn(capability_secret, stdout.getvalue())
+        self.assertNotIn(stderr_secret, stdout.getvalue())
         self.assertNotIn("list_command", payload["task_source"])
         self.assertTrue(payload["task_source"]["list_command_configured"])
         self.assertTrue(payload["task_source"]["list_command_redacted"])
         runtime_source = payload["task_source_runtime"]["task_source"]
         self.assertNotIn("list_command", runtime_source)
         self.assertTrue(runtime_source["list_command_configured"])
+        for key in ("complete_command", "park_command", "capabilities_command"):
+            self.assertNotIn(key, payload["task_source"])
+            self.assertTrue(payload["task_source"][f"{key}_configured"])
+            self.assertTrue(payload["task_source"][f"{key}_redacted"])
+            self.assertNotIn(key, runtime_source)
+            self.assertTrue(runtime_source[f"{key}_configured"])
+            self.assertTrue(runtime_source[f"{key}_redacted"])
+        self.assertEqual(
+            payload["task_source_adapter"],
+            {
+                "capabilities_command_configured": True,
+                "capabilities_command_redacted": True,
+                "status": "deployment_gap",
+                "reason": "command_failed",
+                "identity": None,
+            },
+        )
         self.assertNotIn("acquire_command", payload["locks"])
         self.assertTrue(payload["locks"]["acquire_command_configured"])
         self.assertEqual(payload["completion"]["commands_configured"], 1)
         self.assertTrue(payload["completion"]["commands_redacted"])
+
+    def test_doctor_reports_valid_task_source_adapter_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            fingerprint = "sha256:" + "b" * 64
+            identity = {
+                "schema_version": 1,
+                "adapter": "loopyard-vibe",
+                "package": "loopyard",
+                "package_version": "0.1.2",
+                "source_fingerprint": fingerprint,
+                "editable_install": None,
+                "capabilities": ["task-source-reset:fenced-owner:v1"],
+            }
+            command = shell_command(
+                sys.executable,
+                "-c",
+                f"import json; print(json.dumps({identity!r}))",
+            )
+            config_path = repo / ".vibe-loop.toml"
+            config_path.write_text(
+                "[task_source]\n"
+                f"capabilities = {json.dumps(command)}\n"
+                'reset = "tracker reset {task_id}"\n',
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["doctor", "--repo", str(repo), "--json"])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(
+            payload["task_source_adapter"],
+            {
+                "capabilities_command_configured": True,
+                "capabilities_command_redacted": True,
+                "status": "available",
+                "reason": None,
+                "identity": identity,
+            },
+        )
+        self.assertEqual(payload["repo"], str(repo.resolve()))
+        self.assertEqual(payload["config"]["path"], str(config_path.resolve()))
+        self.assertEqual(payload["state_dir"], ".vibe-loop")
+        self.assertNotIn(command, stdout.getvalue())
+
+    def test_doctor_does_not_probe_unconfigured_task_source_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            stdout = StringIO()
+            with patch(
+                "vibe_loop.tasks.run_bounded_capabilities_command"
+            ) as capability_probe:
+                with redirect_stdout(stdout):
+                    exit_code = main(["doctor", "--repo", str(repo), "--json"])
+
+            payload = json.loads(stdout.getvalue())
+
+        capability_probe.assert_not_called()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            payload["task_source_adapter"],
+            {
+                "capabilities_command_configured": False,
+                "capabilities_command_redacted": False,
+                "status": "not_configured",
+                "reason": None,
+                "identity": None,
+            },
+        )
 
     def test_doctor_exposes_configured_disk_reserve(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -19,6 +19,56 @@ product behavior:
 | `eval` | [Evals and release PRD](prd/evals-release.md) | The PRD owns evaluation behavior, artifact contracts, external adapters, and release policy; the [evaluation strategy](skill-evaluation-strategy.md) provides methodology and rationale. |
 | Session linkage, recovery, and usage telemetry | [Autopilot PRD](prd/autopilot.md#prd-aut-013-observed-agent-session-id-and-transcript-linkage) | PRD-AUT-013, PRD-AUT-014, and PRD-AUT-016 own these run-provenance contracts. |
 
+## Diagnostic Commands
+
+### `vibe-loop doctor`
+
+Print the resolved, redacted repository diagnostics:
+
+```bash
+vibe-loop doctor --repo . --json
+```
+
+- `--repo PATH` selects the repository. It defaults to the current directory.
+- `--json` requests the structured document. Doctor retains its existing JSON
+  output compatibility when the flag is omitted.
+
+The top-level `task_source_adapter` object always has this fixed shape:
+
+```json
+{
+  "capabilities_command_configured": true,
+  "capabilities_command_redacted": true,
+  "status": "available",
+  "reason": null,
+  "identity": {
+    "schema_version": 1,
+    "adapter": "loopyard-vibe",
+    "package": "loopyard",
+    "package_version": "0.1.2",
+    "source_fingerprint": "sha256:<64 lowercase hexadecimal characters>",
+    "editable_install": true,
+    "capabilities": ["task-source-reset:fenced-owner:v1"]
+  }
+}
+```
+
+`status` is `not_configured`, `available`, or `deployment_gap`. `identity` is
+the validated producer document only for `available`; otherwise it is `null`.
+`reason` is `null` for `not_configured` and `available`. For `deployment_gap`,
+it is `command_start_failed`, `command_failed`, `command_timeout`,
+`stdout_limit_exceeded`, `invalid_json`, `invalid_document`, or
+`required_capability_missing`. The command flags are both false when omitted and
+both true when configured, independent of probe outcome. Doctor exits zero for
+all three adapter diagnostic statuses.
+
+The subtree never includes command text, arguments, environment values, raw
+stdout or stderr, or working/source paths. Existing doctor repository, config,
+state, workspace, and log path fields remain intentional. The
+[configuration reference](configuration.md#task-source-configuration) owns the
+option spelling; [PRD-TSK-008](prd/task-discovery.md#prd-tsk-008-adapter-capability-diagnostics)
+owns execution and validation behavior.
+
 ## Run Commands
 
 ### `vibe-loop run`

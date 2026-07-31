@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -2616,6 +2617,210 @@ class WithheldAdapterEnvironmentTests(unittest.TestCase):
 
         assert isinstance(payload, dict)
         self.assertEqual(payload["echo"], token)
+
+
+class TaskSourceCapabilitiesDiagnosticTests(unittest.TestCase):
+    FINGERPRINT = "sha256:" + "a" * 64
+
+    @classmethod
+    def identity(cls, **overrides: object) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "adapter": "loopyard-vibe",
+            "package": "loopyard",
+            "package_version": "0.1.2",
+            "source_fingerprint": cls.FINGERPRINT,
+            "editable_install": None,
+            "capabilities": ["task-source-reset:fenced-owner:v1"],
+        }
+        payload.update(overrides)
+        return payload
+
+    @staticmethod
+    def command(script: str) -> str:
+        return shlex.join([sys.executable, "-c", script])
+
+    def test_unconfigured_report_does_not_launch_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch("vibe_loop.tasks.subprocess.Popen") as popen:
+                report = tasks_module.task_source_adapter_report(
+                    Path(directory),
+                    TaskSourceConfig(),
+                )
+
+        popen.assert_not_called()
+        self.assertEqual(
+            report,
+            {
+                "capabilities_command_configured": False,
+                "capabilities_command_redacted": False,
+                "status": "not_configured",
+                "reason": None,
+                "identity": None,
+            },
+        )
+
+    def test_valid_identity_is_bounded_to_public_fields(self) -> None:
+        payload = self.identity(unknown_path="/private/source")
+        command = self.command(f"import json; print(json.dumps({payload!r}))")
+        config = TaskSourceConfig(capabilities_command=command)
+
+        with tempfile.TemporaryDirectory() as directory:
+            report = tasks_module.task_source_adapter_report(
+                Path(directory),
+                config,
+            )
+
+        self.assertEqual(report["status"], "available")
+        self.assertIsNone(report["reason"])
+        self.assertEqual(report["identity"], self.identity())
+        assert isinstance(report["identity"], dict)
+        self.assertNotIn("unknown_path", report["identity"])
+        self.assertEqual(
+            report["identity"]["source_fingerprint"],
+            self.FINGERPRINT,
+        )
+        self.assertIsNone(report["identity"]["editable_install"])
+
+    def test_reset_capability_is_required_only_with_reset_adapter(self) -> None:
+        payload = self.identity(capabilities=[])
+        command = self.command(f"import json; print(json.dumps({payload!r}))")
+
+        with tempfile.TemporaryDirectory() as directory:
+            without_reset = tasks_module.task_source_adapter_report(
+                Path(directory),
+                TaskSourceConfig(capabilities_command=command),
+            )
+            with_reset = tasks_module.task_source_adapter_report(
+                Path(directory),
+                TaskSourceConfig(
+                    capabilities_command=command,
+                    reset_command="reset {task_id}",
+                ),
+            )
+
+        self.assertEqual(without_reset["status"], "available")
+        self.assertEqual(with_reset["status"], "deployment_gap")
+        self.assertEqual(with_reset["reason"], "required_capability_missing")
+        self.assertIsNone(with_reset["identity"])
+
+    def test_malformed_json_and_documents_have_fixed_reasons(self) -> None:
+        invalid_documents = (
+            [],
+            self.identity(schema_version=True),
+            self.identity(adapter=""),
+            self.identity(source_fingerprint="sha256:" + "A" * 64),
+            self.identity(editable_install="yes"),
+            self.identity(capabilities="reset"),
+            self.identity(capabilities=["x" * 257]),
+        )
+        commands = [self.command("print('{')")]
+        commands.extend(
+            self.command(f"import json; print(json.dumps({payload!r}))")
+            for payload in invalid_documents
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            reports = [
+                tasks_module.task_source_adapter_report(
+                    Path(directory),
+                    TaskSourceConfig(capabilities_command=command),
+                )
+                for command in commands
+            ]
+
+        self.assertEqual(reports[0]["reason"], "invalid_json")
+        self.assertTrue(
+            all(report["reason"] == "invalid_document" for report in reports[1:])
+        )
+        self.assertTrue(all(report["status"] == "deployment_gap" for report in reports))
+        self.assertTrue(all(report["identity"] is None for report in reports))
+
+    def test_start_failure_and_nonzero_exit_do_not_surface_secret_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            start_failures = []
+            for error in (OSError("private executable path"), ValueError("private")):
+                with mock.patch(
+                    "vibe_loop.tasks.subprocess.Popen",
+                    side_effect=error,
+                ):
+                    start_failures.append(
+                        tasks_module.task_source_adapter_report(
+                            repo,
+                            TaskSourceConfig(capabilities_command="private-command"),
+                        )
+                    )
+            secret = "CAPABILITY_STDERR_SENTINEL"
+            command = self.command(
+                f"import sys; sys.stderr.write({secret!r} * 8192); raise SystemExit(7)"
+            )
+            command_failed = tasks_module.task_source_adapter_report(
+                repo,
+                TaskSourceConfig(capabilities_command=command),
+            )
+
+        self.assertTrue(
+            all(report["reason"] == "command_start_failed" for report in start_failures)
+        )
+        self.assertEqual(command_failed["reason"], "command_failed")
+        self.assertNotIn(secret, json.dumps(command_failed))
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group assertion")
+    def test_stdout_overflow_terminates_owned_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            pid_path = repo / "child.pid"
+            command = self.command(
+                "import os, pathlib, sys, time; "
+                f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
+                "sys.stdout.write('x' * 70000); sys.stdout.flush(); time.sleep(30)"
+            )
+            report = tasks_module.task_source_adapter_report(
+                repo,
+                TaskSourceConfig(
+                    capabilities_command=command,
+                    command_timeout_seconds=5.0,
+                ),
+            )
+            child_pid = int(pid_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(report["reason"], "stdout_limit_exceeded")
+        self.assert_process_exited(child_pid)
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group assertion")
+    def test_timeout_terminates_owned_process_group_and_discards_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            pid_path = repo / "child.pid"
+            secret = "TIMEOUT_STDERR_SENTINEL"
+            command = self.command(
+                "import os, pathlib, sys, time; "
+                f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
+                f"sys.stderr.write({secret!r}); sys.stderr.flush(); time.sleep(30)"
+            )
+            report = tasks_module.task_source_adapter_report(
+                repo,
+                TaskSourceConfig(
+                    capabilities_command=command,
+                    command_timeout_seconds=0.1,
+                ),
+            )
+            child_pid = int(pid_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(report["reason"], "command_timeout")
+        self.assertNotIn(secret, json.dumps(report))
+        self.assert_process_exited(child_pid)
+
+    def assert_process_exited(self, pid: int) -> None:
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.02)
+        self.fail(f"capability diagnostic child still exists: {pid}")
 
 
 if __name__ == "__main__":
