@@ -16,6 +16,12 @@ When `--repo` names a linked Git worktree without its own `.vibe-loop.toml`,
 stderr. Runtime state, locks, logs, and caches still live under the invoked
 worktree.
 
+## Main verification cache
+
+`XDG_CACHE_HOME` controls the non-configurable main-verification cache location.
+The [runtime integration contract](prd/run-orchestration.md#prd-orc-007-runtime-integration-and-task-provenance)
+owns its exact path, fallback, retention, and safe-reclamation behavior.
+
 ## Annotated configuration
 
 This example shows the principal settings and their defaults or typical values.

@@ -5301,7 +5301,13 @@ class Integrator:
         self,
         commit: str,
     ) -> tuple[Path | None, str]:
-        verification_dir = self._main_verification_directory()
+        try:
+            verification_dir = self._main_verification_directory()
+        except (OSError, RuntimeError) as exc:
+            return None, (
+                "main verification cache location could not be resolved: "
+                f"{type(exc).__name__}"
+            )
         checkout = verification_dir / "repo"
         try:
             if verification_dir.is_symlink():

@@ -394,6 +394,16 @@ and cannot recursively include the verification checkout. Failure to prepare
 that checkout is recorded as an `execution_error`, distinct from a command
 failure.
 
+The repository ID is the SHA-256 digest of the resolved repository path. The
+runtime retains each verification clone across runs and does not prune it
+automatically because deleting a live clone would invalidate shared build
+outputs during integration. Moving or deleting a repository can therefore
+orphan its old cache entry. An operator may reclaim individual entries or the
+whole `main-verification` cache only when no runtime integration is active;
+the next main verification recreates any removed clone. The
+[configuration reference](../configuration.md#main-verification-cache) owns the
+operator-facing cache-location index.
+
 Each failed integration or main verification entry records the command key and
 the combined command-output tail. The tail uses the task-source adapter's
 pre-redaction line and window bounds, secret scrubbing, and final persisted

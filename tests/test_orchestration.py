@@ -3559,6 +3559,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
         stage_machine: RunLifecycleStateMachine | None = None,
         conflict_resolver=None,
         completion_fence=None,
+        default_verification_cache: bool = False,
     ) -> Integrator:
         return Integrator(
             repo=self.repo,
@@ -3586,7 +3587,11 @@ class RuntimeIntegrationTests(unittest.TestCase):
             stage_machine=stage_machine,
             conflict_resolver=conflict_resolver,
             completion_fence=completion_fence,
-            verification_cache_root=Path(self.directory.name) / "verification-cache",
+            verification_cache_root=(
+                None
+                if default_verification_cache
+                else Path(self.directory.name) / "verification-cache"
+            ),
         )
 
     def advance_main(self, *, content: str = "main\n") -> str:
@@ -4886,8 +4891,19 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(result[0].exit_class, "execution_error")
         self.assertEqual(list(outside.iterdir()), [])
 
-    @unittest.skipUnless(shutil.which("cargo"), "cargo is required")
     def test_main_verification_does_not_inherit_source_cargo_config(self) -> None:
+        cargo = shutil.which("cargo")
+        if cargo is None:
+            self.skipTest("cargo is required")
+        unstable_options = subprocess.run(
+            (cargo, "-Zunstable-options", "config", "get"),
+            cwd=self.repo,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if unstable_options.returncode != 0:
+            self.skipTest("cargo with unstable options is required")
         cargo_config = self.repo / ".cargo" / "config.toml"
         cargo_config.parent.mkdir()
         cargo_config.write_text(
@@ -4906,7 +4922,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
         assert checkout is not None
         self.assertFalse(checkout.resolve().is_relative_to(self.repo))
         command = (
-            "cargo",
+            cargo,
             "-Zunstable-options",
             "config",
             "get",
@@ -4927,6 +4943,76 @@ class RuntimeIntegrationTests(unittest.TestCase):
             text=True,
         ).stdout
         self.assertEqual(checkout_value, source_value)
+
+    def test_main_verification_uses_absolute_xdg_cache_home(self) -> None:
+        cache_home = Path(self.directory.name) / "xdg-cache"
+        with patch.dict(os.environ, {"XDG_CACHE_HOME": str(cache_home)}):
+            first = self.integrator(default_verification_cache=True)
+            second = self.integrator(default_verification_cache=True)
+
+            first_directory = first._main_verification_directory()
+            second_directory = second._main_verification_directory()
+
+        self.assertEqual(first_directory, second_directory)
+        self.assertEqual(
+            first_directory.parent,
+            cache_home / "vibe-loop" / "main-verification",
+        )
+        self.assertFalse(first_directory.resolve().is_relative_to(self.repo))
+
+    def test_main_verification_falls_back_from_relative_xdg_cache_home(
+        self,
+    ) -> None:
+        home = Path(self.directory.name) / "home"
+        with (
+            patch.dict(os.environ, {"XDG_CACHE_HOME": "relative-cache"}),
+            patch.object(Path, "home", return_value=home),
+        ):
+            verification_dir = self.integrator(
+                default_verification_cache=True
+            )._main_verification_directory()
+
+        self.assertEqual(
+            verification_dir.parent,
+            home / ".cache" / "vibe-loop" / "main-verification",
+        )
+
+    def test_main_verification_falls_back_when_xdg_cache_home_is_unset(
+        self,
+    ) -> None:
+        home = Path(self.directory.name) / "home"
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch.object(Path, "home", return_value=home),
+        ):
+            os.environ.pop("XDG_CACHE_HOME", None)
+            verification_dir = self.integrator(
+                default_verification_cache=True
+            )._main_verification_directory()
+
+        self.assertEqual(
+            verification_dir.parent,
+            home / ".cache" / "vibe-loop" / "main-verification",
+        )
+
+    def test_main_verification_records_unresolvable_cache_home(self) -> None:
+        commit = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        integrator = self.integrator(default_verification_cache=True)
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch.object(Path, "home", side_effect=RuntimeError("home unavailable")),
+        ):
+            os.environ.pop("XDG_CACHE_HOME", None)
+            result = integrator._run_main_checks(
+                keys=("completion.commands[1]",),
+                commit=commit,
+            )
+
+        self.assertEqual(result[0].exit_class, "execution_error")
+        self.assertIn(
+            "cache location could not be resolved: RuntimeError",
+            Path(result[0].log_reference).read_text(encoding="utf-8"),
+        )
 
     def test_main_verification_failure_preserves_recovered_lock_diagnostic(
         self,
