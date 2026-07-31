@@ -5153,10 +5153,75 @@ class Integrator:
     ) -> tuple[IntegrationCheckResult, ...]:
         if not keys:
             return ()
-        with tempfile.TemporaryDirectory(
-            prefix="vibe-loop-main-verification-"
-        ) as directory:
-            checkout = Path(directory) / "repo"
+        checkout, setup_error = self._prepare_main_verification_checkout(commit)
+        if setup_error:
+            return self._verification_setup_failure(
+                command_key=keys[0],
+                detail=setup_error,
+            )
+        assert checkout is not None
+        local_state_error = self._link_ignored_verification_state(checkout)
+        if local_state_error:
+            return self._verification_setup_failure(
+                command_key=keys[0],
+                detail=local_state_error,
+            )
+        return self._run_checks(
+            phase="main",
+            keys=keys,
+            worktree=checkout,
+        )
+
+    def _prepare_main_verification_checkout(
+        self,
+        commit: str,
+    ) -> tuple[Path | None, str]:
+        state_dir = self.repo / ".vibe-loop"
+        verification_dir = state_dir / "main-verification"
+        checkout = verification_dir / "repo"
+        try:
+            if state_dir.is_symlink() or verification_dir.is_symlink():
+                return (
+                    None,
+                    "main verification state path must remain inside the repository",
+                )
+            verification_dir.mkdir(parents=True, exist_ok=True)
+            if not verification_dir.resolve().is_relative_to(self.repo):
+                return (
+                    None,
+                    "main verification state path must remain inside the repository",
+                )
+            if checkout.is_symlink():
+                return None, "main verification checkout must not be a symlink"
+        except OSError as exc:
+            return None, (
+                "main verification state directory could not be prepared: "
+                f"{type(exc).__name__}"
+            )
+
+        if checkout.exists():
+            if not checkout.is_dir():
+                return None, "main verification checkout path is not a directory"
+            top_level = self._git(checkout, "rev-parse", "--show-toplevel")
+            git_dir = self._git(checkout, "rev-parse", "--absolute-git-dir")
+            try:
+                valid_checkout = (
+                    top_level.returncode == 0
+                    and Path(top_level.stdout.strip()).resolve() == checkout
+                    and git_dir.returncode == 0
+                    and Path(git_dir.stdout.strip()).resolve() == checkout / ".git"
+                )
+            except OSError:
+                valid_checkout = False
+            if not valid_checkout:
+                return None, "existing main verification checkout is not standalone"
+            reset = self._git(checkout, "reset", "--hard", "--quiet")
+            if reset.returncode != 0:
+                return None, self._bounded_git_output(reset)
+            clean = self._git(checkout, "clean", "-ffdx", "--quiet")
+            if clean.returncode != 0:
+                return None, self._bounded_git_output(clean)
+        else:
             clone = self._git(
                 self.repo,
                 "clone",
@@ -5166,33 +5231,29 @@ class Integrator:
                 str(checkout),
             )
             if clone.returncode != 0:
-                return self._verification_setup_failure(
-                    command_key=keys[0],
-                    detail=self._bounded_git_output(clone),
-                )
-            checked_out = self._git(
-                checkout,
-                "checkout",
-                "--detach",
-                "--quiet",
-                commit,
-            )
-            if checked_out.returncode != 0:
-                return self._verification_setup_failure(
-                    command_key=keys[0],
-                    detail=self._bounded_git_output(checked_out),
-                )
-            local_state_error = self._link_ignored_verification_state(checkout)
-            if local_state_error:
-                return self._verification_setup_failure(
-                    command_key=keys[0],
-                    detail=local_state_error,
-                )
-            return self._run_checks(
-                phase="main",
-                keys=keys,
-                worktree=checkout,
-            )
+                return None, self._bounded_git_output(clone)
+
+        fetched = self._git(
+            checkout,
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            str(self.repo),
+            commit,
+        )
+        if fetched.returncode != 0:
+            return None, self._bounded_git_output(fetched)
+        checked_out = self._git(
+            checkout,
+            "checkout",
+            "--detach",
+            "--force",
+            "--quiet",
+            commit,
+        )
+        if checked_out.returncode != 0:
+            return None, self._bounded_git_output(checked_out)
+        return checkout, ""
 
     def _link_ignored_verification_state(self, checkout: Path) -> str:
         ignored = self._git(

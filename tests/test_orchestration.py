@@ -4465,6 +4465,128 @@ class RuntimeIntegrationTests(unittest.TestCase):
             Path(result.verification[-1].log_reference).read_text(encoding="utf-8"),
         )
 
+    def test_main_verification_keeps_embedded_manifest_paths_live_and_cached(
+        self,
+    ) -> None:
+        (self.repo / ".gitignore").write_text("target/\n", encoding="utf-8")
+        crate = self.repo / "init"
+        crate.mkdir()
+        (crate / "build.rs").write_text(
+            "use std::env;\n\n"
+            "fn main() {\n"
+            '    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();\n'
+            '    println!("cargo:rustc-link-arg=-T{manifest_dir}/linker.ld");\n'
+            "}\n",
+            encoding="utf-8",
+        )
+        (crate / "Cargo.toml").write_text(
+            "[package]\n"
+            'name = "manifest-path-fixture"\n'
+            'version = "0.1.0"\n'
+            'edition = "2024"\n',
+            encoding="utf-8",
+        )
+        source = crate / "src"
+        source.mkdir()
+        (source / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+        (crate / "linker.ld").write_text("SECTIONS {}\n", encoding="utf-8")
+        (self.repo / "build_fixture.py").write_text(
+            "from pathlib import Path\n\n"
+            'manifest_dir = Path.cwd() / "init"\n'
+            'output = manifest_dir / "target" / "build-script-output"\n'
+            'runs = manifest_dir / "target" / "build-script-runs"\n'
+            "if not output.exists():\n"
+            "    output.write_text(str(manifest_dir), encoding='utf-8')\n"
+            "    count = int(runs.read_text()) if runs.exists() else 0\n"
+            "    runs.write_text(str(count + 1), encoding='utf-8')\n"
+            "linker_script = Path(output.read_text(encoding='utf-8')) / 'linker.ld'\n"
+            "raise SystemExit(0 if linker_script.is_file() else 1)\n",
+            encoding="utf-8",
+        )
+        git(
+            self.repo,
+            "add",
+            ".gitignore",
+            "build_fixture.py",
+            "init/Cargo.toml",
+            "init/build.rs",
+            "init/linker.ld",
+            "init/src/main.rs",
+        )
+        git(self.repo, "commit", "-m", "add manifest-path build fixture")
+        commit = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        target = crate / "target"
+        target.mkdir()
+        (target / "cache-seed").write_text("seed\n", encoding="utf-8")
+        command = shlex.join([sys.executable, "build_fixture.py"])
+        integrator = self.integrator(commands=(command,), main_keys=())
+
+        first = integrator._run_main_checks(
+            keys=("completion.commands[0]",),
+            commit=commit,
+        )
+        operator_build = subprocess.run(command, cwd=self.repo, shell=True, check=False)
+        second = integrator._run_main_checks(
+            keys=("completion.commands[0]",),
+            commit=commit,
+        )
+
+        stable_checkout = self.repo / ".vibe-loop" / "main-verification" / "repo"
+        self.assertTrue(first[0].passed)
+        self.assertEqual(operator_build.returncode, 0)
+        self.assertTrue(second[0].passed)
+        self.assertTrue(stable_checkout.is_dir())
+        self.assertEqual(
+            (target / "build-script-runs").read_text(encoding="utf-8"), "1"
+        )
+        self.assertEqual(
+            (target / "build-script-output").read_text(encoding="utf-8"),
+            str(stable_checkout / "init"),
+        )
+
+    def test_main_verification_ignored_links_remain_repository_confined(
+        self,
+    ) -> None:
+        safe_cache = self.repo / "safe-cache"
+        safe_cache.mkdir()
+        checkout = Path(self.directory.name) / "verification"
+        checkout.mkdir()
+        ignored = subprocess.CompletedProcess(
+            (),
+            0,
+            stdout=(
+                f"{safe_cache.name}/\0"
+                "/absolute-cache/\0"
+                "../outside-cache/\0"
+                ".vibe-loop/private/\0"
+            ),
+            stderr="",
+        )
+        integrator = self.integrator()
+
+        with patch.object(integrator, "_git", return_value=ignored):
+            error = integrator._link_ignored_verification_state(checkout)
+
+        self.assertEqual(error, "")
+        self.assertEqual((checkout / safe_cache.name).resolve(), safe_cache)
+        self.assertFalse((checkout / ".vibe-loop").exists())
+        self.assertFalse((Path(self.directory.name) / "outside-cache").exists())
+
+    def test_main_verification_refuses_state_directory_symlink(self) -> None:
+        outside = Path(self.directory.name) / "outside-verification"
+        outside.mkdir()
+        verification_dir = self.repo / ".vibe-loop" / "main-verification"
+        verification_dir.symlink_to(outside, target_is_directory=True)
+        commit = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+        result = self.integrator()._run_main_checks(
+            keys=("completion.commands[1]",),
+            commit=commit,
+        )
+
+        self.assertEqual(result[0].exit_class, "execution_error")
+        self.assertEqual(list(outside.iterdir()), [])
+
     def test_main_verification_failure_preserves_recovered_lock_diagnostic(
         self,
     ) -> None:

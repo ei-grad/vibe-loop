@@ -357,13 +357,21 @@ probes confirm that neither ref contains the other. If either ref contains the
 other or the ancestry relationship cannot be read, the reason is
 `main_fast_forward_environment_failed`.
 
-Main verification runs the exact target commit in a temporary standalone clone
-whose refs and worktree registry are independent of the live primary
-repository. The clone reuses local Git objects and links ignored local
-dependencies and configuration, except `.vibe-loop` runtime control state, so
-verification retains the configured environment without observing concurrent
-runtime ref or worktree changes. Failure to prepare that checkout is recorded
-as an `execution_error`, distinct from a command failure.
+Main verification runs the exact target commit in the stable standalone clone
+at `.vibe-loop/main-verification/repo`, whose refs and worktree registry are
+independent of the live primary repository. Before each verification, the
+runtime hard-resets the checkout, removes checkout-owned untracked and ignored
+state, fetches the exact target commit, and recreates links to the primary
+repository's current ignored paths. The stable checkout path lets shared build
+outputs such as Cargo `target/` directories safely retain embedded absolute
+manifest paths across verification runs and operator builds. Shared virtual
+environments, tool caches, and downloaded artifacts likewise retain their
+stable installation, cache-key, or content paths instead of being copied into
+an ephemeral checkout. Absolute paths, parent traversal, and all `.vibe-loop`
+runtime control state remain unlinked, so linked state stays repository-local
+and cannot recursively include the verification checkout. Failure to prepare
+that checkout is recorded as an `execution_error`, distinct from a command
+failure.
 
 Each failed integration or main verification entry records the command key and
 the combined command-output tail. The tail uses the task-source adapter's
