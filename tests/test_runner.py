@@ -960,6 +960,30 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(warnings[2]["requested_path"], "tools/computed-one.py")
         self.assertNotIn("tools/computed-two.py", prompt)
 
+    def test_worker_prompt_planning_warning_full_persisted_cap_skips_scan(
+        self,
+    ) -> None:
+        persisted = tuple(
+            planning_warning(f"planned/{index}.py", f"legacy/{index}.py")
+            for index in range(3)
+        )
+        task = Task(
+            task_id="PLANNING-FULL-CAP",
+            title="Add helper",
+            status="Next",
+            body="Create tools/computed.py.",
+            planning_warnings=persisted,
+        )
+
+        with patch.object(
+            runner_module,
+            "task_deliverable_path_collisions",
+        ) as collision_scan:
+            prompt = build_worker_prompt("$", task, VibeConfig(repo=Path(".")))
+
+        collision_scan.assert_not_called()
+        self.assertEqual(prompt_planning_warnings(prompt), list(persisted))
+
     def test_worker_prompt_planning_warning_section_absent_without_warnings(
         self,
     ) -> None:

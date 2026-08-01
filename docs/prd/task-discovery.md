@@ -100,10 +100,11 @@ are non-empty repository-relative POSIX paths accepted by the normalized path
 lock contract, name files with non-empty suffixes, and occupy at most 1,024
 UTF-8 bytes each. A warning's compact JSON encoding occupies at most 2,048
 UTF-8 bytes. Unknown or missing keys, invalid enums or paths, excess entries,
-and malformed types reject the task object. Valid warnings round-trip in
-normalized task JSON. Authoritative source-side storage and explicit projection
-of this field are producer responsibilities outside vibe-loop's consumer
-contract. At dispatch, the runtime applies the
+and malformed types reject the command source response; command list responses
+normalize atomically rather than silently dropping an invalid task. Valid
+warnings round-trip in normalized task JSON. Authoritative source-side storage
+and explicit projection of this field are producer responsibilities outside
+vibe-loop's consumer contract. At dispatch, the runtime applies the
 [persisted-first advisory union contract](autopilot.md#prd-aut-012-configuration-free-generic-cycle).
 
 Command task objects may also provide `prior_findings` and

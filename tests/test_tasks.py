@@ -343,7 +343,10 @@ class MarkdownPlanTests(unittest.TestCase):
                 warning[path_key] = path
                 with (
                     self.subTest(path_key=path_key, path=path),
-                    self.assertRaises(ValueError),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        rf"task planning_warnings\[0\]\.{path_key}",
+                    ),
                 ):
                     task_from_mapping(
                         {

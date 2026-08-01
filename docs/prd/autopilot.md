@@ -1008,6 +1008,9 @@ the authoritative task record. The canonical optional top-level wire field,
 shape, validation limits, backward compatibility, and external producer
 responsibility are owned by
 [PRD-TSK-003](task-discovery.md#prd-tsk-003-command-task-sources).
+The native planning-worker prompt names that field and supplies its canonical
+warning object so a compatible authoritative task source can persist it; the
+task-source backend must still provide the storage and projection capability.
 
 Before an implementation worker launches, the runtime validates
 creation-worded repository-relative deliverable paths in the normalized task

@@ -496,7 +496,10 @@ def normalize_planning_warnings(value: object) -> tuple[dict[str, str], ...]:
         paths: dict[str, str] = {}
         for path_key in ("requested_path", "existing_path"):
             raw_path = item[path_key]
-            path = normalize_path_lock(raw_path)
+            try:
+                path = normalize_path_lock(raw_path)
+            except ValueError as exc:
+                raise ValueError(f"{name}.{path_key}: {exc}") from exc
             if not PurePosixPath(path).suffix:
                 raise ValueError(f"{name}.{path_key} must name a file with a suffix")
             if len(path.encode("utf-8")) > DELIVERABLE_COLLISION_PATH_MAX_BYTES:
@@ -506,11 +509,14 @@ def normalize_planning_warnings(value: object) -> tuple[dict[str, str], ...]:
                 )
             paths[path_key] = path
 
-        warning = _deliverable_collision(
-            paths["requested_path"],
-            paths["existing_path"],
-            item["match"],
-        )
+        warning = {
+            "kind": item["kind"],
+            "requested_path": paths["requested_path"],
+            "existing_path": paths["existing_path"],
+            "match": item["match"],
+            "effect": item["effect"],
+            "precision": item["precision"],
+        }
         encoded = json.dumps(
             warning,
             ensure_ascii=False,

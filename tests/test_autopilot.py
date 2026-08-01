@@ -182,7 +182,11 @@ from vibe_loop.processes import (
     read_process_table,
 )
 from vibe_loop.orchestration import RunStage, StageTransition
-from vibe_loop.tasks import WITHHELD_ADAPTER_ENV, Task
+from vibe_loop.tasks import (
+    DELIVERABLE_COLLISION_PRECISION,
+    WITHHELD_ADAPTER_ENV,
+    Task,
+)
 from vibe_loop.workers import (
     KEEP_EVIDENCE_CHANGED,
     ActiveRunState,
@@ -8935,10 +8939,14 @@ class NativePlanningTests(unittest.TestCase):
             "creation-worded repository-relative deliverable paths",
             worker_calls[0]["command"],
         )
-        self.assertIn(
-            "add an advisory planning-validation warning",
-            worker_calls[0]["command"],
-        )
+        self.assertIn("top-level planning_warnings array", worker_calls[0]["command"])
+        self.assertIn("never fields.planning_warnings", worker_calls[0]["command"])
+        self.assertIn('"kind":"deliverable_path_collision"', worker_calls[0]["command"])
+        self.assertIn('"match":"exact"', worker_calls[0]["command"])
+        self.assertIn("same_directory_sibling as match", worker_calls[0]["command"])
+        self.assertIn(DELIVERABLE_COLLISION_PRECISION, worker_calls[0]["command"])
+        self.assertIn("1024 UTF-8 bytes each", worker_calls[0]["command"])
+        self.assertIn("2048 UTF-8 bytes", worker_calls[0]["command"])
         self.assertIn(
             "do not warn on ordinary path references or unrelated filenames",
             worker_calls[0]["command"],

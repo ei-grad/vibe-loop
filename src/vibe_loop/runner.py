@@ -6840,14 +6840,9 @@ def build_worker_prompt(
         else CLI_WORKER_ADDENDUM
     )
     prompt = f"{skill_prefix}vibe-loop {task.task_id}{addendum}"
-    computed_warnings = (
-        task_deliverable_path_collisions(config.repo, task)
-        if config is not None
-        else ()
-    )
     planning_warnings: list[dict[str, str]] = []
     seen_warnings: set[str] = set()
-    for warning in (*task.planning_warnings, *computed_warnings):
+    for warning in task.planning_warnings:
         canonical = json.dumps(warning, sort_keys=True, separators=(",", ":"))
         if canonical in seen_warnings:
             continue
@@ -6855,6 +6850,15 @@ def build_worker_prompt(
         planning_warnings.append(dict(warning))
         if len(planning_warnings) == DELIVERABLE_COLLISION_LIMIT:
             break
+    if config is not None and len(planning_warnings) < DELIVERABLE_COLLISION_LIMIT:
+        for warning in task_deliverable_path_collisions(config.repo, task):
+            canonical = json.dumps(warning, sort_keys=True, separators=(",", ":"))
+            if canonical in seen_warnings:
+                continue
+            seen_warnings.add(canonical)
+            planning_warnings.append(dict(warning))
+            if len(planning_warnings) == DELIVERABLE_COLLISION_LIMIT:
+                break
     if planning_warnings:
         planning_record = json.dumps(
             {

@@ -126,6 +126,12 @@ from vibe_loop.runs import (
 )
 from vibe_loop.tasks import (
     BLOCKED_FAMILY_STATUSES,
+    DELIVERABLE_COLLISION_EFFECT,
+    DELIVERABLE_COLLISION_KIND,
+    DELIVERABLE_COLLISION_LIMIT,
+    DELIVERABLE_COLLISION_PATH_MAX_BYTES,
+    DELIVERABLE_COLLISION_PRECISION,
+    DELIVERABLE_COLLISION_WARNING_MAX_BYTES,
     WITHHELD_ADAPTER_ENV,
     Task,
     build_adapter_environment,
@@ -7156,6 +7162,18 @@ def build_native_planning_worker_prompt(
 ) -> str:
     skill_prefix = config.agent.require_skill_ref_prefix()
     scope_evidence_path = config.state_path / "runs.jsonl"
+    planning_warning_example = json.dumps(
+        {
+            "effect": DELIVERABLE_COLLISION_EFFECT,
+            "existing_path": "path/existing-file.ext",
+            "kind": DELIVERABLE_COLLISION_KIND,
+            "match": "exact",
+            "precision": DELIVERABLE_COLLISION_PRECISION,
+            "requested_path": "path/requested-file.ext",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return (
         f"{skill_prefix}orchestrated-vibe-loop\n\n"
         "You are the separate read-write planning worker for an autopilot cycle. "
@@ -7182,8 +7200,19 @@ def build_native_planning_worker_prompt(
         "creation-worded repository-relative deliverable paths from its body and "
         "check the current repository for the exact path and close filenames in "
         "the same directory with the same extension. If either exists, keep the "
-        "task dispatchable but add an advisory planning-validation warning to its "
-        "authoritative record naming the requested and existing paths. Favor "
+        "task dispatchable but persist at most "
+        f"{DELIVERABLE_COLLISION_LIMIT} warnings in the authoritative record's "
+        "top-level planning_warnings array, never fields.planning_warnings. Each "
+        "warning must contain exactly kind, requested_path, existing_path, match, "
+        "effect, and precision. For an exact match use this canonical object, "
+        f"replacing only its paths: {planning_warning_example}. For a close "
+        "filename use "
+        "same_directory_sibling as match; all other values remain byte-for-byte "
+        "unchanged. Both paths must be normalized repository-relative POSIX file "
+        "paths with suffixes and occupy at most "
+        f"{DELIVERABLE_COLLISION_PATH_MAX_BYTES} UTF-8 bytes each; the compact "
+        "warning object must occupy at most "
+        f"{DELIVERABLE_COLLISION_WARNING_MAX_BYTES} UTF-8 bytes. Favor "
         "recall within that bounded candidate set, but do not warn on ordinary "
         "path references or unrelated filenames. Use isolated worktrees and the "
         "repository's "
