@@ -14,6 +14,8 @@ from vibe_loop.runs import (
     AUTOPILOT_CYCLE_RECORD_TYPE,
     AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
     AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
+    AUTOPILOT_PLANNING_LAUNCH_RECORD_TYPE,
+    AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE,
     AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
     AUTOPILOT_RECORD_TYPES,
     AUTOPILOT_TROUBLESHOOT_RECORD_TYPE,
@@ -1697,9 +1699,83 @@ class RunStoreTests(unittest.TestCase):
         for record_type in (
             AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
             AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
+            AUTOPILOT_PLANNING_LAUNCH_RECORD_TYPE,
+            AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE,
         ):
-            self.assertIn(record_type, AUTOPILOT_RECORD_TYPES)
-            self.assertIn(record_type, KNOWN_RECORD_TYPES)
+            with self.subTest(record_type=record_type):
+                self.assertIn(record_type, AUTOPILOT_RECORD_TYPES)
+                self.assertIn(record_type, KNOWN_RECORD_TYPES)
+
+    def test_read_records_keeps_native_planning_records_out_of_run_history(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(Path(directory) / "runs.jsonl")
+            planning_records = [
+                {
+                    "schema_version": 1,
+                    "record_type": AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
+                    "occurred_at": "2026-05-09T00:00:00+00:00",
+                    "repo": directory,
+                    "cycle_id": "cycle-1",
+                    "stage": "read_only_detection",
+                    "status": "planning_requested",
+                    "should_plan": True,
+                },
+                {
+                    "schema_version": 1,
+                    "record_type": AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
+                    "occurred_at": "2026-05-09T00:00:01+00:00",
+                    "repo": directory,
+                    "cycle_id": "cycle-1",
+                    "stage": "read_write_authoring",
+                    "phase": "terminal",
+                    "status": "completed",
+                },
+                {
+                    "schema_version": 1,
+                    "record_type": AUTOPILOT_PLANNING_LAUNCH_RECORD_TYPE,
+                    "occurred_at": "2026-05-09T00:00:02+00:00",
+                    "repo": directory,
+                    "cycle_id": "cycle-1",
+                    "fingerprint": "1:0:abcdef0123456789",
+                },
+                {
+                    "schema_version": 1,
+                    "record_type": AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE,
+                    "occurred_at": "2026-05-09T00:00:03+00:00",
+                    "repo": directory,
+                    "cycle_id": "cycle-1",
+                    "outcome": "tasks_created",
+                    "fingerprint": "1:0:abcdef0123456789",
+                    "provider_launched": True,
+                },
+            ]
+            for record in planning_records:
+                store.append_record(record)
+            store.append_record(
+                {
+                    "schema_version": 1,
+                    "record_type": "unknown_future_record",
+                    "cycle_id": "cycle-1",
+                }
+            )
+
+            records = store.read_records()
+            runs = store.list_runs()
+
+        self.assertEqual(
+            [record["record_type"] for record in records],
+            [
+                AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
+                AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
+                AUTOPILOT_PLANNING_LAUNCH_RECORD_TYPE,
+                AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE,
+            ],
+        )
+        self.assertEqual(records[2]["fingerprint"], "1:0:abcdef0123456789")
+        self.assertEqual(records[3]["outcome"], "tasks_created")
+        self.assertEqual(runs, [])
 
     def test_idle_wait_record_type_registered(self) -> None:
         self.assertEqual(AUTOPILOT_IDLE_WAIT_RECORD_TYPE, "autopilot_idle_wait")
