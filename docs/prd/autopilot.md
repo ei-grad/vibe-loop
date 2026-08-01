@@ -1016,8 +1016,6 @@ responsibility are owned by
 The native planning-worker prompt names that field and supplies its canonical
 warning object so a compatible authoritative task source can persist it; the
 task-source backend must still provide the storage and projection capability.
-vibe-loop does not supply that external producer prerequisite or claim ownership
-of Loopyard persistence.
 
 Before an implementation worker launches, the runtime validates
 creation-worded repository-relative deliverable paths in the normalized task

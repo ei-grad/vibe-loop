@@ -254,7 +254,55 @@ class MarkdownPlanTests(unittest.TestCase):
             ["root.py", "工具/one.py", "工具/two.py"],
         )
 
-    def test_deliverable_collision_rejects_unsafe_and_suffixless_paths(self) -> None:
+    def test_deliverable_collision_filters_names_before_resolving_siblings(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            for index in range(100):
+                (repo / f"unrelated-{index}.txt").write_text("")
+            similar = repo / "qemu-proof-outcome.py"
+            similar.write_text("")
+            task = Task(
+                "TASK-CHEAP-FILTER",
+                "Add root guard",
+                "Next",
+                body="Create qemu-proof-startup-guard.py.",
+            )
+            original_resolve = Path.resolve
+            resolved_paths: list[Path] = []
+
+            def recording_resolve(path: Path, *args, **kwargs) -> Path:
+                resolved_paths.append(path)
+                return original_resolve(path, *args, **kwargs)
+
+            with mock.patch.object(
+                Path,
+                "resolve",
+                autospec=True,
+                side_effect=recording_resolve,
+            ):
+                collisions = task_deliverable_path_collisions(repo, task)
+
+        resolved_siblings = [path for path in resolved_paths if path.parent == repo]
+        self.assertEqual(resolved_siblings, [similar])
+        self.assertEqual(collisions[0]["existing_path"], similar.name)
+
+    def test_deliverable_path_extraction_rejects_boundary_path_forms(self) -> None:
+        bodies = (
+            "Create /absolute/tool.py.",
+            "Create ../outside.py.",
+            "Create suffixless.",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                task = Task("TASK-BOUNDARY", "Add bounded helper", "Next", body=body)
+
+                requested_paths = tasks_module._task_deliverable_paths(task)
+
+                self.assertEqual(requested_paths, ())
+
+    def test_deliverable_collision_ignores_symlink_outside_repository(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo = root / "repo"
@@ -266,10 +314,7 @@ class MarkdownPlanTests(unittest.TestCase):
                 "TASK-BOUNDARY",
                 "Add bounded helper",
                 "Next",
-                body=(
-                    f"Create {outside.as_posix()}; create ../outside.py; "
-                    "create suffixless; create outside.py."
-                ),
+                body="Create outside.py.",
             )
 
             collisions = task_deliverable_path_collisions(repo, task)

@@ -364,9 +364,9 @@ def task_deliverable_path_collisions(
                 (
                     sibling
                     for sibling in target.parent.iterdir()
-                    if sibling.is_file()
+                    if _close_deliverable_sibling(target.name, sibling.name)
+                    and sibling.is_file()
                     and sibling.resolve().is_relative_to(repo)
-                    and _close_deliverable_sibling(target.name, sibling.name)
                 ),
                 key=lambda sibling: sibling.name,
             )
@@ -407,7 +407,7 @@ def _task_deliverable_paths(task: Task) -> tuple[str, ...]:
             ):
                 continue
             candidate = PurePosixPath(match.group("path"))
-            if candidate.is_absolute() or ".." in candidate.parts:
+            if ".." in candidate.parts:
                 continue
             normalized = candidate.as_posix()
             if normalized not in paths:
