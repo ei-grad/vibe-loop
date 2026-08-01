@@ -1718,6 +1718,7 @@ class RunStoreTests(unittest.TestCase):
                     "occurred_at": "2026-05-09T00:00:00+00:00",
                     "repo": directory,
                     "cycle_id": "cycle-1",
+                    "run_id": "run-1",
                     "stage": "read_only_detection",
                     "status": "planning_requested",
                     "should_plan": True,
@@ -1728,6 +1729,7 @@ class RunStoreTests(unittest.TestCase):
                     "occurred_at": "2026-05-09T00:00:01+00:00",
                     "repo": directory,
                     "cycle_id": "cycle-1",
+                    "run_id": "run-1",
                     "stage": "read_write_authoring",
                     "phase": "terminal",
                     "status": "completed",
@@ -1738,6 +1740,7 @@ class RunStoreTests(unittest.TestCase):
                     "occurred_at": "2026-05-09T00:00:02+00:00",
                     "repo": directory,
                     "cycle_id": "cycle-1",
+                    "run_id": "run-1",
                     "fingerprint": "1:0:abcdef0123456789",
                 },
                 {
@@ -1746,6 +1749,7 @@ class RunStoreTests(unittest.TestCase):
                     "occurred_at": "2026-05-09T00:00:03+00:00",
                     "repo": directory,
                     "cycle_id": "cycle-1",
+                    "run_id": "run-1",
                     "outcome": "tasks_created",
                     "fingerprint": "1:0:abcdef0123456789",
                     "provider_launched": True,
@@ -1758,6 +1762,7 @@ class RunStoreTests(unittest.TestCase):
                     "schema_version": 1,
                     "record_type": "unknown_future_record",
                     "cycle_id": "cycle-1",
+                    "run_id": "run-1",
                 }
             )
 
