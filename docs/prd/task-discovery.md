@@ -86,7 +86,27 @@ changes may also provide `conflict_domains_actor_kind` (`operator`, `worker`,
 identity. Missing provenance is not operator authorization. Optional
 `requirement_ids`, `spec_paths`, `design_refs`, `approval_state`, and
 `source_fingerprints` preserve traceability through task JSON, worker prompts,
-and promotion. Command task objects may also provide `prior_findings` and
+and promotion.
+
+Command task objects may provide an optional top-level `planning_warnings`
+array. Omission or `null` means no persisted warnings; a member of `fields` is
+not runtime metadata. The array contains at most three objects, each with
+exactly the string keys `kind`, `requested_path`, `existing_path`, `match`,
+`effect`, and `precision`. `kind` is `deliverable_path_collision`; `match` is
+`exact` or `same_directory_sibling`; `effect` is `advisory_only`; and
+`precision` is `high recall for paths governed by a creation verb in the same
+clause; paths attached by modification prepositions are excluded`. Both paths
+are non-empty repository-relative POSIX paths accepted by the normalized path
+lock contract, name files with non-empty suffixes, and occupy at most 1,024
+UTF-8 bytes each. A warning's compact JSON encoding occupies at most 2,048
+UTF-8 bytes. Unknown or missing keys, invalid enums or paths, excess entries,
+and malformed types reject the task object. Valid warnings round-trip in
+normalized task JSON. Authoritative source-side storage and explicit projection
+of this field are producer responsibilities outside vibe-loop's consumer
+contract. At dispatch, the runtime applies the
+[persisted-first advisory union contract](autopilot.md#prd-aut-012-configuration-free-generic-cycle).
+
+Command task objects may also provide `prior_findings` and
 `review_budget_exhaustions`.
 `prior_findings` uses the review finding wire shape (`id`, `severity`, `summary`,
 `evidence`, `files`, `lines`, and `state`); `review_budget_exhaustions` is the

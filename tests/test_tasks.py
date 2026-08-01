@@ -47,6 +47,21 @@ PLAN = """# Plan
 """
 
 
+def planning_warning(
+    requested_path: str = "tools/new-helper.sh",
+    existing_path: str = "tools/existing-helper.sh",
+    match: str = "exact",
+) -> dict[str, str]:
+    return {
+        "kind": "deliverable_path_collision",
+        "requested_path": requested_path,
+        "existing_path": existing_path,
+        "match": match,
+        "effect": "advisory_only",
+        "precision": tasks_module.DELIVERABLE_COLLISION_PRECISION,
+    }
+
+
 class RespectSourceOrderTests(unittest.TestCase):
     @staticmethod
     def _source(tasks: list[Task]) -> object:
@@ -208,6 +223,177 @@ class MarkdownPlanTests(unittest.TestCase):
         self.assertEqual(task.body, "Create tools/new-helper.sh.")
         self.assertNotIn("body", task.to_json())
         self.assertEqual(collisions[0]["existing_path"], "tools/new-helper.sh")
+
+    def test_command_task_planning_warnings_round_trip(self) -> None:
+        warnings = [
+            planning_warning(),
+            planning_warning(
+                "tools/new-startup-guard.sh",
+                "tools/startup-guard.sh",
+                "same_directory_sibling",
+            ),
+        ]
+
+        task = task_from_mapping(
+            {
+                "id": "TASK-WARNINGS",
+                "status": "ready",
+                "planning_warnings": warnings,
+            },
+            0,
+        )
+
+        self.assertEqual(task.planning_warnings, tuple(warnings))
+        self.assertEqual(task.to_json()["planning_warnings"], warnings)
+
+    def test_command_task_planning_warnings_omission_and_null_are_empty(self) -> None:
+        omitted = task_from_mapping({"id": "OMITTED", "status": "ready"}, 0)
+        null = task_from_mapping(
+            {"id": "NULL", "status": "ready", "planning_warnings": None},
+            0,
+        )
+
+        self.assertEqual(omitted.planning_warnings, ())
+        self.assertEqual(null.planning_warnings, ())
+        self.assertNotIn("planning_warnings", omitted.to_json())
+        self.assertNotIn("planning_warnings", null.to_json())
+
+    def test_command_task_ignores_nested_planning_warnings(self) -> None:
+        task = task_from_mapping(
+            {
+                "id": "NESTED",
+                "status": "ready",
+                "fields": {"planning_warnings": [planning_warning()]},
+            },
+            0,
+        )
+
+        self.assertEqual(task.planning_warnings, ())
+
+    def test_command_task_rejects_invalid_planning_warning_collection(self) -> None:
+        invalid_values = (
+            planning_warning(),
+            [planning_warning()] * 4,
+            ["warning"],
+        )
+
+        for value in invalid_values:
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "planning_warnings"),
+            ):
+                task_from_mapping(
+                    {"id": "INVALID", "status": "ready", "planning_warnings": value},
+                    0,
+                )
+
+    def test_command_task_rejects_unknown_or_missing_planning_warning_keys(
+        self,
+    ) -> None:
+        unknown = planning_warning() | {"detail": "extra"}
+        missing = planning_warning()
+        del missing["effect"]
+
+        for warning in (unknown, missing):
+            with (
+                self.subTest(warning=warning),
+                self.assertRaisesRegex(ValueError, "must contain exactly"),
+            ):
+                task_from_mapping(
+                    {
+                        "id": "INVALID",
+                        "status": "ready",
+                        "planning_warnings": [warning],
+                    },
+                    0,
+                )
+
+    def test_command_task_rejects_invalid_planning_warning_enums(self) -> None:
+        invalid_values = {
+            "kind": "other_warning",
+            "match": "similar",
+            "effect": "blocking",
+            "precision": "approximate",
+        }
+
+        for key, value in invalid_values.items():
+            warning = planning_warning()
+            warning[key] = value
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                task_from_mapping(
+                    {
+                        "id": "INVALID",
+                        "status": "ready",
+                        "planning_warnings": [warning],
+                    },
+                    0,
+                )
+
+    def test_command_task_rejects_invalid_planning_warning_paths(self) -> None:
+        invalid_paths = (
+            "/tools/helper.sh",
+            "tools/../helper.sh",
+            "tools/helper",
+            "tools/.env",
+        )
+
+        for path_key in ("requested_path", "existing_path"):
+            for path in invalid_paths:
+                warning = planning_warning()
+                warning[path_key] = path
+                with (
+                    self.subTest(path_key=path_key, path=path),
+                    self.assertRaises(ValueError),
+                ):
+                    task_from_mapping(
+                        {
+                            "id": "INVALID",
+                            "status": "ready",
+                            "planning_warnings": [warning],
+                        },
+                        0,
+                    )
+
+    def test_command_task_rejects_planning_warning_path_over_byte_limit(self) -> None:
+        warning = planning_warning(requested_path=f"tools/{'é' * 509}.py")
+
+        with self.assertRaisesRegex(ValueError, "1024 UTF-8 bytes"):
+            task_from_mapping(
+                {
+                    "id": "INVALID",
+                    "status": "ready",
+                    "planning_warnings": [warning],
+                },
+                0,
+            )
+
+    def test_command_task_rejects_planning_warning_over_entry_byte_limit(self) -> None:
+        long_path = f"tools/{'a' * 990}.py"
+        warning = planning_warning(long_path, long_path)
+
+        with self.assertRaisesRegex(ValueError, "2048 UTF-8 bytes"):
+            task_from_mapping(
+                {
+                    "id": "INVALID",
+                    "status": "ready",
+                    "planning_warnings": [warning],
+                },
+                0,
+            )
+
+    def test_command_task_rejects_non_string_planning_warning_value(self) -> None:
+        warning = planning_warning()
+        warning["requested_path"] = 7  # type: ignore[assignment]
+
+        with self.assertRaisesRegex(ValueError, "values must be strings"):
+            task_from_mapping(
+                {
+                    "id": "INVALID",
+                    "status": "ready",
+                    "planning_warnings": [warning],
+                },
+                0,
+            )
 
     def test_task_json_omits_empty_traceability_fields(self) -> None:
         payload = Task("TASK-01", "Plain task", "Next").to_json()

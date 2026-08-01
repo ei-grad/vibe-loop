@@ -215,6 +215,18 @@ GENERIC_FILENAME_TOKENS = frozenset(
     }
 )
 DELIVERABLE_COLLISION_LIMIT = 3
+DELIVERABLE_COLLISION_PATH_MAX_BYTES = 1024
+DELIVERABLE_COLLISION_WARNING_MAX_BYTES = 2048
+DELIVERABLE_COLLISION_KIND = "deliverable_path_collision"
+DELIVERABLE_COLLISION_MATCHES = frozenset({"exact", "same_directory_sibling"})
+DELIVERABLE_COLLISION_EFFECT = "advisory_only"
+DELIVERABLE_COLLISION_PRECISION = (
+    "high recall for paths governed by a creation verb in the same clause; "
+    "paths attached by modification prepositions are excluded"
+)
+DELIVERABLE_COLLISION_WARNING_KEYS = frozenset(
+    {"kind", "requested_path", "existing_path", "match", "effect", "precision"}
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -247,6 +259,7 @@ class Task:
     design_refs: tuple[str, ...] = ()
     approval_state: str = ""
     source_fingerprints: tuple[dict[str, object], ...] = ()
+    planning_warnings: tuple[dict[str, str], ...] = ()
     order: int = 0
     # Per-task agent routing inputs. `agent` selects a profile, `model` overrides
     # that profile's model, and `hazards` feeds routing predicates. They are
@@ -318,6 +331,10 @@ class Task:
         if self.source_fingerprints:
             payload["source_fingerprints"] = [
                 dict(fingerprint) for fingerprint in self.source_fingerprints
+            ]
+        if self.planning_warnings:
+            payload["planning_warnings"] = [
+                dict(warning) for warning in self.planning_warnings
             ]
         if self.agent:
             payload["agent"] = self.agent
@@ -434,16 +451,78 @@ def _deliverable_collision(
     match: str,
 ) -> dict[str, str]:
     return {
-        "kind": "deliverable_path_collision",
+        "kind": DELIVERABLE_COLLISION_KIND,
         "requested_path": requested_path,
         "existing_path": existing_path,
         "match": match,
-        "effect": "advisory_only",
-        "precision": (
-            "high recall for paths governed by a creation verb in the same "
-            "clause; paths attached by modification prepositions are excluded"
-        ),
+        "effect": DELIVERABLE_COLLISION_EFFECT,
+        "precision": DELIVERABLE_COLLISION_PRECISION,
     }
+
+
+def normalize_planning_warnings(value: object) -> tuple[dict[str, str], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("task planning_warnings must be an array")
+    if len(value) > DELIVERABLE_COLLISION_LIMIT:
+        raise ValueError(
+            f"task planning_warnings must contain at most "
+            f"{DELIVERABLE_COLLISION_LIMIT} entries"
+        )
+
+    warnings: list[dict[str, str]] = []
+    for index, item in enumerate(value):
+        name = f"task planning_warnings[{index}]"
+        if not isinstance(item, Mapping):
+            raise ValueError(f"{name} must be an object")
+        if set(item) != DELIVERABLE_COLLISION_WARNING_KEYS:
+            raise ValueError(
+                f"{name} must contain exactly: "
+                + ", ".join(sorted(DELIVERABLE_COLLISION_WARNING_KEYS))
+            )
+        if not all(isinstance(item[key], str) for key in item):
+            raise ValueError(f"{name} values must be strings")
+        if item["kind"] != DELIVERABLE_COLLISION_KIND:
+            raise ValueError(f"{name}.kind must be {DELIVERABLE_COLLISION_KIND}")
+        if item["match"] not in DELIVERABLE_COLLISION_MATCHES:
+            allowed_matches = ", ".join(sorted(DELIVERABLE_COLLISION_MATCHES))
+            raise ValueError(f"{name}.match must be one of {allowed_matches}")
+        if item["effect"] != DELIVERABLE_COLLISION_EFFECT:
+            raise ValueError(f"{name}.effect must be {DELIVERABLE_COLLISION_EFFECT}")
+        if item["precision"] != DELIVERABLE_COLLISION_PRECISION:
+            raise ValueError(f"{name}.precision must use the canonical value")
+
+        paths: dict[str, str] = {}
+        for path_key in ("requested_path", "existing_path"):
+            raw_path = item[path_key]
+            path = normalize_path_lock(raw_path)
+            if not PurePosixPath(path).suffix:
+                raise ValueError(f"{name}.{path_key} must name a file with a suffix")
+            if len(path.encode("utf-8")) > DELIVERABLE_COLLISION_PATH_MAX_BYTES:
+                raise ValueError(
+                    f"{name}.{path_key} must fit within "
+                    f"{DELIVERABLE_COLLISION_PATH_MAX_BYTES} UTF-8 bytes"
+                )
+            paths[path_key] = path
+
+        warning = _deliverable_collision(
+            paths["requested_path"],
+            paths["existing_path"],
+            item["match"],
+        )
+        encoded = json.dumps(
+            warning,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > DELIVERABLE_COLLISION_WARNING_MAX_BYTES:
+            raise ValueError(
+                f"{name} must fit within "
+                f"{DELIVERABLE_COLLISION_WARNING_MAX_BYTES} UTF-8 bytes"
+            )
+        warnings.append(warning)
+    return tuple(warnings)
 
 
 class TaskSource(Protocol):
@@ -3189,6 +3268,7 @@ def task_from_mapping(value: object, order: int) -> Task:
         value.get("source_fingerprints"),
         "source_fingerprints",
     )
+    planning_warnings = normalize_planning_warnings(value.get("planning_warnings"))
     return Task(
         task_id=str(value.get("id") or value.get("task_id") or ""),
         title=str(value.get("title") or value.get("id") or value.get("task_id") or ""),
@@ -3219,6 +3299,7 @@ def task_from_mapping(value: object, order: int) -> Task:
         ),
         approval_state=approval_state,
         source_fingerprints=source_fingerprints,
+        planning_warnings=planning_warnings,
         order=order,
         agent=agent,
         model=model,

@@ -158,6 +158,28 @@ from vibe_loop.workers import (
 )
 
 
+def planning_warning(
+    requested_path: str,
+    existing_path: str,
+    match: str = "exact",
+) -> dict[str, str]:
+    return {
+        "kind": "deliverable_path_collision",
+        "requested_path": requested_path,
+        "existing_path": existing_path,
+        "match": match,
+        "effect": "advisory_only",
+        "precision": tasks_module.DELIVERABLE_COLLISION_PRECISION,
+    }
+
+
+def prompt_planning_warnings(prompt: str) -> list[dict[str, str]]:
+    section = prompt.split("### Planning Validation Warnings", 1)[1]
+    record = section.split("```json\n", 1)[1].split("\n```", 1)[0]
+    payload = json.loads(record)
+    return payload["planning_warnings"]
+
+
 class MutableTaskSource:
     def __init__(
         self,
@@ -856,7 +878,7 @@ class RunnerTests(unittest.TestCase):
             f"$vibe-loop {task.task_id}{RUNTIME_OWNED_WORKER_ADDENDUM}",
         )
 
-    def test_worker_prompt_surfaces_advisory_deliverable_collision(self) -> None:
+    def test_worker_prompt_planning_warning_surfaces_computed_collision(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             (repo / "tools").mkdir()
@@ -875,6 +897,85 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('"effect": "advisory_only"', prompt)
         self.assertIn('"requested_path": "tools/qemu-proof-startup-guard.sh"', prompt)
         self.assertIn('"existing_path": "tools/qemu-proof-outcome.sh"', prompt)
+
+    def test_worker_prompt_planning_warning_surfaces_persisted_only(self) -> None:
+        warning = planning_warning("tools/removed.py", "tools/old.py")
+        task = Task(
+            task_id="PLANNING-PERSISTED",
+            title="Retain source evidence",
+            status="Next",
+            planning_warnings=(warning,),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            prompt = build_worker_prompt(
+                "$",
+                task,
+                VibeConfig(repo=Path(directory)),
+            )
+
+        self.assertEqual(prompt_planning_warnings(prompt), [warning])
+        self.assertTrue(prompt.startswith("$vibe-loop PLANNING-PERSISTED"))
+
+    def test_worker_prompt_planning_warning_deduplicates_across_sources(self) -> None:
+        warning = planning_warning("tools/existing.py", "tools/existing.py")
+        task = Task(
+            task_id="PLANNING-DUPLICATE",
+            title="Add helper",
+            status="Next",
+            body="Create tools/existing.py.",
+            planning_warnings=(warning,),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "tools").mkdir()
+            (repo / "tools" / "existing.py").write_text("")
+
+            prompt = build_worker_prompt("$", task, VibeConfig(repo=repo))
+
+        self.assertEqual(prompt_planning_warnings(prompt), [warning])
+
+    def test_worker_prompt_planning_warning_union_cap_prefers_persisted(self) -> None:
+        persisted = (
+            planning_warning("planned/one.py", "legacy/one.py"),
+            planning_warning("planned/two.py", "legacy/two.py"),
+        )
+        task = Task(
+            task_id="PLANNING-CAP",
+            title="Add helpers",
+            status="Next",
+            body="Create tools/computed-one.py and create tools/computed-two.py.",
+            planning_warnings=persisted,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "tools").mkdir()
+            (repo / "tools" / "computed-one.py").write_text("")
+            (repo / "tools" / "computed-two.py").write_text("")
+
+            prompt = build_worker_prompt("$", task, VibeConfig(repo=repo))
+
+        warnings = prompt_planning_warnings(prompt)
+        self.assertEqual(warnings[:2], list(persisted))
+        self.assertEqual(len(warnings), 3)
+        self.assertEqual(warnings[2]["requested_path"], "tools/computed-one.py")
+        self.assertNotIn("tools/computed-two.py", prompt)
+
+    def test_worker_prompt_planning_warning_section_absent_without_warnings(
+        self,
+    ) -> None:
+        task = Task(
+            task_id="PLANNING-NONE",
+            title="Inspect behavior",
+            status="Next",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            prompt = build_worker_prompt(
+                "$",
+                task,
+                VibeConfig(repo=Path(directory)),
+            )
+
+        self.assertNotIn("### Planning Validation Warnings", prompt)
 
     def test_runtime_owned_worker_prompt_uses_slim_addendum(self) -> None:
         task = Task(task_id="ORC-10", title="Runtime lifecycle", status="Next")

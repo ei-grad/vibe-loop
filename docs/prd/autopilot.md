@@ -1004,18 +1004,27 @@ affected task's authoritative conflict domains, and re-read each created or
 repaired task to verify that its declared paths cover its acceptance and
 recorded scope evidence. Before publishing a drafted task, the planning worker
 must run deliverable-collision validation and persist any advisory warning on
-the authoritative task record.
+the authoritative task record. The canonical optional top-level wire field,
+shape, validation limits, backward compatibility, and external producer
+responsibility are owned by
+[PRD-TSK-003](task-discovery.md#prd-tsk-003-command-task-sources).
 
 Before an implementation worker launches, the runtime validates
 creation-worded repository-relative deliverable paths in the normalized task
 record against the current repository. An existing exact path or a close
 same-directory filename produces a `deliverable_path_collision` warning in the
-worker prompt naming both paths. The warning is advisory: intentional rewrites
-remain dispatchable. Detection deliberately favors recall, but bounds its
-noise by considering only file paths governed by a creation verb in the same
-clause, excluding paths attached through modification prepositions such as
-`to` and `through`, and limiting fuzzy matches to the same directory and file
-extension.
+worker prompt naming both paths. Persisted source warnings and freshly computed
+warnings render in one Planning Validation Warnings section. The runtime keeps
+persisted source order followed by the detector's stable order, removes exact
+canonical duplicates by first occurrence, and retains the first three warnings
+across that shared union. Persisted evidence therefore survives source body
+omission and later repository changes, and consumes the cap before current
+repository findings. Warnings remain advisory and never change runnability or
+scheduling: intentional rewrites remain dispatchable. Detection deliberately
+favors recall, but bounds its noise by considering only file paths governed by
+a creation verb in the same clause, excluding paths attached through
+modification prepositions such as `to` and `through`, and limiting fuzzy matches
+to the same directory and file extension.
 
 Project-authored `[autopilot]` maintenance commands (`PRD-AUT-005`) continue to
 override or augment the native behaviors; native behavior is the default, not a

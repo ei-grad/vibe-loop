@@ -179,6 +179,7 @@ from vibe_loop.telemetry import (
 )
 from vibe_loop.tasks import (
     BLOCKED_FAMILY_STATUSES,
+    DELIVERABLE_COLLISION_LIMIT,
     Task,
     TaskSource,
     build_task_source,
@@ -6839,16 +6840,26 @@ def build_worker_prompt(
         else CLI_WORKER_ADDENDUM
     )
     prompt = f"{skill_prefix}vibe-loop {task.task_id}{addendum}"
-    planning_collisions = (
+    computed_warnings = (
         task_deliverable_path_collisions(config.repo, task)
         if config is not None
         else ()
     )
-    if planning_collisions:
+    planning_warnings: list[dict[str, str]] = []
+    seen_warnings: set[str] = set()
+    for warning in (*task.planning_warnings, *computed_warnings):
+        canonical = json.dumps(warning, sort_keys=True, separators=(",", ":"))
+        if canonical in seen_warnings:
+            continue
+        seen_warnings.add(canonical)
+        planning_warnings.append(dict(warning))
+        if len(planning_warnings) == DELIVERABLE_COLLISION_LIMIT:
+            break
+    if planning_warnings:
         planning_record = json.dumps(
             {
                 "id": task.task_id,
-                "planning_warnings": list(planning_collisions),
+                "planning_warnings": planning_warnings,
             },
             indent=2,
             sort_keys=True,
@@ -6856,10 +6867,10 @@ def build_worker_prompt(
         prompt = (
             f"{prompt}\n\n"
             "### Planning Validation Warnings\n\n"
-            "A deterministic pre-dispatch repository check found possible "
-            "collisions with deliverable paths named by this task. These warnings "
-            "are advisory and do not prohibit an intentional rewrite. Inspect the "
-            "existing paths before implementing:\n\n"
+            "Planning validation found possible collisions with deliverable paths "
+            "named by this task. These warnings are advisory and do not prohibit "
+            "an intentional rewrite. Inspect the existing paths before "
+            "implementing:\n\n"
             "```json\n"
             f"{planning_record}\n"
             "```\n"
