@@ -8951,6 +8951,14 @@ class NativePlanningTests(unittest.TestCase):
             "do not warn on ordinary path references or unrelated filenames",
             worker_calls[0]["command"],
         )
+        self.assertIn(
+            "re-read each planning_warnings value from the authoritative source",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "repair any mismatch before exiting",
+            worker_calls[0]["command"],
+        )
         self.assertEqual(
             records[0]["record_type"], AUTOPILOT_PLANNING_DECISION_RECORD_TYPE
         )

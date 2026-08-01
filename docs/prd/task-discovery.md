@@ -101,7 +101,9 @@ lock contract, name files with non-empty suffixes, and occupy at most 1,024
 UTF-8 bytes each. A warning's compact JSON encoding occupies at most 2,048
 UTF-8 bytes. Unknown or missing keys, invalid enums or paths, excess entries,
 and malformed types reject the command source response; command list responses
-normalize atomically rather than silently dropping an invalid task. Valid
+normalize atomically rather than silently dropping an invalid task. Rejection
+diagnostics identify the zero-based list entry and its `id`, `task_id`, or title
+when available so the authoritative producer can repair the exact record. Valid
 warnings round-trip in normalized task JSON. Authoritative source-side storage
 and explicit projection of this field are producer responsibilities outside
 vibe-loop's consumer contract. At dispatch, the runtime applies the

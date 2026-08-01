@@ -2551,7 +2551,23 @@ class CommandTaskSource:
             raise ValueError(
                 "task_source.list must return a JSON array or {tasks:[...]}"
             )
-        return [task_from_mapping(item, index) for index, item in enumerate(raw_tasks)]
+        tasks: list[Task] = []
+        for index, item in enumerate(raw_tasks):
+            try:
+                tasks.append(task_from_mapping(item, index))
+            except ValueError as exc:
+                context = f"task_source.list entry {index}"
+                if isinstance(item, Mapping):
+                    for identity_key in ("id", "task_id", "title"):
+                        identity = item.get(identity_key)
+                        if isinstance(identity, str) and identity.strip():
+                            normalized_identity = identity.strip()
+                            if len(normalized_identity) > 120:
+                                normalized_identity = f"{normalized_identity[:117]}..."
+                            context += f" ({identity_key}={normalized_identity!r})"
+                            break
+                raise ValueError(f"{context}: {exc}") from exc
+        return tasks
 
     def probe(self, task_id: str) -> Task | None:
         return self._probe(task_id)

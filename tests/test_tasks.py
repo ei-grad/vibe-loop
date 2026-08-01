@@ -398,6 +398,34 @@ class MarkdownPlanTests(unittest.TestCase):
                 0,
             )
 
+    def test_command_task_planning_warning_error_identifies_invalid_task(self) -> None:
+        invalid_warning = planning_warning()
+        invalid_warning["precision"] += "."
+        payload = [
+            {"id": "TASK-A", "status": "ready"},
+            {
+                "id": "TASK-B",
+                "title": "Invalid warning producer",
+                "status": "ready",
+                "planning_warnings": [invalid_warning],
+            },
+            {"id": "TASK-C", "status": "ready"},
+        ]
+        source = CommandTaskSource(
+            Path("."),
+            TaskSourceConfig(type="command", list_command="unused"),
+        )
+
+        with (
+            mock.patch.object(tasks_module, "run_json_command", return_value=payload),
+            self.assertRaisesRegex(
+                ValueError,
+                r"task_source\.list entry 1 \(id='TASK-B'\): "
+                r"task planning_warnings\[0\]\.precision must use the canonical value",
+            ),
+        ):
+            source.list_tasks()
+
     def test_task_json_omits_empty_traceability_fields(self) -> None:
         payload = Task("TASK-01", "Plain task", "Next").to_json()
 
