@@ -102,11 +102,16 @@ UTF-8 bytes each. A warning's compact JSON encoding occupies at most 2,048
 UTF-8 bytes. Unknown or missing keys, invalid enums or paths, excess entries,
 and malformed types reject the command source response; command list responses
 normalize atomically rather than silently dropping an invalid task. Rejection
-diagnostics identify the zero-based list entry and its `id`, `task_id`, or title
-when available so the authoritative producer can repair the exact record. Valid
-warnings round-trip in normalized task JSON. Authoritative source-side storage
-and explicit projection of this field are producer responsibilities outside
-vibe-loop's consumer contract. At dispatch, the runtime applies the
+diagnostics always identify the zero-based list entry, then use the first usable
+identity in the order `id`, `task_id`, title; when none is usable, the index is
+the complete record context. This bounded context lets the authoritative
+producer repair the exact record without copying unrelated task payloads or the
+configured command into the diagnostic. Valid warning paths may name root-level
+files or contain Unicode directory components and filenames, and round-trip in
+normalized repository-relative POSIX form. Authoritative source-side storage
+and explicit projection of this field are external producer prerequisites:
+vibe-loop consumes them but does not implement or own Loopyard persistence or
+projection. At dispatch, the runtime applies the
 [persisted-first advisory union contract](autopilot.md#prd-aut-012-configuration-free-generic-cycle).
 
 Command task objects may also provide `prior_findings` and

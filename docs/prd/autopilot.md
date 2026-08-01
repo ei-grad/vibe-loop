@@ -981,10 +981,15 @@ content. The supervisor validates and journals the decision, launches the
 worker when requested, records its started and terminal lifecycle (including
 PID, log, configured worker timeout, and before/after runnable depth), and
 re-reads rather than mutating the task source. Post-worker task-source failures
-remain explicit instead of becoming a zero count. Malformed decisions fail
-closed without launching a write-capable worker. The two stages use the
-registered `autopilot_planning_decision` and `autopilot_planning_worker` record
-types.
+remain explicit instead of becoming a zero count. If that authoritative re-read
+finds a malformed canonical warning, the terminal planning-worker record uses
+`status=task_source_error`, `runnable_after=null`, and `created_count=null`; no
+malformed task is credited as newly authored or silently dropped. The bounded
+entry-identity diagnostic contract is owned by
+[PRD-TSK-003](task-discovery.md#prd-tsk-003-command-task-sources). Malformed
+decisions fail closed without launching a write-capable worker. The two stages
+use the registered `autopilot_planning_decision` and
+`autopilot_planning_worker` record types.
 
 The read-write planning worker must derive a new task's path conflict domains
 from its complete acceptance criteria and likely write surface, including
@@ -1011,6 +1016,8 @@ responsibility are owned by
 The native planning-worker prompt names that field and supplies its canonical
 warning object so a compatible authoritative task source can persist it; the
 task-source backend must still provide the storage and projection capability.
+vibe-loop does not supply that external producer prerequisite or claim ownership
+of Loopyard persistence.
 
 Before an implementation worker launches, the runtime validates
 creation-worded repository-relative deliverable paths in the normalized task
@@ -1027,7 +1034,10 @@ scheduling: intentional rewrites remain dispatchable. Detection deliberately
 favors recall, but bounds its noise by considering only file paths governed by
 a creation verb in the same clause, excluding paths attached through
 modification prepositions such as `to` and `through`, and limiting fuzzy matches
-to the same directory and file extension.
+to the same directory and file extension. Repository-root filenames and paths
+with Unicode components or filenames participate under the same normalized
+repository-relative POSIX, suffix, containment, exact-match, stable-order, and
+shared-cap rules.
 
 Project-authored `[autopilot]` maintenance commands (`PRD-AUT-005`) continue to
 override or augment the native behaviors; native behavior is the default, not a

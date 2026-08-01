@@ -167,6 +167,115 @@ class MarkdownPlanTests(unittest.TestCase):
         )
         self.assertEqual(collisions[0]["match"], "same_directory_sibling")
 
+    def test_deliverable_collision_flags_root_level_exact_and_sibling_paths(
+        self,
+    ) -> None:
+        cases = (
+            ("Create new-tool.py.", "new-tool.py", "new-tool.py", "exact"),
+            (
+                "Create qemu-proof-startup-guard.py.",
+                "qemu-proof-outcome.py",
+                "qemu-proof-startup-guard.py",
+                "same_directory_sibling",
+            ),
+        )
+        for body, existing_path, requested_path, match in cases:
+            with self.subTest(requested_path=requested_path, match=match):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    (repo / existing_path).write_text("")
+                    task = Task("TASK-ROOT", "Add root tool", "Next", body=body)
+
+                    collisions = task_deliverable_path_collisions(repo, task)
+
+                self.assertEqual(
+                    collisions,
+                    (planning_warning(requested_path, existing_path, match),),
+                )
+
+    def test_deliverable_collision_flags_nested_unicode_exact_and_sibling_paths(
+        self,
+    ) -> None:
+        cases = (
+            ("Create 工具/检查器.py.", "检查器.py", "检查器.py", "exact"),
+            (
+                "Create 工具/部署验证startup-guard.py.",
+                "部署验证startup-outcome.py",
+                "部署验证startup-guard.py",
+                "same_directory_sibling",
+            ),
+        )
+        for body, existing_name, requested_name, match in cases:
+            with self.subTest(requested_name=requested_name, match=match):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    tools = repo / "工具"
+                    tools.mkdir()
+                    (tools / existing_name).write_text("")
+                    task = Task("TASK-UNICODE", "Add Unicode tool", "Next", body=body)
+
+                    collisions = task_deliverable_path_collisions(repo, task)
+
+                self.assertEqual(
+                    collisions,
+                    (
+                        planning_warning(
+                            f"工具/{requested_name}",
+                            f"工具/{existing_name}",
+                            match,
+                        ),
+                    ),
+                )
+
+    def test_deliverable_collision_deduplicates_and_caps_mixed_path_forms(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "root.py").write_text("")
+            tools = repo / "工具"
+            tools.mkdir()
+            for name in ("one.py", "two.py", "three.py"):
+                (tools / name).write_text("")
+            task = Task(
+                "TASK-CAP",
+                "Add tools",
+                "Next",
+                body=(
+                    "Create root.py; create root.py; create 工具/one.py; "
+                    "create 工具/two.py; create 工具/three.py."
+                ),
+            )
+
+            collisions = task_deliverable_path_collisions(repo, task)
+
+        self.assertEqual(
+            [warning["requested_path"] for warning in collisions],
+            ["root.py", "工具/one.py", "工具/two.py"],
+        )
+
+    def test_deliverable_collision_rejects_unsafe_and_suffixless_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            outside = root / "outside.py"
+            outside.write_text("")
+            (repo / "outside.py").symlink_to(outside)
+            task = Task(
+                "TASK-BOUNDARY",
+                "Add bounded helper",
+                "Next",
+                body=(
+                    f"Create {outside.as_posix()}; create ../outside.py; "
+                    "create suffixless; create outside.py."
+                ),
+            )
+
+            collisions = task_deliverable_path_collisions(repo, task)
+
+        self.assertEqual(collisions, ())
+
     def test_deliverable_collision_ignores_no_match_and_incidental_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

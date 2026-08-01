@@ -147,7 +147,7 @@ from vibe_loop.runs import (
 )
 from vibe_loop.skill_deployment import SkillDeploymentError
 from vibe_loop.spec_diagnostics import SpecExecutionGateError
-from vibe_loop.tasks import Task, run_json_command
+from vibe_loop.tasks import CommandTaskSource, Task, run_json_command
 from vibe_loop.workers import (
     ActiveRunState,
     StaleLock,
@@ -915,6 +915,45 @@ class RunnerTests(unittest.TestCase):
 
         self.assertEqual(prompt_planning_warnings(prompt), [warning])
         self.assertTrue(prompt.startswith("$vibe-loop PLANNING-PERSISTED"))
+
+    def test_command_source_planning_warning_reaches_worker_prompt_first(
+        self,
+    ) -> None:
+        persisted = planning_warning("planned/tool.py", "legacy/tool.py")
+        nested = planning_warning("ignored/tool.py", "ignored/legacy.py")
+        payload = [
+            {
+                "id": "PLANNING-SOURCE",
+                "title": "Add computed helper",
+                "status": "Next",
+                "body": "Create tools/computed.py.",
+                "planning_warnings": [persisted],
+                "fields": {"planning_warnings": [nested]},
+            }
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "tools").mkdir()
+            (repo / "tools" / "computed.py").write_text("")
+            source = CommandTaskSource(
+                repo,
+                TaskSourceConfig(type="command", list_command="list-tasks"),
+            )
+            with patch.object(
+                tasks_module,
+                "run_json_command",
+                return_value=payload,
+            ):
+                task = source.list_tasks()[0]
+
+            prompt = build_worker_prompt("$", task, VibeConfig(repo=repo))
+
+        warnings = prompt_planning_warnings(prompt)
+        self.assertEqual(warnings[0], persisted)
+        self.assertEqual(warnings[1]["requested_path"], "tools/computed.py")
+        self.assertNotIn(nested, warnings)
+        self.assertEqual(prompt.count("### Planning Validation Warnings"), 1)
+        self.assertIn("warnings are advisory", prompt)
 
     def test_worker_prompt_planning_warning_deduplicates_across_sources(self) -> None:
         warning = planning_warning("tools/existing.py", "tools/existing.py")

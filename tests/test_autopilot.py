@@ -9259,39 +9259,106 @@ class NativePlanningTests(unittest.TestCase):
         self.assertFalse(result.worker.started)
         self.assertIsNone(result.worker.log_path)
 
-    def test_post_worker_task_source_error_is_explicit(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-            configured_repo(repo, [])
-            config = load_config(repo)
-            status = collect_project_status(config)
-            run_store = RunStore(config.state_path / "runs.jsonl")
+    def test_native_planning_post_worker_malformed_warning_identifies_source_entry(
+        self,
+    ) -> None:
+        identity_cases = (
+            (
+                {"id": "BROKEN-ID", "task_id": "ignored", "title": "Ignored"},
+                "task_source.list entry 1 (id='BROKEN-ID')",
+            ),
+            (
+                {"task_id": "BROKEN-TASK-ID", "title": "Ignored"},
+                "task_source.list entry 1 (task_id='BROKEN-TASK-ID')",
+            ),
+            (
+                {"title": "Broken warning producer"},
+                "task_source.list entry 1 (title='Broken warning producer')",
+            ),
+            ({}, "task_source.list entry 1:"),
+        )
+        invalid_warning = {
+            "kind": "deliverable_path_collision",
+            "requested_path": "planned/tool.py",
+            "existing_path": "legacy/tool.py",
+            "match": "exact",
+            "effect": "advisory_only",
+            "precision": f"{DELIVERABLE_COLLISION_PRECISION}.",
+        }
 
-            def successful_worker(command, *, on_start, **kwargs):
-                on_start(4444)
-                return NativePlanningProcessResult(exit_code=0, pid=4444)
+        for identity, expected_context in identity_cases:
+            with self.subTest(identity=identity):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    configured_repo(
+                        repo,
+                        [],
+                        extra_toml=(
+                            "[task_source]\n"
+                            'type = "command"\n'
+                            'list = "list-tasks --json"\n'
+                        ),
+                    )
+                    config = load_config(repo)
+                    valid_payload = [
+                        {"id": "EXISTING", "title": "Existing", "status": "Next"}
+                    ]
+                    with mock.patch(
+                        "vibe_loop.tasks.run_json_command",
+                        return_value=valid_payload,
+                    ):
+                        status = collect_project_status(config)
+                    run_store = RunStore(config.state_path / "runs.jsonl")
 
-            with mock.patch(
-                "vibe_loop.autopilot.collect_task_queue_status",
-                return_value=TaskQueueStatus(source_error="task backend unavailable"),
-            ):
-                result = run_native_planning(
-                    config,
-                    cycle_id="cycle-source-error",
-                    status=status,
-                    min_ready=1,
-                    run_store=run_store,
-                    analysis_runner=lambda prompt, output_path: {
-                        "should_plan": True,
-                        "reason": "queue empty",
-                        "objective": "add one task",
-                    },
-                    worker_launcher=successful_worker,
+                    def successful_worker(command, *, on_start, **kwargs):
+                        on_start(4444)
+                        return NativePlanningProcessResult(exit_code=0, pid=4444)
+
+                    malformed_payload = [
+                        valid_payload[0],
+                        identity
+                        | {
+                            "status": "Next",
+                            "body": "UNRELATED-TASK-PAYLOAD",
+                            "planning_warnings": [invalid_warning],
+                        },
+                    ]
+                    with mock.patch(
+                        "vibe_loop.tasks.run_json_command",
+                        return_value=malformed_payload,
+                    ):
+                        result = run_native_planning(
+                            config,
+                            cycle_id="cycle-source-error",
+                            status=status,
+                            min_ready=1,
+                            run_store=run_store,
+                            analysis_runner=lambda prompt, output_path: {
+                                "should_plan": True,
+                                "reason": "queue empty",
+                                "objective": "add one task",
+                            },
+                            worker_launcher=successful_worker,
+                        )
+                    terminal_record = run_store.read_records()[-1]
+
+                self.assertEqual(result.worker.status, "task_source_error")
+                self.assertIn(expected_context, result.worker.task_source_error)
+                self.assertIn(
+                    "planning_warnings[0].precision must use the canonical value",
+                    result.worker.task_source_error,
                 )
-
-        self.assertEqual(result.worker.status, "task_source_error")
-        self.assertEqual(result.worker.task_source_error, "task backend unavailable")
-        self.assertIsNone(result.worker.runnable_after)
+                self.assertNotIn(
+                    "UNRELATED-TASK-PAYLOAD",
+                    result.worker.task_source_error,
+                )
+                self.assertNotIn("list-tasks --json", result.worker.task_source_error)
+                self.assertIsNone(result.worker.runnable_after)
+                self.assertIsNone(result.worker.created_count)
+                self.assertEqual(result.worker.created_task_ids, ())
+                self.assertEqual(terminal_record["status"], "task_source_error")
+                self.assertIsNone(terminal_record["runnable_after"])
+                self.assertIsNone(terminal_record["created_count"])
 
     def test_launcher_kills_process_group_on_timeout_and_interrupt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

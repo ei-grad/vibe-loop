@@ -188,7 +188,7 @@ TRACEABILITY_LIST_FIELDS = {
 }
 DELIVERABLE_PATH_RE = re.compile(
     r"(?<![\w./-])"
-    r"(?P<path>(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+)"
+    r"(?P<path>(?:[\w.-]+/)*[\w.-]+\.[A-Za-z0-9]+)"
     r"(?![\w/-])"
 )
 DELIVERABLE_INTENT_RE = re.compile(
@@ -355,7 +355,7 @@ def task_deliverable_path_collisions(
     collisions: list[dict[str, str]] = []
     for requested_path in requested_paths:
         target = repo / requested_path
-        if target.is_file():
+        if target.is_file() and target.resolve().is_relative_to(repo):
             collisions.append(
                 _deliverable_collision(requested_path, requested_path, "exact")
             )
@@ -365,6 +365,7 @@ def task_deliverable_path_collisions(
                     sibling
                     for sibling in target.parent.iterdir()
                     if sibling.is_file()
+                    and sibling.resolve().is_relative_to(repo)
                     and _close_deliverable_sibling(target.name, sibling.name)
                 ),
                 key=lambda sibling: sibling.name,
