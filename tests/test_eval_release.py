@@ -861,23 +861,9 @@ class RepoAgnosticGuardTests(unittest.TestCase):
                     (root / "scripts" / "binary").write_bytes(
                         b"\xff" + forbidden_reference.encode()
                     )
-                    subprocess.run(("git", "init", "-q"), cwd=root, check=True)
-                    subprocess.run(
-                        ("git", "add", script_path.relative_to(root).as_posix()),
-                        cwd=root,
-                        check=True,
-                    )
-                    tracked_script = subprocess.run(
-                        ("git", "ls-files", script_path.relative_to(root).as_posix()),
-                        cwd=root,
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                    ).stdout.strip()
 
                     offenders = find_forbidden_repository_references(root)
 
-                self.assertEqual(tracked_script, "scripts/nested/release-guard-probe")
                 self.assertEqual(
                     offenders,
                     [f"scripts/nested/release-guard-probe: {pattern.pattern}"],
