@@ -736,7 +736,7 @@ FORBIDDEN_REFERENCE_PATTERNS = (
     re.compile(r"[A-Za-z]:\\Users\\"),
     re.compile(r"faceapp", re.IGNORECASE),
 )
-SCANNED_REFERENCE_ROOTS = ("src", "docs", "eval", "tests")
+SCANNED_REFERENCE_ROOTS = ("src", "docs", "eval", "scripts", "tests")
 SKIPPED_REFERENCE_DIRS = frozenset({"__pycache__", ".git", ".venv"})
 # These files spell out the forbidden literals on purpose — to define the guard
 # and to assert command output stays clean — so they are exempt from it.
@@ -746,6 +746,43 @@ REFERENCE_GUARD_EXEMPT_FILES = frozenset(
         "tests/test_eval_examples.py",
     }
 )
+
+
+def find_forbidden_repository_references(root: Path) -> list[str]:
+    missing_roots = [
+        directory
+        for directory in SCANNED_REFERENCE_ROOTS
+        if not (root / directory).is_dir()
+    ]
+    if missing_roots:
+        missing = ", ".join(missing_roots)
+        raise AssertionError(f"reference guard scan roots missing: {missing}")
+
+    targets = [root / "README.md", root / "PROMPT.md"]
+    for directory in SCANNED_REFERENCE_ROOTS:
+        for path in (root / directory).rglob("*"):
+            if not path.is_file():
+                continue
+            if SKIPPED_REFERENCE_DIRS.intersection(path.parts):
+                continue
+            targets.append(path)
+
+    offenders: list[str] = []
+    for path in targets:
+        if not path.exists():
+            continue
+        relative = path.relative_to(root).as_posix()
+        if relative in REFERENCE_GUARD_EXEMPT_FILES:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            # Binary or unreadable files cannot carry a textual leak.
+            continue
+        for pattern in FORBIDDEN_REFERENCE_PATTERNS:
+            if pattern.search(text):
+                offenders.append(f"{relative}: {pattern.pattern}")
+    return offenders
 
 
 class RepoAgnosticGuardTests(unittest.TestCase):
@@ -786,32 +823,77 @@ class RepoAgnosticGuardTests(unittest.TestCase):
 
     def test_shipped_artifacts_have_no_downstream_references(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        targets = [root / "README.md", root / "PROMPT.md"]
-        for directory in SCANNED_REFERENCE_ROOTS:
-            for path in (root / directory).rglob("*"):
-                if not path.is_file():
-                    continue
-                if SKIPPED_REFERENCE_DIRS.intersection(path.parts):
-                    continue
-                targets.append(path)
-
-        offenders: list[str] = []
-        for path in targets:
-            if not path.exists():
-                continue
-            relative = path.relative_to(root).as_posix()
-            if relative in REFERENCE_GUARD_EXEMPT_FILES:
-                continue
-            try:
-                text = path.read_text(encoding="utf-8")
-            except (UnicodeDecodeError, OSError):
-                # Binary or unreadable files cannot carry a textual leak.
-                continue
-            for pattern in FORBIDDEN_REFERENCE_PATTERNS:
-                if pattern.search(text):
-                    offenders.append(f"{relative}: {pattern.pattern}")
+        offenders = find_forbidden_repository_references(root)
 
         self.assertEqual(offenders, [], f"downstream references leaked: {offenders}")
+
+    def test_shipped_script_references_are_reported_by_relative_path(self) -> None:
+        forbidden_references = (
+            "/home/developer/project",
+            "/Users/developer/project",
+            r"C:\Users\developer\project",
+            "FaceApp-internal",
+        )
+
+        for pattern, forbidden_reference in zip(
+            FORBIDDEN_REFERENCE_PATTERNS, forbidden_references, strict=True
+        ):
+            with self.subTest(pattern=pattern.pattern):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    for scan_root in SCANNED_REFERENCE_ROOTS:
+                        (root / scan_root).mkdir()
+                    script_path = root / "scripts" / "nested" / "release-guard-probe"
+                    script_path.parent.mkdir()
+                    script_path.write_text(forbidden_reference, encoding="utf-8")
+                    (root / "scripts" / "__pycache__").mkdir()
+                    (root / "scripts" / "__pycache__" / "generated").write_text(
+                        forbidden_reference, encoding="utf-8"
+                    )
+                    (root / "scripts" / ".venv").mkdir()
+                    (root / "scripts" / ".venv" / "generated").write_text(
+                        forbidden_reference, encoding="utf-8"
+                    )
+                    (root / "scripts" / ".git").mkdir()
+                    (root / "scripts" / ".git" / "metadata").write_text(
+                        forbidden_reference, encoding="utf-8"
+                    )
+                    (root / "scripts" / "binary").write_bytes(
+                        b"\xff" + forbidden_reference.encode()
+                    )
+                    subprocess.run(("git", "init", "-q"), cwd=root, check=True)
+                    subprocess.run(
+                        ("git", "add", script_path.relative_to(root).as_posix()),
+                        cwd=root,
+                        check=True,
+                    )
+                    tracked_script = subprocess.run(
+                        ("git", "ls-files", script_path.relative_to(root).as_posix()),
+                        cwd=root,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+
+                    offenders = find_forbidden_repository_references(root)
+
+                self.assertEqual(tracked_script, "scripts/nested/release-guard-probe")
+                self.assertEqual(
+                    offenders,
+                    [f"scripts/nested/release-guard-probe: {pattern.pattern}"],
+                )
+
+    def test_reference_guard_rejects_a_missing_scan_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for scan_root in SCANNED_REFERENCE_ROOTS:
+                if scan_root != "scripts":
+                    (root / scan_root).mkdir()
+
+            with self.assertRaisesRegex(
+                AssertionError, "reference guard scan roots missing: scripts"
+            ):
+                find_forbidden_repository_references(root)
 
 
 def passing_release_aggregate(
