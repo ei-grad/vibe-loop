@@ -368,6 +368,18 @@ preserved approved candidate branch and commit; a generic conflict reason alone
 is insufficient. The runtime never performs semantic conflict resolution
 itself.
 
+`orchestration.push_main_to_upstream` is a per-project integration policy and
+defaults to `false`. When enabled, the runtime pushes the checked-out main
+branch to its configured Git upstream after successful main verification and
+before it records successful integration or releases the main-integration lock.
+This applies to both a new fast-forward and `branch_already_merged`
+reconciliation. A missing upstream, rejected push, or post-push upstream ref
+that does not equal the verified local main commit records
+`main_push_failed` with bounded, redacted Git evidence. The local merge remains
+intact so a transport or policy failure cannot discard reviewed work, but the
+run does not report completed. With the option omitted or false, integration
+does not inspect or push an upstream and preserves the prior result payload.
+
 A failed `git merge --ff-only` records bounded, redacted Git output including
 stderr. The reason is `main_fast_forward_failed` only when successful ancestry
 probes confirm that neither ref contains the other. If either ref contains the

@@ -4383,6 +4383,7 @@ INTEGRATION_FAILURE_REASONS = (
     "main_worktree_unavailable",
     "main_fast_forward_environment_failed",
     "main_fast_forward_failed",
+    "main_push_failed",
     "main_verification_failed",
     "integration_ancestry_unproven",
 )
@@ -4558,6 +4559,7 @@ class Integrator:
         completion_commands: Sequence[str],
         integration_keys: Sequence[str],
         verify_on_main_keys: Sequence[str],
+        push_main_to_upstream: bool = False,
         lock_manager: object,
         run_store: object,
         run_id: str,
@@ -4583,6 +4585,7 @@ class Integrator:
         self.completion_commands = tuple(completion_commands)
         self.integration_keys = tuple(integration_keys)
         self.verify_on_main_keys = tuple(verify_on_main_keys)
+        self.push_main_to_upstream = push_main_to_upstream
         self.lock_manager = lock_manager
         self.run_store = run_store
         self.run_id = run_id
@@ -4793,6 +4796,21 @@ class Integrator:
                     },
                     recovered=recovered_lock,
                 )
+            push_diagnostics = self._push_main(main_before)
+            if (
+                push_diagnostics is not None
+                and push_diagnostics.get("status") != "pushed"
+            ):
+                return self._record_failure(
+                    "main_push_failed",
+                    status="failed",
+                    main_before=main_before,
+                    main_after=main_before,
+                    refreshed_head=branch_head,
+                    verification=checks,
+                    diagnostics={"main_push": push_diagnostics},
+                    recovered=recovered_lock,
+                )
             return self._record_completed_result(
                 IntegrationResult(
                     outcome="branch_already_merged",
@@ -4809,6 +4827,11 @@ class Integrator:
                     ),
                     diagnostics={
                         "provenance_settlement": "settled-by-reconciliation",
+                        **(
+                            {"main_push": push_diagnostics}
+                            if push_diagnostics is not None
+                            else {}
+                        ),
                     },
                 ),
                 provenance_outcome="settled-by-reconciliation",
@@ -4931,6 +4954,25 @@ class Integrator:
                 recovered=restored or recovered_lock,
                 diagnostics=diagnostics,
             )
+        push_diagnostics = self._push_main(main_after)
+        if push_diagnostics is not None and push_diagnostics.get("status") != "pushed":
+            return self._record_failure(
+                "main_push_failed",
+                status="failed",
+                main_before=main_before,
+                main_after=main_after,
+                refreshed_head=branch_head,
+                verification=checks,
+                diagnostics={
+                    **resolution_diagnostics,
+                    **(
+                        {"main_push": push_diagnostics}
+                        if push_diagnostics is not None
+                        else {}
+                    ),
+                },
+                recovered=recovered_lock,
+            )
         return self._record_completed_result(
             IntegrationResult(
                 outcome="merged",
@@ -4943,9 +4985,64 @@ class Integrator:
                 main_after=main_after,
                 verification=checks,
                 recovered=recovered_lock,
-                diagnostics=resolution_diagnostics,
+                diagnostics={
+                    **resolution_diagnostics,
+                    **(
+                        {"main_push": push_diagnostics}
+                        if push_diagnostics is not None
+                        else {}
+                    ),
+                },
             )
         )
+
+    def _push_main(self, main_head: str) -> dict[str, object] | None:
+        if not self.push_main_to_upstream:
+            return None
+        upstream = self._git(
+            self.repo,
+            "rev-parse",
+            "--abbrev-ref",
+            f"{self.main_branch}@{{upstream}}",
+        )
+        if upstream.returncode != 0 or not upstream.stdout.strip():
+            return {
+                "status": "failed",
+                "git_output": self._bounded_git_output(upstream),
+            }
+        upstream_ref = upstream.stdout.strip()
+        pushed = self._git(self.repo, "push")
+        if pushed.returncode != 0:
+            return {
+                "status": "failed",
+                "upstream": upstream_ref,
+                "git_output": self._bounded_git_output(pushed),
+            }
+        upstream_head = self._git(
+            self.repo,
+            "rev-parse",
+            "--verify",
+            f"{upstream_ref}^{{commit}}",
+        )
+        if upstream_head.returncode != 0:
+            return {
+                "status": "failed",
+                "upstream": upstream_ref,
+                "git_output": self._bounded_git_output(upstream_head),
+            }
+        actual_head = upstream_head.stdout.strip()
+        if actual_head != main_head:
+            return {
+                "status": "failed",
+                "upstream": upstream_ref,
+                "expected_head": main_head,
+                "actual_head": actual_head,
+            }
+        return {
+            "status": "pushed",
+            "upstream": upstream_ref,
+            "head": main_head,
+        }
 
     def _record_completed_result(
         self,
@@ -7078,6 +7175,7 @@ class RunContractResolver:
                 "enabled": effective.integration_enabled,
                 "verify_on_main": list(effective.verify_on_main),
                 "lock_timeout_seconds": (effective.integration_lock_timeout_seconds),
+                "push_main_to_upstream": effective.push_main_to_upstream,
             },
             "task_provenance": task_provenance_payload,
             "candidate_stabilization": {

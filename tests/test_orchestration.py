@@ -115,6 +115,7 @@ class OrchestrationConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.orchestration.max_candidate_reanchors, 2)
         self.assertTrue(config.orchestration.integration_enabled)
+        self.assertFalse(config.orchestration.push_main_to_upstream)
         self.assertEqual(
             config.orchestration.task_provenance_mode,
             "external-confirmed",
@@ -142,6 +143,7 @@ class OrchestrationConfigTests(unittest.TestCase):
                 "max_remediation_rounds = 4\n"
                 "max_candidate_reanchors = 3\n"
                 "integration_enabled = false\n"
+                "push_main_to_upstream = true\n"
                 'task_provenance_mode = "external-confirmed"\n'
                 'external_completion_actor = "operator"\n',
                 encoding="utf-8",
@@ -166,6 +168,7 @@ class OrchestrationConfigTests(unittest.TestCase):
         self.assertEqual(config.orchestration.max_remediation_rounds, 4)
         self.assertEqual(config.orchestration.max_candidate_reanchors, 3)
         self.assertFalse(config.orchestration.integration_enabled)
+        self.assertTrue(config.orchestration.push_main_to_upstream)
         self.assertEqual(config.orchestration.external_completion_actor, "operator")
 
     def test_parses_reviewer_routing_by_implementer_provider(self) -> None:
@@ -281,6 +284,10 @@ class OrchestrationConfigTests(unittest.TestCase):
             (
                 'integration_lock_timeout_seconds = "slow"\n',
                 "orchestration.integration_lock_timeout_seconds",
+            ),
+            (
+                'push_main_to_upstream = "yes"\n',
+                "orchestration.push_main_to_upstream",
             ),
             (
                 'task_provenance_mode = ""\n',
@@ -428,8 +435,14 @@ class RunContractResolverTests(unittest.TestCase):
                 mode="worker-owned",
                 reviewer_profile="review",
                 max_remediation_rounds=7,
+                push_main_to_upstream=True,
                 explicit_keys=frozenset(
-                    {"mode", "reviewer_profile", "max_remediation_rounds"}
+                    {
+                        "mode",
+                        "reviewer_profile",
+                        "max_remediation_rounds",
+                        "push_main_to_upstream",
+                    }
                 ),
             ),
         )
@@ -457,6 +470,7 @@ class RunContractResolverTests(unittest.TestCase):
         )
 
         self.assertEqual(contract.payload["remediation"], {"max_rounds": 7})
+        self.assertTrue(contract.payload["integration"]["push_main_to_upstream"])
         self.assertEqual(
             contract.payload["candidate_stabilization"],
             {"max_reanchors": 2},
@@ -3560,6 +3574,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
         conflict_resolver=None,
         completion_fence=None,
         default_verification_cache: bool = False,
+        push_main_to_upstream: bool = False,
     ) -> Integrator:
         return Integrator(
             repo=self.repo,
@@ -3575,6 +3590,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
             completion_commands=commands,
             integration_keys=integration_keys,
             verify_on_main_keys=main_keys,
+            push_main_to_upstream=push_main_to_upstream,
             lock_manager=self.manager,
             run_store=self.store,
             run_id="run-1",
@@ -3599,6 +3615,13 @@ class RuntimeIntegrationTests(unittest.TestCase):
         git(self.repo, "add", "main.txt")
         git(self.repo, "commit", "-m", "advance main")
         return git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+    def configure_origin(self) -> Path:
+        remote = Path(self.directory.name) / "origin.git"
+        git(self.repo.parent, "init", "--bare", str(remote))
+        git(self.repo, "remote", "add", "origin", str(remote))
+        git(self.repo, "push", "-u", "origin", "main")
+        return remote
 
     def test_success_refreshes_verifies_fast_forwards_and_records_evidence(
         self,
@@ -3642,6 +3665,110 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(provenance["outcome"], "settled-directly")
         self.assertEqual(provenance["candidate_commit"], self.candidate_head)
         self.assertEqual(provenance["target_commit"], result.main_after)
+
+    def test_default_does_not_push_main(self) -> None:
+        self.configure_origin()
+
+        result = self.integrator().run()
+
+        self.assertTrue(result.completed)
+        self.assertNotEqual(
+            git(self.repo, "rev-parse", "main").stdout.strip(),
+            git(self.repo, "rev-parse", "origin/main").stdout.strip(),
+        )
+        self.assertNotIn("main_push", result.diagnostics)
+
+    def test_enabled_pushes_main_to_configured_upstream(self) -> None:
+        self.configure_origin()
+
+        result = self.integrator(push_main_to_upstream=True).run()
+
+        self.assertTrue(result.completed)
+        self.assertEqual(
+            git(self.repo, "rev-parse", "main").stdout.strip(),
+            git(self.repo, "rev-parse", "origin/main").stdout.strip(),
+        )
+        self.assertEqual(result.diagnostics["main_push"]["status"], "pushed")
+        self.assertEqual(result.diagnostics["main_push"]["upstream"], "origin/main")
+
+    def test_push_stays_inside_main_integration_lock(self) -> None:
+        self.configure_origin()
+        original_git = Integrator._git
+        waiter_started = threading.Event()
+        waiter_acquired = threading.Event()
+        sequence: list[str] = []
+        waiter_threads: list[threading.Thread] = []
+
+        def wait_for_lock() -> None:
+            waiter_started.set()
+            acquired = self.manager.acquire_main_integration_with_wait(
+                task_id="TASK-02",
+                run_id="run-2",
+                wait=True,
+                timeout_seconds=2,
+                poll_interval_seconds=0.01,
+            )
+            if acquired.acquired:
+                sequence.append("waiter_acquired")
+                waiter_acquired.set()
+                self.manager.release_main_integration(
+                    task_id="TASK-02",
+                    run_id="run-2",
+                )
+
+        def observe_push(worktree: Path, *args: str):
+            if args == ("push",):
+                sequence.append("push_started")
+                self.assertTrue(self.manager.main_integration_status().locked)
+                waiter = threading.Thread(target=wait_for_lock)
+                waiter_threads.append(waiter)
+                waiter.start()
+                self.assertTrue(waiter_started.wait(1))
+                self.assertFalse(waiter_acquired.wait(0.1))
+                result = original_git(worktree, *args)
+                sequence.append("push_finished")
+                return result
+            return original_git(worktree, *args)
+
+        with patch.object(Integrator, "_git", side_effect=observe_push):
+            result = self.integrator(push_main_to_upstream=True).run()
+
+        for waiter in waiter_threads:
+            waiter.join(timeout=2)
+        self.assertTrue(result.completed)
+        self.assertTrue(waiter_acquired.is_set())
+        self.assertEqual(
+            sequence,
+            ["push_started", "push_finished", "waiter_acquired"],
+        )
+
+    def test_push_failure_is_recorded_without_rolling_back_main(self) -> None:
+        remote = self.configure_origin()
+        hook = remote / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        hook.chmod(0o755)
+        origin_before = git(self.repo, "rev-parse", "origin/main").stdout.strip()
+
+        result = self.integrator(push_main_to_upstream=True).run()
+
+        local_main = git(self.repo, "rev-parse", "main").stdout.strip()
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.reason, "main_push_failed")
+        self.assertEqual(result.main_after, local_main)
+        self.assertEqual(local_main, self.candidate_head)
+        self.assertEqual(
+            git(self.repo, "rev-parse", "origin/main").stdout.strip(),
+            origin_before,
+        )
+        self.assertEqual(result.diagnostics["main_push"]["status"], "failed")
+        self.assertIn("git_output", result.diagnostics["main_push"])
+        integration_record = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "integration_result"
+        )
+        self.assertEqual(integration_record["reason"], "main_push_failed")
+        self.assertFalse(self.manager.main_integration_status().locked)
 
     def test_completion_fence_retains_lock_and_withholds_success_evidence(
         self,

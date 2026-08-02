@@ -918,6 +918,17 @@ and executes `git worktree remove` plus `git branch -d` only within safety
 guardrails. There must be no blanket reap: salvageable unmerged or dirty
 work-in-progress must be kept.
 
+Remote-main containment remains a mandatory guardrail independently of the
+integration push policy. A project that does not enable
+`orchestration.push_main_to_upstream` therefore keeps a locally merged
+worktree with `remote_main_not_contained` until an external workflow makes the
+commit reachable from the configured remote main ref; a project with no
+readable remote main keeps it as `remote_main_unavailable`. This retention is
+the expected fail-safe behavior, even if it means keeping those worktrees
+indefinitely. Changing that guardrail or defining a local-only reclamation
+policy is a separate slice, not an implicit consequence of leaving integration
+push disabled.
+
 Acceptance must cover mechanical evidence gathering that reuses existing
 workers.py helpers (worktree enumeration, merged-branch predicate, dirty-state
 inspection, worker-view claim and liveness); report-only behavior that records

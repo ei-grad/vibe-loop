@@ -4509,6 +4509,7 @@ class VibeRunner:
                 for item in integration.get("verify_on_main", ())
                 if isinstance(item, str)
             ),
+            push_main_to_upstream=bool(integration.get("push_main_to_upstream", False)),
             lock_manager=self.lock_manager,
             run_store=self.run_store,
             run_id=run_id,

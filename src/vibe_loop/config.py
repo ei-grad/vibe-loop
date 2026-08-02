@@ -495,6 +495,7 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
         "max_remediation_rounds",
         "max_candidate_reanchors",
         "integration_enabled",
+        "push_main_to_upstream",
         "task_provenance_mode",
         "external_completion_actor",
     }
@@ -523,6 +524,7 @@ ORCHESTRATION_CONFIG_KEYS = frozenset(
         "max_remediation_rounds",
         "max_candidate_reanchors",
         "integration_enabled",
+        "push_main_to_upstream",
         "task_provenance_mode",
         "external_completion_actor",
     }
@@ -1090,6 +1092,7 @@ class OrchestrationConfig:
     max_remediation_rounds: int = 2
     max_candidate_reanchors: int = 2
     integration_enabled: bool = True
+    push_main_to_upstream: bool = False
     task_provenance_mode: str = "external-confirmed"
     external_completion_actor: str | None = None
     explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
@@ -1111,6 +1114,7 @@ class OrchestrationConfig:
             "max_remediation_rounds": self.max_remediation_rounds,
             "max_candidate_reanchors": self.max_candidate_reanchors,
             "integration_enabled": self.integration_enabled,
+            "push_main_to_upstream": self.push_main_to_upstream,
             "task_provenance_mode": self.task_provenance_mode,
             "external_completion_actor": self.external_completion_actor,
             "explicit_keys": sorted(self.explicit_keys),
@@ -2980,6 +2984,11 @@ def parse_orchestration(
             table.get("integration_enabled"),
             True,
             "orchestration.integration_enabled",
+        ),
+        push_main_to_upstream=optional_bool(
+            table.get("push_main_to_upstream"),
+            False,
+            "orchestration.push_main_to_upstream",
         ),
         task_provenance_mode=task_provenance_mode,
         external_completion_actor=external_completion_actor,
