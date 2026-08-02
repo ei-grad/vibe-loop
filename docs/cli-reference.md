@@ -555,10 +555,14 @@ release-gate accepts:
 - `--json`
 
 The command resolves the current full commit and prior reachable `v*` release
-tag, requires a clean tracked worktree for newly executed evals, and emits
+tag, requires a clean worktree for newly executed evals, and emits
 schema-version-2 revision and bundled-skill bindings. Existing aggregates that
 lack matching trial source evidence are diagnostic dry runs, not publishable
-records.
+records. Checking an existing aggregate does not require a clean worktree;
+dirty skill sources still cause fingerprint or later distribution validation
+to block admission. If the source revision changes while a new suite runs, the
+command retains trial artifacts, emits no readiness record, and tells the
+operator to restore the exact clean revision before rerunning.
 
 ### `vibe-loop eval release-classify`
 

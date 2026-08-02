@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from vibe_loop.eval_examples import EXAMPLE_SUITE_ID, list_eval_example_cases
+from vibe_loop.eval_runner import skill_id_for_condition
+from vibe_loop.release_admission import FULL_COMMIT_PATTERN
 
 
 RELEASE_READINESS_SCHEMA_VERSION = 2
@@ -199,7 +201,13 @@ def build_release_readiness_record(
     )
     release_provenance = mapping_value(aggregate.get("release_provenance"))
     provenance_gaps: list[dict[str, object]] = []
-    if revision_head is not None:
+    revision_bound = bool(
+        isinstance(revision_base, str)
+        and FULL_COMMIT_PATTERN.fullmatch(revision_base)
+        and isinstance(revision_head, str)
+        and FULL_COMMIT_PATTERN.fullmatch(revision_head)
+    )
+    if revision_bound:
         local_suite["aggregate_path"] = aggregate_path.name
         local_suite["artifact_root"] = ""
         if release_provenance.get("repository_head") != revision_head:
@@ -223,9 +231,17 @@ def build_release_readiness_record(
                 required_case_conditions=required_case_conditions,
                 bundled_skills=bundled_skills or {},
                 minimum_trials=minimum_trials,
+                aggregate_path=aggregate_path,
             )
         )
-        blockers.extend(provenance_gaps)
+    else:
+        provenance_gaps.append(
+            {
+                "id": "revision_binding_missing",
+                "message": "release readiness is not bound to exact base and head commits",
+            }
+        )
+    blockers.extend(provenance_gaps)
     status = "passed" if not blockers else "blocked"
     external_benchmarks = [dict(item) for item in external_benchmarks]
     record = {
@@ -255,7 +271,7 @@ def build_release_readiness_record(
         },
         "local_suite": local_suite,
         "release_provenance": {
-            "status": "passed" if not provenance_gaps else "blocked",
+            "status": "passed" if revision_bound and not provenance_gaps else "blocked",
             "gaps": provenance_gaps,
         },
         "trial_failures": {
@@ -291,6 +307,7 @@ def release_trial_source_gaps(
     required_case_conditions: Mapping[str, Sequence[str]] | None,
     bundled_skills: Mapping[str, str],
     minimum_trials: int,
+    aggregate_path: Path,
 ) -> list[dict[str, object]]:
     required = normalized_required_case_conditions(required_case_conditions)
     required_pairs = {
@@ -315,13 +332,21 @@ def release_trial_source_gaps(
             gaps.append(source_gap("missing_trial_artifact", *pair))
             failed_pairs.add(pair)
             continue
+        trial_root = resolve_trial_artifact_root(
+            aggregate_path=aggregate_path,
+            artifact_root=artifact_root,
+        )
+        if trial_root is None:
+            gaps.append(source_gap("invalid_trial_artifact", *pair))
+            failed_pairs.add(pair)
+            continue
         try:
-            run_record = load_json_mapping(Path(artifact_root) / "run.json")
+            run_record = load_json_mapping(trial_root / "run.json")
         except ValueError:
             gaps.append(source_gap("invalid_trial_artifact", *pair))
             failed_pairs.add(pair)
             continue
-        skill_id = release_skill_id(pair[1])
+        skill_id = skill_id_for_condition(pair[1])
         source_path = f"src/vibe_loop/skills/{skill_id}/SKILL.md"
         expected_sha = bundled_skills.get(source_path)
         fingerprint_path = f"skills/{skill_id}/SKILL.md"
@@ -349,14 +374,19 @@ def release_trial_source_gaps(
     return gaps
 
 
-def release_skill_id(condition: str) -> str:
-    if condition in ("vibe_loop", "vibe_loop_cli"):
-        return "vibe-loop"
-    if condition == "orchestrated_vibe_loop":
-        return "orchestrated-vibe-loop"
-    if condition in ("infinite_vibe_loop", "infinite_vibe_loop_cli"):
-        return "infinite-vibe-loop"
-    return condition.replace("_", "-")
+def resolve_trial_artifact_root(
+    *,
+    aggregate_path: Path,
+    artifact_root: str,
+) -> Path | None:
+    relative = Path(artifact_root)
+    if relative.is_absolute() or ".." in relative.parts:
+        return None
+    suite_root = aggregate_path.parent.resolve()
+    resolved = (suite_root / relative).resolve()
+    if not resolved.is_relative_to(suite_root):
+        return None
+    return resolved
 
 
 def source_gap(reason: str, case_id: str, condition: str) -> dict[str, object]:

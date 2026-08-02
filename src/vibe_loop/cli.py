@@ -1597,25 +1597,37 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 2
+        executing_suite = not args.dry_run and args.aggregate is None
         try:
             classification = classify_release_changes(config.repo)
-            initial_provenance = eval_release_provenance(config.repo)
             skill_fingerprints = bundled_skill_fingerprints(config.repo)
+            initial_provenance = (
+                eval_release_provenance(config.repo) if executing_suite else None
+            )
         except ReleaseAdmissionError as exc:
             print(f"release revision binding failed: {exc}", file=sys.stderr)
             return 2
         local_suite_mode = "existing_aggregate"
-        if not args.dry_run and args.aggregate is None:
-            aggregate = run_local_demo_eval(
-                local_demo_config_from_args(
-                    args,
-                    config,
-                    output_root=output_root,
-                    cases=tuple(required_case_conditions),
-                    case_conditions=required_case_conditions,
-                    initial_release_provenance=initial_provenance,
+        if executing_suite:
+            try:
+                aggregate = run_local_demo_eval(
+                    local_demo_config_from_args(
+                        args,
+                        config,
+                        output_root=output_root,
+                        cases=tuple(required_case_conditions),
+                        case_conditions=required_case_conditions,
+                        initial_release_provenance=initial_provenance,
+                    )
                 )
-            )
+            except ReleaseAdmissionError as exc:
+                print(
+                    "release eval provenance failed after trial execution: "
+                    f"{exc}; trial artifacts remain available, but no readiness "
+                    "record was emitted; restore the exact clean revision and rerun",
+                    file=sys.stderr,
+                )
+                return 2
             aggregate_path = output_root / "local-demo-v1" / "aggregate.json"
             local_suite_mode = "executed"
         else:

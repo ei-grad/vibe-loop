@@ -225,7 +225,8 @@ state evidence.
 SHA-256. For an exact-revision record, `release_provenance` reports whether the
 aggregate's recorded head and required trial skill fingerprints match those
 fields. A dry-run record without these bindings remains useful diagnostically
-but cannot satisfy publishing admission.
+but has blocked readiness and provenance status and cannot satisfy publishing
+admission.
 
 `skill_release_classification` records the ownership-contract version, canonical
 base/head commits, all Git name-status entries (including both rename paths),

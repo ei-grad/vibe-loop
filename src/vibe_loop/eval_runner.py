@@ -2923,11 +2923,16 @@ def build_aggregate(
         ],
     }
     if release_source_repo is not None:
-        from vibe_loop.release_admission import eval_release_provenance
+        from vibe_loop.release_admission import (
+            ReleaseAdmissionError,
+            eval_release_provenance,
+        )
 
         current_provenance = eval_release_provenance(release_source_repo)
         if current_provenance != initial_release_provenance:
-            raise ValueError("release source revision changed during eval execution")
+            raise ReleaseAdmissionError(
+                "release source revision changed during eval execution"
+            )
         aggregate["release_provenance"] = current_provenance
     return aggregate
 

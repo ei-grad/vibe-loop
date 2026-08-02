@@ -91,6 +91,10 @@ uv run vibe-loop eval release-gate --repo . --dry-run \
   --record-output .vibe-loop/release-readiness-dry-run.json
 ```
 
+This diagnostic path may run from a dirty worktree because it does not execute
+new trials. Exact commit and bundled-skill fingerprint checks still determine
+whether its record is publishable.
+
 If a workflow-contract regression is intentionally parked, use the regression id
 from the release-readiness record:
 
@@ -127,8 +131,9 @@ passes the generated `swe-rebench-v2-multilingual-smoke-results.json` with
 `agent_failed` when interpreting the optional summary, and retain the manifest's
 non-leaderboard caveat in release evidence.
 
-`docs/examples/release-readiness-dry-run.json` shows the expected record shape
-with local-suite evidence and optional external smoke evidence.
+`docs/examples/release-readiness-dry-run.json` shows an exact-revision record
+shape with illustrative full commits and skill fingerprints, local-suite
+evidence, and optional external smoke evidence.
 
 ## Publish
 

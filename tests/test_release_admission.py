@@ -36,11 +36,25 @@ class ReleaseAdmissionTests(unittest.TestCase):
         for publish_job in (testpypi, pypi):
             self.assertIn("- admission", publish_job)
             self.assertIn("- test", publish_job)
+            self.assertIn("actions/setup-python@", publish_job)
+            self.assertIn("astral-sh/setup-uv@", publish_job)
+            self.assertLess(
+                publish_job.index("astral-sh/setup-uv@"),
+                publish_job.index("Verify transferred evidence and distributions"),
+            )
             self.assertLess(
                 publish_job.index("Verify transferred evidence and distributions"),
                 publish_job.index("Publish distributions"),
             )
             self.assertIn("--verify", publish_job)
+        self.assertIn(
+            'run_path != ".github/workflows/skill-readiness-evidence.yml"',
+            admission,
+        )
+        self.assertIn('run.get("workflow_id") != expected_workflow_id', admission)
+        self.assertIn('workflow_run.get("head_sha") != head', admission)
+        self.assertIn("class NoRedirect", admission)
+        self.assertIn("urllib.request.urlopen(signed_url)", admission)
         evidence_workflow = (
             root / ".github/workflows/skill-readiness-evidence.yml"
         ).read_text(encoding="utf-8")

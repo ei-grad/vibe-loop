@@ -1,8 +1,13 @@
 {
-  "bundled_skills": {},
+  "bundled_skills": {
+    "src/vibe_loop/skills/autopilot/SKILL.md": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "src/vibe_loop/skills/infinite-vibe-loop/SKILL.md": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "src/vibe_loop/skills/orchestrated-vibe-loop/SKILL.md": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "src/vibe_loop/skills/vibe-loop/SKILL.md": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
   "checklist": [
     {
-      "evidence": ".vibe-loop/eval-runs/local-demo-v1/aggregate.json",
+      "evidence": "aggregate.json",
       "id": "run_local_demo_suite",
       "required": true,
       "status": "passed"
@@ -39,7 +44,7 @@
     "records": [
       {
         "benchmark": "swe-bench-pro-public-smoke",
-        "path": "docs/examples/swe-bench-pro-smoke-summary.json",
+        "path": "swe-bench-pro-smoke-summary.json",
         "sha256": "0882d12ca4584a95ecda814de6039c21a206eb1ad887ad4d5cc0e8d9d4ed2f94",
         "size": 171,
         "status": "recorded",
@@ -129,9 +134,9 @@
   },
   "generated_at": "2026-05-09T00:00:00+00:00",
   "local_suite": {
-    "aggregate_path": ".vibe-loop/eval-runs/local-demo-v1/aggregate.json",
+    "aggregate_path": "aggregate.json",
     "aggregate_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
-    "artifact_root": ".vibe-loop/eval-runs/local-demo-v1",
+    "artifact_root": "",
     "conditions": {
       "orchestrated_vibe_loop": 2,
       "vibe_loop": 11,
@@ -214,8 +219,8 @@
   },
   "record_type": "skill_release_readiness",
   "revision": {
-    "base": null,
-    "head": null
+    "base": "1111111111111111111111111111111111111111",
+    "head": "2222222222222222222222222222222222222222"
   },
   "schema_version": 2,
   "status": "passed",

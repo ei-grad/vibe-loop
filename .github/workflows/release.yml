@@ -241,46 +241,80 @@ jobs:
           import io
           import json
           import os
+          import urllib.error
+          import urllib.parse
           import urllib.request
           import zipfile
+
+          api_headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+          def api_json(url):
+              request = urllib.request.Request(url, headers=api_headers)
+              with urllib.request.urlopen(request) as response:
+                  return json.load(response)
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, message, headers, newurl):
+                  return None
 
           with open("release-classification.json", encoding="utf-8") as handle:
               head = json.load(handle)["head"]
           requested_run_id = os.environ.get("REQUESTED_RUN_ID", "").strip()
+          workflow_url = f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/actions/workflows/skill-readiness-evidence.yml"
+          expected_workflow_id = api_json(workflow_url)["id"]
           query = f"?name=skill-release-readiness-{head}&per_page=100"
           url = f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/actions/artifacts{query}"
-          request = urllib.request.Request(
-              url,
-              headers={
-                  "Accept": "application/vnd.github+json",
-                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
-                  "X-GitHub-Api-Version": "2022-11-28",
-              },
-          )
-          with urllib.request.urlopen(request) as response:
-              artifacts = json.load(response)["artifacts"]
-          candidates = [
-              artifact
-              for artifact in artifacts
-              if not artifact["expired"]
-              and (
-                  not requested_run_id
-                  or str(artifact["workflow_run"]["id"]) == requested_run_id
-              )
-          ]
+          artifacts = api_json(url)["artifacts"]
+          candidates = []
+          for artifact in artifacts:
+              workflow_run = artifact.get("workflow_run") or {}
+              run_id = str(workflow_run.get("id", ""))
+              if (
+                  artifact["expired"]
+                  or workflow_run.get("head_sha") != head
+                  or (requested_run_id and run_id != requested_run_id)
+              ):
+                  continue
+              run_url = f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{run_id}"
+              run = api_json(run_url)
+              run_path = str(run.get("path", "")).partition("@")[0]
+              if (
+                  run.get("head_sha") != head
+                  or run.get("workflow_id") != expected_workflow_id
+                  or run_path != ".github/workflows/skill-readiness-evidence.yml"
+                  or run.get("event") != "workflow_dispatch"
+                  or run.get("conclusion") != "success"
+              ):
+                  continue
+              candidates.append(artifact)
           if not candidates:
-              raise SystemExit("no non-expired exact-head readiness artifact was found")
+              raise SystemExit("no validated exact-head readiness artifact was found")
           artifact = max(candidates, key=lambda item: item["created_at"])
           download = urllib.request.Request(
-              artifact["archive_download_url"],
-              headers={
-                  "Accept": "application/vnd.github+json",
-                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
-                  "X-GitHub-Api-Version": "2022-11-28",
-              },
+              artifact["archive_download_url"], headers=api_headers
           )
-          with urllib.request.urlopen(download) as response:
-              archive_bytes = response.read()
+          opener = urllib.request.build_opener(NoRedirect)
+          try:
+              with opener.open(download) as response:
+                  archive_bytes = response.read()
+          except urllib.error.HTTPError as exc:
+              if exc.code not in {301, 302, 303, 307, 308}:
+                  raise
+              location = exc.headers.get("Location")
+              exc.close()
+              if not location:
+                  raise SystemExit("readiness artifact redirect is missing a location")
+              signed_url = urllib.parse.urljoin(
+                  artifact["archive_download_url"], location
+              )
+              if urllib.parse.urlsplit(signed_url).scheme != "https":
+                  raise SystemExit("readiness artifact redirect is not HTTPS")
+              with urllib.request.urlopen(signed_url) as response:
+                  archive_bytes = response.read()
           with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
               names = archive.namelist()
               if names != ["release-readiness.json"]:
@@ -340,6 +374,14 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
 
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
       - name: Download distributions
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -398,6 +440,14 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
       - name: Download distributions
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1

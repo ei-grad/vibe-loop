@@ -8,6 +8,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 from vibe_loop.cli import main
 from vibe_loop.eval_examples import list_eval_example_cases
@@ -19,7 +20,10 @@ from vibe_loop.eval_release import (
     render_release_readiness_summary,
     release_gate_case_conditions,
 )
-from vibe_loop.release_admission import bundled_skill_fingerprints
+from vibe_loop.release_admission import (
+    ReleaseAdmissionError,
+    bundled_skill_fingerprints,
+)
 
 
 class EvalReleaseTests(unittest.TestCase):
@@ -66,7 +70,12 @@ class EvalReleaseTests(unittest.TestCase):
                 generated_at="2026-05-09T00:00:00+00:00",
             )
 
-        self.assertEqual(record["status"], "passed")
+        self.assertEqual(record["status"], "blocked")
+        self.assertEqual(record["release_provenance"]["status"], "blocked")
+        self.assertEqual(
+            record["release_provenance"]["gaps"][0]["id"],
+            "revision_binding_missing",
+        )
         self.assertTrue(record["dry_run"])
         self.assertEqual(record["local_suite"]["coverage_status"], "passed")
         self.assertEqual(record["workflow_contract_regressions"]["unresolved"], [])
@@ -87,12 +96,15 @@ class EvalReleaseTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            aggregate_path = root / "aggregate.json"
-            trial_root = root / "trial"
+            aggregate_path = root / "suite" / "aggregate.json"
+            relative_trial_root = Path(
+                "cases/command-hooks-task-source/vibe_loop_cli/trial-1"
+            )
+            trial_root = aggregate_path.parent / relative_trial_root
             skill_sha = "a" * 64
             aggregate = passing_release_aggregate(trials=1)
             aggregate["records"] = [aggregate["records"][0]]
-            aggregate["records"][0]["artifact_root"] = str(trial_root)
+            aggregate["records"][0]["artifact_root"] = relative_trial_root.as_posix()
             aggregate["release_provenance"] = {
                 "repository_head": "2" * 40,
                 "bundled_skills": {
@@ -147,12 +159,40 @@ class EvalReleaseTests(unittest.TestCase):
                 revision_head="2" * 40,
                 bundled_skills={"src/vibe_loop/skills/vibe-loop/SKILL.md": skill_sha},
             )
+            aggregate["records"][0]["artifact_root"] = "../outside-suite"
+            write_json(
+                root / "outside-suite" / "run.json",
+                {
+                    "source_fingerprints": [
+                        {
+                            "path": "skills/vibe-loop/SKILL.md",
+                            "sha256": skill_sha,
+                        }
+                    ],
+                    "skill_condition": {"skill_sha256": skill_sha},
+                },
+            )
+            escaped = build_release_readiness_record(
+                aggregate,
+                aggregate_path=aggregate_path,
+                dry_run=True,
+                required_case_conditions={
+                    "command-hooks-task-source": ("vibe_loop_cli",)
+                },
+                revision_base="1" * 40,
+                revision_head="2" * 40,
+                bundled_skills={"src/vibe_loop/skills/vibe-loop/SKILL.md": skill_sha},
+            )
 
         self.assertEqual(matching["status"], "passed")
         self.assertEqual(stale["status"], "blocked")
         self.assertIn(
             "trial_skill_fingerprint_mismatch",
             {gap["id"] for gap in stale["release_provenance"]["gaps"]},
+        )
+        self.assertIn(
+            "invalid_trial_artifact",
+            {gap["id"] for gap in escaped["release_provenance"]["gaps"]},
         )
 
     def test_swe_rebench_evidence_is_attached_only_when_intentionally_supplied(
@@ -241,7 +281,11 @@ class EvalReleaseTests(unittest.TestCase):
             blocked["workflow_contract_regressions"]["unresolved"][0]["id"],
             "condition_comparison:orchestrated_vibe_loop",
         )
-        self.assertEqual(parked["status"], "passed")
+        self.assertEqual(parked["status"], "blocked")
+        self.assertIn(
+            "revision_binding_missing",
+            {blocker["id"] for blocker in parked["gate"]["blockers"]},
+        )
         self.assertEqual(
             parked["workflow_contract_regressions"]["parked"][0]["parked_task_ids"],
             ["EVAL-99"],
@@ -365,7 +409,11 @@ class EvalReleaseTests(unittest.TestCase):
                 generated_at="2026-05-09T00:00:00+00:00",
             )
 
-        self.assertEqual(record["status"], "passed")
+        self.assertEqual(record["status"], "blocked")
+        self.assertIn(
+            "revision_binding_missing",
+            {blocker["id"] for blocker in record["gate"]["blockers"]},
+        )
         self.assertEqual(
             record["workflow_contract_regressions"]["evidence_gaps"],
             [],
@@ -542,6 +590,58 @@ class EvalReleaseTests(unittest.TestCase):
             '"long_text": {"length": 300, "omitted": "long_string"}', rendered
         )
 
+    def test_post_eval_provenance_change_has_actionable_cli_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(("git", "init", "-q"), cwd=root, check=True)
+            subprocess.run(("git", "config", "user.name", "Test"), cwd=root, check=True)
+            subprocess.run(
+                ("git", "config", "user.email", "test@example.com"),
+                cwd=root,
+                check=True,
+            )
+            skill_path = root / "src/vibe_loop/skills/vibe-loop/SKILL.md"
+            skill_path.parent.mkdir(parents=True)
+            skill_path.write_text("contract\n", encoding="utf-8")
+            subprocess.run(("git", "add", "."), cwd=root, check=True)
+            subprocess.run(("git", "commit", "-q", "-m", "base"), cwd=root, check=True)
+            subprocess.run(("git", "tag", "v0.1.0"), cwd=root, check=True)
+            (root / "README.md").write_text("release\n", encoding="utf-8")
+            subprocess.run(("git", "add", "."), cwd=root, check=True)
+            subprocess.run(
+                ("git", "commit", "-q", "-m", "release"), cwd=root, check=True
+            )
+
+            stdout = StringIO()
+            stderr = StringIO()
+            with (
+                patch(
+                    "vibe_loop.cli.run_local_demo_eval",
+                    side_effect=ReleaseAdmissionError(
+                        "release source revision changed during eval execution"
+                    ),
+                ),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                exit_code = main(
+                    [
+                        "--repo",
+                        str(root),
+                        "eval",
+                        "release-gate",
+                        "--agent-command",
+                        "*=stub {prompt}",
+                        "--overwrite",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("trial artifacts remain available", stderr.getvalue())
+        self.assertIn("restore the exact clean revision and rerun", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
     def test_cli_dry_run_checks_existing_aggregate_and_writes_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -591,6 +691,7 @@ class EvalReleaseTests(unittest.TestCase):
                     "summary": {"reason": "adapter not configured"},
                 },
             )
+            (root / ".tmp-dirty-probe").write_text("dirty\n", encoding="utf-8")
 
             stdout = StringIO()
             stderr = StringIO()
