@@ -727,16 +727,24 @@ class EvalReleaseTests(unittest.TestCase):
 
 
 # Absolute developer-machine paths and downstream/company project names that
-# must never ship inside the package, docs, eval fixtures, or tests. Design
-# references such as "ralphex" and "lightmetrics" are intentionally NOT
-# forbidden.
+# must never ship inside repository artifacts. Design references such as
+# "ralphex" and "lightmetrics" are intentionally NOT forbidden.
 FORBIDDEN_REFERENCE_PATTERNS = (
     re.compile(r"/home/"),
     re.compile(r"/Users/"),
     re.compile(r"[A-Za-z]:\\Users\\"),
     re.compile(r"faceapp", re.IGNORECASE),
 )
-SCANNED_REFERENCE_ROOTS = ("src", "docs", "eval", "scripts", "tests")
+SCANNED_REFERENCE_ROOTS = (".github", "src", "docs", "eval", "scripts", "tests")
+SCANNED_REFERENCE_FILES = (
+    "README.md",
+    "PROMPT.md",
+    "Makefile",
+    "CLAUDE.md",
+    "REVIEW.md",
+    "doc-budgets.toml",
+    "markdown-links.toml",
+)
 SKIPPED_REFERENCE_DIRS = frozenset({"__pycache__", ".git", ".venv"})
 # These files spell out the forbidden literals on purpose — to define the guard
 # and to assert command output stays clean — so they are exempt from it.
@@ -758,7 +766,7 @@ def find_forbidden_repository_references(root: Path) -> list[str]:
         missing = ", ".join(missing_roots)
         raise AssertionError(f"reference guard scan roots missing: {missing}")
 
-    targets = [root / "README.md", root / "PROMPT.md"]
+    targets = [root / path for path in SCANNED_REFERENCE_FILES]
     for directory in SCANNED_REFERENCE_ROOTS:
         for path in (root / directory).rglob("*"):
             if not path.is_file():
@@ -868,6 +876,28 @@ class RepoAgnosticGuardTests(unittest.TestCase):
                     offenders,
                     [f"scripts/nested/release-guard-probe: {pattern.pattern}"],
                 )
+
+    def test_root_artifact_references_are_reported_by_relative_path(
+        self,
+    ) -> None:
+        artifact_paths = (
+            *SCANNED_REFERENCE_FILES,
+            ".github/workflows/release.yml",
+        )
+
+        for relative in artifact_paths:
+            with self.subTest(path=relative):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    for scan_root in SCANNED_REFERENCE_ROOTS:
+                        (root / scan_root).mkdir()
+                    artifact = root / relative
+                    artifact.parent.mkdir(parents=True, exist_ok=True)
+                    artifact.write_text("/home/developer/project", encoding="utf-8")
+
+                    offenders = find_forbidden_repository_references(root)
+
+                self.assertEqual(offenders, [f"{relative}: /home/"])
 
     def test_reference_guard_rejects_a_missing_scan_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
