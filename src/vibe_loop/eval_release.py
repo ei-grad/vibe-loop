@@ -9,7 +9,7 @@ from pathlib import Path
 from vibe_loop.eval_examples import EXAMPLE_SUITE_ID, list_eval_example_cases
 
 
-RELEASE_READINESS_SCHEMA_VERSION = 1
+RELEASE_READINESS_SCHEMA_VERSION = 2
 RELEASE_READINESS_RECORD_TYPE = "skill_release_readiness"
 WORKFLOW_REGRESSION_FLAG = "workflow_contract_regression"
 DEFAULT_RELEASE_GATE_TRIALS = 1
@@ -127,7 +127,7 @@ def load_external_benchmark_evidence(paths: Sequence[Path]) -> list[dict[str, ob
 def external_benchmark_evidence(path: Path) -> dict[str, object]:
     payload = load_json_mapping(path)
     return {
-        "path": str(path),
+        "path": path.name,
         "sha256": file_sha256(path),
         "size": path.stat().st_size,
         "benchmark": string_value(
@@ -154,6 +154,9 @@ def build_release_readiness_record(
     parked_workflow_regression_task_ids: Sequence[str] = (),
     external_benchmarks: Sequence[Mapping[str, object]] = (),
     generated_at: str | None = None,
+    revision_base: str | None = None,
+    revision_head: str | None = None,
+    bundled_skills: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     if minimum_trials < 1:
         raise ValueError("minimum trials must be at least 1")
@@ -194,6 +197,35 @@ def build_release_readiness_record(
         unresolved_regressions=unresolved_regressions,
         invalid_parked_ids=invalid_parked_ids,
     )
+    release_provenance = mapping_value(aggregate.get("release_provenance"))
+    provenance_gaps: list[dict[str, object]] = []
+    if revision_head is not None:
+        local_suite["aggregate_path"] = aggregate_path.name
+        local_suite["artifact_root"] = ""
+        if release_provenance.get("repository_head") != revision_head:
+            provenance_gaps.append(
+                {
+                    "id": "aggregate_revision_mismatch",
+                    "message": "eval aggregate was not produced for the release commit",
+                }
+            )
+        aggregate_skills = mapping_value(release_provenance.get("bundled_skills"))
+        if dict(aggregate_skills) != dict(bundled_skills or {}):
+            provenance_gaps.append(
+                {
+                    "id": "aggregate_skill_fingerprint_mismatch",
+                    "message": "eval aggregate bundled-skill fingerprints are stale or missing",
+                }
+            )
+        provenance_gaps.extend(
+            release_trial_source_gaps(
+                aggregate,
+                required_case_conditions=required_case_conditions,
+                bundled_skills=bundled_skills or {},
+                minimum_trials=minimum_trials,
+            )
+        )
+        blockers.extend(provenance_gaps)
     status = "passed" if not blockers else "blocked"
     external_benchmarks = [dict(item) for item in external_benchmarks]
     record = {
@@ -202,6 +234,11 @@ def build_release_readiness_record(
         "generated_at": generated_at or utc_now(),
         "dry_run": dry_run,
         "status": status,
+        "revision": {
+            "base": revision_base,
+            "head": revision_head,
+        },
+        "bundled_skills": dict(sorted((bundled_skills or {}).items())),
         "gate": {
             "name": "bundled_skill_release_readiness",
             "minimum_trials_per_case_condition": minimum_trials,
@@ -217,6 +254,10 @@ def build_release_readiness_record(
             "blockers": blockers,
         },
         "local_suite": local_suite,
+        "release_provenance": {
+            "status": "passed" if not provenance_gaps else "blocked",
+            "gaps": provenance_gaps,
+        },
         "trial_failures": {
             "status": "passed" if not trial_failures else "blocked",
             "total": len(trial_failures),
@@ -242,6 +283,89 @@ def build_release_readiness_record(
     }
     record["checklist"] = release_checklist(record)
     return record
+
+
+def release_trial_source_gaps(
+    aggregate: Mapping[str, object],
+    *,
+    required_case_conditions: Mapping[str, Sequence[str]] | None,
+    bundled_skills: Mapping[str, str],
+    minimum_trials: int,
+) -> list[dict[str, object]]:
+    required = normalized_required_case_conditions(required_case_conditions)
+    required_pairs = {
+        (case_id, condition)
+        for case_id, conditions in required.items()
+        for condition in conditions
+    }
+    gaps: list[dict[str, object]] = []
+    valid_counts: dict[tuple[str, str], int] = {}
+    failed_pairs: set[tuple[str, str]] = set()
+    for summary in sequence_value(aggregate.get("records")):
+        if not isinstance(summary, Mapping):
+            continue
+        pair = (
+            string_value(summary.get("case_id")),
+            string_value(summary.get("condition")),
+        )
+        if pair not in required_pairs or pair in failed_pairs:
+            continue
+        artifact_root = summary.get("artifact_root")
+        if not isinstance(artifact_root, str) or not artifact_root:
+            gaps.append(source_gap("missing_trial_artifact", *pair))
+            failed_pairs.add(pair)
+            continue
+        try:
+            run_record = load_json_mapping(Path(artifact_root) / "run.json")
+        except ValueError:
+            gaps.append(source_gap("invalid_trial_artifact", *pair))
+            failed_pairs.add(pair)
+            continue
+        skill_id = release_skill_id(pair[1])
+        source_path = f"src/vibe_loop/skills/{skill_id}/SKILL.md"
+        expected_sha = bundled_skills.get(source_path)
+        fingerprint_path = f"skills/{skill_id}/SKILL.md"
+        fingerprints = sequence_value(run_record.get("source_fingerprints"))
+        matching = [
+            fingerprint
+            for fingerprint in fingerprints
+            if isinstance(fingerprint, Mapping)
+            and fingerprint.get("path") == fingerprint_path
+            and fingerprint.get("sha256") == expected_sha
+        ]
+        skill_condition = mapping_value(run_record.get("skill_condition"))
+        if (
+            not expected_sha
+            or not matching
+            or skill_condition.get("skill_sha256") != expected_sha
+        ):
+            gaps.append(source_gap("trial_skill_fingerprint_mismatch", *pair))
+            failed_pairs.add(pair)
+            continue
+        valid_counts[pair] = valid_counts.get(pair, 0) + 1
+    for case_id, condition in sorted(required_pairs - failed_pairs):
+        if valid_counts.get((case_id, condition), 0) < minimum_trials:
+            gaps.append(source_gap("missing_trial_source_evidence", case_id, condition))
+    return gaps
+
+
+def release_skill_id(condition: str) -> str:
+    if condition in ("vibe_loop", "vibe_loop_cli"):
+        return "vibe-loop"
+    if condition == "orchestrated_vibe_loop":
+        return "orchestrated-vibe-loop"
+    if condition in ("infinite_vibe_loop", "infinite_vibe_loop_cli"):
+        return "infinite-vibe-loop"
+    return condition.replace("_", "-")
+
+
+def source_gap(reason: str, case_id: str, condition: str) -> dict[str, object]:
+    return {
+        "id": reason,
+        "message": "required trial source evidence is missing or stale",
+        "case_id": case_id,
+        "condition": condition,
+    }
 
 
 def write_release_readiness_record(path: Path, record: Mapping[str, object]) -> None:

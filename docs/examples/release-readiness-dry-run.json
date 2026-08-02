@@ -1,4 +1,5 @@
 {
+  "bundled_skills": {},
   "checklist": [
     {
       "evidence": ".vibe-loop/eval-runs/local-demo-v1/aggregate.json",
@@ -102,6 +103,9 @@
         "vibe_loop",
         "orchestrated_vibe_loop"
       ],
+      "runtime-owned-implementation": [
+        "vibe_loop_cli"
+      ],
       "supervised-worker-report": [
         "vibe_loop_cli"
       ],
@@ -131,7 +135,7 @@
     "conditions": {
       "orchestrated_vibe_loop": 2,
       "vibe_loop": 11,
-      "vibe_loop_cli": 8
+      "vibe_loop_cli": 9
     },
     "coverage_gaps": [],
     "coverage_status": "passed",
@@ -179,6 +183,9 @@
         "vibe_loop",
         "orchestrated_vibe_loop"
       ],
+      "runtime-owned-implementation": [
+        "vibe_loop_cli"
+      ],
       "supervised-worker-report": [
         "vibe_loop_cli"
       ],
@@ -199,10 +206,18 @@
       ]
     },
     "suite_id": "local-demo-v1",
-    "total_trials": 21
+    "total_trials": 22
+  },
+  "release_provenance": {
+    "gaps": [],
+    "status": "passed"
   },
   "record_type": "skill_release_readiness",
-  "schema_version": 1,
+  "revision": {
+    "base": null,
+    "head": null
+  },
+  "schema_version": 2,
   "status": "passed",
   "trial_failures": {
     "records": [],

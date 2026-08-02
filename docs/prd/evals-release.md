@@ -63,6 +63,23 @@ Bundled skill releases must require compact, release-relevant local-demo
 evidence and block unresolved workflow-contract regressions unless they are
 explicitly parked with task IDs.
 
+Every publishing event classifies the canonical full commit being built against
+the prior reachable `v*` release tag. The code-owned path boundary includes
+bundled skills, the eval harness and fixtures, release schemas and contracts,
+package manifests and lockfiles, and release workflows. Rename and deletion
+paths are classified on both sides. Missing or non-ancestor history, shallow
+history, malformed commits, and unknown diff statuses are fail-closed; only a
+complete exact-base/head path set containing no owned path can produce an
+unrelated-release exemption.
+
+Required readiness records bind the base and head commits, each required
+trial's skill source fingerprint, and the complete bundled-skill fingerprint
+set. Admission compares those fingerprints with every built wheel and source
+distribution. The classification, optional readiness record, admission record,
+and distributions are hashed and revalidated after transfer before either
+publisher receives an identity token. Non-publishing build/test runs produce no
+publish approval or exemption.
+
 Acceptance must cover a curated release matrix distinct from the full paired
 eval suite, no required `no_skill` baseline for release readiness, required
 trial pass/fail blocking, dry-run over existing aggregates, release-readiness
@@ -76,7 +93,8 @@ discovery, explicit-list and spec-driven profiles, command-backed task and lock
 adapters, runtime-owned orchestration, review remediation, worktree safety, and
 integration failure paths.
 
-Related implementation IDs: `EVAL-06`.
+Related implementation IDs: `EVAL-06`,
+`publish-gate-exact-revision-skill-readiness-evidence`.
 
 ## PRD-EVL-006 External Benchmark Adapters
 

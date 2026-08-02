@@ -21,6 +21,10 @@ on:
         options:
           - TestPyPI
           - PyPI
+      readiness_run_id:
+        description: Optional workflow run containing exact-head skill readiness evidence
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -47,7 +51,7 @@ jobs:
           persist-credentials: false
           ref: >-
             ${{ github.event_name == 'workflow_run' &&
-            github.event.workflow_run.head_sha || github.ref }}
+            github.event.workflow_run.head_sha || github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -144,7 +148,7 @@ jobs:
           persist-credentials: false
           ref: >-
             ${{ github.event_name == 'workflow_run' &&
-            github.event.workflow_run.head_sha || github.ref }}
+            github.event.workflow_run.head_sha || github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -183,23 +187,183 @@ jobs:
         shell: bash
         run: uv run --no-project --with dist/*.whl vibe-loop --help >/dev/null
 
+  admission:
+    name: Validate exact-revision release admission
+    needs: build
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out the exact release revision with full history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      - name: Download distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Classify exact release changes
+        run: >-
+          uv run vibe-loop eval release-classify --repo .
+          --output release-classification.json --json
+
+      - name: Resolve immutable exact-head readiness evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_RUN_ID: ${{ inputs.readiness_run_id }}
+        run: |
+          if python - <<'PY'
+          import json
+
+          with open("release-classification.json", encoding="utf-8") as handle:
+              classification = json.load(handle)
+          raise SystemExit(classification["status"] != "readiness_required")
+          PY
+          then
+            python - <<'PY'
+          import io
+          import json
+          import os
+          import urllib.request
+          import zipfile
+
+          with open("release-classification.json", encoding="utf-8") as handle:
+              head = json.load(handle)["head"]
+          requested_run_id = os.environ.get("REQUESTED_RUN_ID", "").strip()
+          query = f"?name=skill-release-readiness-{head}&per_page=100"
+          url = f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/actions/artifacts{query}"
+          request = urllib.request.Request(
+              url,
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(request) as response:
+              artifacts = json.load(response)["artifacts"]
+          candidates = [
+              artifact
+              for artifact in artifacts
+              if not artifact["expired"]
+              and (
+                  not requested_run_id
+                  or str(artifact["workflow_run"]["id"]) == requested_run_id
+              )
+          ]
+          if not candidates:
+              raise SystemExit("no non-expired exact-head readiness artifact was found")
+          artifact = max(candidates, key=lambda item: item["created_at"])
+          download = urllib.request.Request(
+              artifact["archive_download_url"],
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(download) as response:
+              archive_bytes = response.read()
+          with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+              names = archive.namelist()
+              if names != ["release-readiness.json"]:
+                  raise SystemExit("readiness artifact must contain only release-readiness.json")
+              with open("release-readiness.json", "wb") as output:
+                  output.write(archive.read(names[0]))
+          PY
+          fi
+
+      - name: Build readiness admission
+        if: hashFiles('release-readiness.json') != ''
+        run: >-
+          uv run vibe-loop eval release-admit --repo .
+          --classification release-classification.json
+          --readiness-record release-readiness.json
+          --distribution dist/*.whl --distribution dist/*.tar.gz
+          --output release-admission.json --json
+
+      - name: Build unrelated-release exemption admission
+        if: hashFiles('release-readiness.json') == ''
+        run: >-
+          uv run vibe-loop eval release-admit --repo .
+          --classification release-classification.json
+          --distribution dist/*.whl --distribution dist/*.tar.gz
+          --output release-admission.json --json
+
+      - name: Upload immutable publish admission
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: publish-admission-${{ github.sha }}
+          path: |
+            release-classification.json
+            release-readiness.json
+            release-admission.json
+          if-no-files-found: error
+          retention-days: 7
+
   publish-testpypi:
     name: Publish to TestPyPI
-    needs: test
+    needs:
+      - admission
+      - test
     if: github.event_name == 'workflow_dispatch' && inputs.target == 'TestPyPI'
     runs-on: ubuntu-latest
     environment:
       name: TestPyPI
       url: https://test.pypi.org/project/vibe-loop/
     permissions:
+      actions: read
       contents: read
       id-token: write
     steps:
+      - name: Check out exact release history for admission verification
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
       - name: Download distributions
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: python-package-distributions
           path: dist/
+
+      - name: Download publish admission
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: publish-admission-${{ github.sha }}
+          path: admission/
+
+      - name: Verify transferred evidence and distributions
+        shell: bash
+        run: |
+          readiness=()
+          if [ -f admission/release-readiness.json ]; then
+            readiness=(--readiness-record admission/release-readiness.json)
+          fi
+          uv run --no-project --with dist/*.whl vibe-loop eval release-admit \
+            --repo . --classification admission/release-classification.json \
+            "${readiness[@]}" --distribution dist/*.whl \
+            --distribution dist/*.tar.gz --output admission/release-admission.json \
+            --verify
 
       - name: Publish distributions to TestPyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
@@ -211,7 +375,9 @@ jobs:
 
   publish-pypi:
     name: Publish to PyPI
-    needs: test
+    needs:
+      - admission
+      - test
     if: >-
       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
       (github.event_name == 'workflow_dispatch' &&
@@ -222,14 +388,41 @@ jobs:
       name: PyPI
       url: https://pypi.org/project/vibe-loop/
     permissions:
+      actions: read
       contents: read
       id-token: write
     steps:
+      - name: Check out exact release history for admission verification
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
       - name: Download distributions
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: python-package-distributions
           path: dist/
+
+      - name: Download publish admission
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: publish-admission-${{ github.sha }}
+          path: admission/
+
+      - name: Verify transferred evidence and distributions
+        shell: bash
+        run: |
+          readiness=()
+          if [ -f admission/release-readiness.json ]; then
+            readiness=(--readiness-record admission/release-readiness.json)
+          fi
+          uv run --no-project --with dist/*.whl vibe-loop eval release-admit \
+            --repo . --classification admission/release-classification.json \
+            "${readiness[@]}" --distribution dist/*.whl \
+            --distribution dist/*.tar.gz --output admission/release-admission.json \
+            --verify
 
       - name: Publish distributions to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0

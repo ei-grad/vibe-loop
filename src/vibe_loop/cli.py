@@ -73,6 +73,14 @@ from vibe_loop.eval_release import (
     release_gate_case_conditions,
     write_release_readiness_record,
 )
+from vibe_loop.release_admission import (
+    ReleaseAdmissionError,
+    build_release_admission,
+    bundled_skill_fingerprints,
+    classify_release_changes,
+    eval_release_provenance,
+    verify_release_admission,
+)
 from vibe_loop.generated_profiles import (
     GeneratedTaskSourceRuntimeError,
     configure_generated_task_source,
@@ -868,6 +876,30 @@ def build_parser() -> argparse.ArgumentParser:
     release_gate.add_argument("--json", action="store_true")
     add_nested_eval_override(release_gate)
 
+    release_classify = eval_subparsers.add_parser(
+        "release-classify",
+        help="Classify exact release changes against the prior release tag",
+    )
+    add_repo_argument(release_classify)
+    release_classify.add_argument("--output", type=Path, required=True)
+    release_classify.add_argument("--json", action="store_true")
+
+    release_admit = eval_subparsers.add_parser(
+        "release-admit",
+        help="Validate release evidence and built distributions",
+    )
+    add_repo_argument(release_admit)
+    release_admit.add_argument("--classification", type=Path, required=True)
+    release_admit.add_argument("--readiness-record", type=Path)
+    release_admit.add_argument(
+        "--distribution", type=Path, action="append", required=True
+    )
+    release_admit.add_argument("--output", type=Path, required=True)
+    release_admit.add_argument(
+        "--verify", action="store_true", help="Verify an existing admission record"
+    )
+    release_admit.add_argument("--json", action="store_true")
+
     benchmark = eval_subparsers.add_parser(
         "benchmark",
         help="Run external benchmark adapter eval",
@@ -1565,6 +1597,13 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 2
+        try:
+            classification = classify_release_changes(config.repo)
+            initial_provenance = eval_release_provenance(config.repo)
+            skill_fingerprints = bundled_skill_fingerprints(config.repo)
+        except ReleaseAdmissionError as exc:
+            print(f"release revision binding failed: {exc}", file=sys.stderr)
+            return 2
         local_suite_mode = "existing_aggregate"
         if not args.dry_run and args.aggregate is None:
             aggregate = run_local_demo_eval(
@@ -1574,6 +1613,7 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
                     output_root=output_root,
                     cases=tuple(required_case_conditions),
                     case_conditions=required_case_conditions,
+                    initial_release_provenance=initial_provenance,
                 )
             )
             aggregate_path = output_root / "local-demo-v1" / "aggregate.json"
@@ -1592,6 +1632,9 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
             external_benchmarks=load_external_benchmark_evidence(
                 args.external_benchmark_json
             ),
+            revision_base=str(classification["base"]),
+            revision_head=str(classification["head"]),
+            bundled_skills=skill_fingerprints,
         )
         if args.record_output:
             write_release_readiness_record(args.record_output, record)
@@ -1602,6 +1645,66 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
             if args.record_output:
                 print(f"record: {args.record_output}")
         return 0 if record.get("status") == "passed" else 1
+
+    if args.eval_command == "release-classify":
+        try:
+            classification = classify_release_changes(config.repo)
+        except ReleaseAdmissionError as exc:
+            print(f"release classification failed: {exc}", file=sys.stderr)
+            return 2
+        write_release_readiness_record(args.output, classification)
+        if args.json:
+            print(json.dumps(classification, indent=2, sort_keys=True))
+        else:
+            print(
+                f"release classification: {classification['status']} "
+                f"base={classification['base']} head={classification['head']}"
+            )
+        return 0
+
+    if args.eval_command == "release-admit":
+        try:
+            classification = load_json_mapping(args.classification)
+            readiness = (
+                load_json_mapping(args.readiness_record)
+                if args.readiness_record is not None
+                else None
+            )
+            distributions = tuple(args.distribution)
+            if args.verify:
+                admission = load_json_mapping(args.output)
+                diagnostics = verify_release_admission(
+                    admission,
+                    classification=classification,
+                    readiness_record=readiness,
+                    distributions=distributions,
+                    repo=config.repo,
+                )
+            else:
+                admission = build_release_admission(
+                    classification,
+                    readiness_record=readiness,
+                    distributions=distributions,
+                    repo=config.repo,
+                )
+                write_release_readiness_record(args.output, admission)
+                diagnostics = tuple(admission.get("diagnostics", ()))
+        except (OSError, ValueError):
+            print(
+                "release admission failed: an input record is unreadable or invalid",
+                file=sys.stderr,
+            )
+            return 2
+        if args.json:
+            print(json.dumps(admission, indent=2, sort_keys=True))
+        elif diagnostics:
+            print("release admission blocked: " + "; ".join(map(str, diagnostics)))
+        else:
+            print(
+                f"release admission: passed base={admission['base']} "
+                f"head={admission['head']}"
+            )
+        return 1 if diagnostics else 0
 
     if args.eval_command == "benchmark":
         from vibe_loop.eval_benchmark import BenchmarkEvalConfig, run_benchmark_eval
@@ -2524,6 +2627,7 @@ def local_demo_config_from_args(
     output_root: Path,
     cases: Sequence[str] | None = None,
     case_conditions: Mapping[str, Sequence[str]] | None = None,
+    initial_release_provenance: Mapping[str, object] | None = None,
 ) -> LocalSkillEvalConfig:
     agent_commands, default_agent_command = parse_agent_command_specs(
         args.agent_command
@@ -2547,6 +2651,10 @@ def local_demo_config_from_args(
         model_provider=args.model_provider,
         model_id=args.model_id,
         reasoning_effort=args.reasoning_effort,
+        release_source_repo=(
+            config.repo.resolve() if args.eval_command == "release-gate" else None
+        ),
+        initial_release_provenance=initial_release_provenance,
     )
 
 

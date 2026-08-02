@@ -1,9 +1,9 @@
 # Release Checklist
 
-Use this checklist before publishing a package version that changes bundled
-skills or their eval harness. The GitHub release workflow builds and publishes
-artifacts; this checklist records the skill-readiness evidence that should exist
-before the workflow is used for TestPyPI or PyPI.
+Use this checklist to produce evidence and start publishing. The GitHub release
+workflow, not this checklist, makes the exact-revision admission decision before
+either package-index credential is exercised. The contract is authoritative in
+[PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate).
 
 ## Versioning And Repository Hooks
 
@@ -42,6 +42,8 @@ The release gate requires:
 - the aggregate has no unresolved `workflow_contract_regression` flags;
 - any accepted workflow-contract regression is parked with a task id before
   publishing;
+- the aggregate was produced at the exact clean commit and every required
+  trial contains the matching bundled-skill fingerprint;
 - release notes or the task plan reference the release-readiness record.
 
 The default release matrix is intentionally smaller than the full paired eval
@@ -132,7 +134,18 @@ with local-suite evidence and optional external smoke evidence.
 
 After the release-readiness record passes:
 
-1. Include the record path or artifact link in release notes.
-2. If regressions were parked, include the task ids.
-3. Run the manual release workflow for TestPyPI.
-4. Publish to PyPI only from a `v<version>` tag matching `pyproject.toml`.
+1. Upload its compact JSON for the exact commit through the `Skill Release
+   Readiness Evidence` workflow. The immutable artifact name includes the full
+   commit. A dry-run is accepted only when it carries the same exact revision
+   and trial fingerprint contract.
+2. Include the evidence workflow run or artifact link in release notes. If
+   regressions were parked, include the task ids.
+3. Run the release workflow for TestPyPI, optionally supplying the evidence run
+   id to select among exact-head artifacts. PyPI remains restricted to a
+   matching `v<version>` tag.
+4. The release workflow discovers the prior reachable release tag, classifies
+   every changed/renamed/deleted path, validates the record only when an owned
+   path changed, compares every distribution's bundled skills, and uploads a
+   hashed admission bundle. Both publishers download and revalidate that bundle
+   and the distributions before trusted publishing begins. Releases with only
+   unrelated paths use the recorded exemption and do not run the 20-case gate.

@@ -554,6 +554,42 @@ release-gate accepts:
 - repeatable `--external-benchmark-json PATH`
 - `--json`
 
+The command resolves the current full commit and prior reachable `v*` release
+tag, requires a clean tracked worktree for newly executed evals, and emits
+schema-version-2 revision and bundled-skill bindings. Existing aggregates that
+lack matching trial source evidence are diagnostic dry runs, not publishable
+records.
+
+### `vibe-loop eval release-classify`
+
+Write the exact-base/head change classification used by publishing:
+
+```bash
+vibe-loop eval release-classify --repo . \
+  --output release-classification.json --json
+```
+
+The base is discovered from reachable release-tag provenance; there is no
+operator-supplied base option. `--output` is required and `--json` also prints
+the record.
+
+### `vibe-loop eval release-admit`
+
+Build or verify the final distribution-bound admission record:
+
+```bash
+vibe-loop eval release-admit --repo . \
+  --classification release-classification.json \
+  --readiness-record release-readiness.json \
+  --distribution dist/vibe_loop.whl \
+  --output release-admission.json
+```
+
+`--classification`, repeatable `--distribution`, and `--output` are required.
+`--readiness-record` is required by the classification, not for a validated
+unrelated exemption. `--verify` re-hashes transferred inputs and rejects any
+admission or distribution substitution.
+
 Release-readiness behavior is defined by
 [PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate).
 

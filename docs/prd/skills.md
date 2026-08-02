@@ -76,4 +76,9 @@ Acceptance must cover the skill publishing dependency on `PRD-EVL-005`, release
 note evidence links, and documentation that skill readiness is proven by eval
 records rather than by manual inspection alone.
 
-Related implementation IDs: `EVAL-05`, `EVAL-06`, `EVAL-09`.
+The exact revision, owned-path classification, evidence transport, artifact
+fingerprint, and pre-credential admission contract is authoritative in
+[PRD-EVL-005](evals-release.md#prd-evl-005-release-readiness-gate).
+
+Related implementation IDs: `EVAL-05`, `EVAL-06`, `EVAL-09`,
+`publish-gate-exact-revision-skill-readiness-evidence`.

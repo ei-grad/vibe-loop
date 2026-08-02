@@ -115,6 +115,8 @@ class LocalSkillEvalConfig:
     model_provider: str = DEFAULT_MODEL_PROVIDER
     model_id: str = DEFAULT_MODEL_ID
     reasoning_effort: str = ""
+    release_source_repo: Path | None = None
+    initial_release_provenance: Mapping[str, object] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -242,6 +244,8 @@ def run_local_demo_eval(config: LocalSkillEvalConfig) -> dict[str, object]:
         trial_results,
         output_root=suite_root,
         previous_aggregate=previous_aggregate,
+        release_source_repo=config.release_source_repo,
+        initial_release_provenance=config.initial_release_provenance,
     )
     write_json(suite_root / "aggregate.json", aggregate)
     (suite_root / "aggregate.md").write_text(
@@ -2857,6 +2861,8 @@ def build_aggregate(
     *,
     output_root: Path,
     previous_aggregate: Mapping[str, object] | None = None,
+    release_source_repo: Path | None = None,
+    initial_release_provenance: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     records = [result.record for result in trial_results]
     by_condition: dict[str, list[Mapping[str, object]]] = defaultdict(list)
@@ -2889,7 +2895,7 @@ def build_aggregate(
                 taxonomy["flaky"] = len(case_ids)
             conditions[condition]["flaky_case_ids"] = case_ids
 
-    return {
+    aggregate = {
         "schema_version": 1,
         "suite_id": EXAMPLE_SUITE_ID,
         "generated_at": utc_now(),
@@ -2916,6 +2922,14 @@ def build_aggregate(
             for record in records
         ],
     }
+    if release_source_repo is not None:
+        from vibe_loop.release_admission import eval_release_provenance
+
+        current_provenance = eval_release_provenance(release_source_repo)
+        if current_provenance != initial_release_provenance:
+            raise ValueError("release source revision changed during eval execution")
+        aggregate["release_provenance"] = current_provenance
+    return aggregate
 
 
 def condition_summary(

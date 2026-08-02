@@ -217,3 +217,21 @@ Each trial records:
 No aggregate report may claim a bundled skill improvement unless every included
 trial has matching source fingerprints, required artifacts, and non-contaminated
 state evidence.
+
+## Release Evidence Records
+
+`skill_release_readiness` schema version 2 adds `revision.base`,
+`revision.head`, and `bundled_skills`, a map from packaged source path to
+SHA-256. For an exact-revision record, `release_provenance` reports whether the
+aggregate's recorded head and required trial skill fingerprints match those
+fields. A dry-run record without these bindings remains useful diagnostically
+but cannot satisfy publishing admission.
+
+`skill_release_classification` records the ownership-contract version, canonical
+base/head commits, all Git name-status entries (including both rename paths),
+owned paths, uncertainty, and either `readiness_required` or
+`unrelated_exemption`. `skill_release_admission` hashes the classification and
+readiness record, records each distribution's name, size, and SHA-256, and has
+status `passed` only when the selected evidence path and packaged skill bytes
+validate. Exact publishing behavior is owned by
+[PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate).

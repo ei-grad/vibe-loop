@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -18,6 +19,7 @@ from vibe_loop.eval_release import (
     render_release_readiness_summary,
     release_gate_case_conditions,
 )
+from vibe_loop.release_admission import bundled_skill_fingerprints
 
 
 class EvalReleaseTests(unittest.TestCase):
@@ -78,6 +80,79 @@ class EvalReleaseTests(unittest.TestCase):
                 "status": "passed",
                 "evidence": str(aggregate_path),
             },
+        )
+
+    def test_exact_revision_record_requires_matching_trial_skill_fingerprint(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            aggregate_path = root / "aggregate.json"
+            trial_root = root / "trial"
+            skill_sha = "a" * 64
+            aggregate = passing_release_aggregate(trials=1)
+            aggregate["records"] = [aggregate["records"][0]]
+            aggregate["records"][0]["artifact_root"] = str(trial_root)
+            aggregate["release_provenance"] = {
+                "repository_head": "2" * 40,
+                "bundled_skills": {
+                    "src/vibe_loop/skills/vibe-loop/SKILL.md": skill_sha
+                },
+            }
+            write_json(
+                trial_root / "run.json",
+                {
+                    "source_fingerprints": [
+                        {
+                            "path": "skills/vibe-loop/SKILL.md",
+                            "sha256": skill_sha,
+                        }
+                    ],
+                    "skill_condition": {"skill_sha256": skill_sha},
+                },
+            )
+            write_json(aggregate_path, aggregate)
+
+            matching = build_release_readiness_record(
+                aggregate,
+                aggregate_path=aggregate_path,
+                dry_run=True,
+                required_case_conditions={
+                    "command-hooks-task-source": ("vibe_loop_cli",)
+                },
+                revision_base="1" * 40,
+                revision_head="2" * 40,
+                bundled_skills={"src/vibe_loop/skills/vibe-loop/SKILL.md": skill_sha},
+            )
+            write_json(
+                trial_root / "run.json",
+                {
+                    "source_fingerprints": [
+                        {
+                            "path": "skills/vibe-loop/SKILL.md",
+                            "sha256": "b" * 64,
+                        }
+                    ],
+                    "skill_condition": {"skill_sha256": "b" * 64},
+                },
+            )
+            stale = build_release_readiness_record(
+                aggregate,
+                aggregate_path=aggregate_path,
+                dry_run=True,
+                required_case_conditions={
+                    "command-hooks-task-source": ("vibe_loop_cli",)
+                },
+                revision_base="1" * 40,
+                revision_head="2" * 40,
+                bundled_skills={"src/vibe_loop/skills/vibe-loop/SKILL.md": skill_sha},
+            )
+
+        self.assertEqual(matching["status"], "passed")
+        self.assertEqual(stale["status"], "blocked")
+        self.assertIn(
+            "trial_skill_fingerprint_mismatch",
+            {gap["id"] for gap in stale["release_provenance"]["gaps"]},
         )
 
     def test_swe_rebench_evidence_is_attached_only_when_intentionally_supplied(
@@ -473,7 +548,41 @@ class EvalReleaseTests(unittest.TestCase):
             aggregate_path = root / "eval-runs" / "local-demo-v1" / "aggregate.json"
             external_path = root / "terminal-smoke.json"
             record_path = root / "release-readiness.json"
-            write_json(aggregate_path, passing_release_aggregate())
+            subprocess.run(("git", "init", "-q"), cwd=root, check=True)
+            subprocess.run(("git", "config", "user.name", "Test"), cwd=root, check=True)
+            subprocess.run(
+                ("git", "config", "user.email", "test@example.com"),
+                cwd=root,
+                check=True,
+            )
+            skill_path = root / "src/vibe_loop/skills/vibe-loop/SKILL.md"
+            skill_path.parent.mkdir(parents=True)
+            skill_path.write_text("contract\n", encoding="utf-8")
+            (root / ".gitignore").write_text(
+                "/eval-runs/\n/terminal-smoke.json\n/release-readiness.json\n",
+                encoding="utf-8",
+            )
+            subprocess.run(("git", "add", "."), cwd=root, check=True)
+            subprocess.run(("git", "commit", "-q", "-m", "base"), cwd=root, check=True)
+            subprocess.run(("git", "tag", "v0.1.0"), cwd=root, check=True)
+            (root / "README.md").write_text("release\n", encoding="utf-8")
+            subprocess.run(("git", "add", "."), cwd=root, check=True)
+            subprocess.run(
+                ("git", "commit", "-q", "-m", "release"), cwd=root, check=True
+            )
+            head = subprocess.run(
+                ("git", "rev-parse", "HEAD"),
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            aggregate = passing_release_aggregate()
+            aggregate["release_provenance"] = {
+                "repository_head": head,
+                "bundled_skills": bundled_skill_fingerprints(root),
+            }
+            write_json(aggregate_path, aggregate)
             write_json(
                 external_path,
                 {
@@ -505,9 +614,10 @@ class EvalReleaseTests(unittest.TestCase):
             output = json.loads(stdout.getvalue())
             written = json.loads(record_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(exit_code, 0)
+        self.assertEqual(exit_code, 1)
         self.assertEqual(stderr.getvalue(), "")
         self.assertTrue(output["dry_run"])
+        self.assertEqual(output["status"], "blocked")
         self.assertEqual(output["local_suite"]["mode"], "existing_aggregate")
         self.assertEqual(written["record_type"], "skill_release_readiness")
         self.assertEqual(
