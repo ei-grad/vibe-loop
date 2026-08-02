@@ -59,9 +59,11 @@ from vibe_loop.telemetry import (
     ProviderUsageObserver,
     unavailable_usage,
 )
+from vibe_loop.upstream import UPSTREAM_FETCH_TIMEOUT_SECONDS
 
 
 RUN_CONTRACT_VERSION = 1
+MAIN_PUSH_TIMEOUT_SECONDS = UPSTREAM_FETCH_TIMEOUT_SECONDS
 RUN_CONTRACT_SOURCE_KINDS = ("config", "profile", "skill-proposal")
 WORKSPACE_BRANCH_PREFIX = "vibe-loop/"
 WORKSPACE_NAME_MAX_LENGTH = 64
@@ -4965,11 +4967,7 @@ class Integrator:
                 verification=checks,
                 diagnostics={
                     **resolution_diagnostics,
-                    **(
-                        {"main_push": push_diagnostics}
-                        if push_diagnostics is not None
-                        else {}
-                    ),
+                    "main_push": push_diagnostics,
                 },
                 recovered=recovered_lock,
             )
@@ -5011,7 +5009,39 @@ class Integrator:
                 "git_output": self._bounded_git_output(upstream),
             }
         upstream_ref = upstream.stdout.strip()
-        pushed = self._git(self.repo, "push")
+        remote = self._git(
+            self.repo,
+            "config",
+            "--get",
+            f"branch.{self.main_branch}.remote",
+        )
+        merge_ref = self._git(
+            self.repo,
+            "config",
+            "--get",
+            f"branch.{self.main_branch}.merge",
+        )
+        remote_name = remote.stdout.strip()
+        remote_branch_ref = merge_ref.stdout.strip()
+        if (
+            remote.returncode != 0
+            or merge_ref.returncode != 0
+            or not remote_name
+            or not remote_branch_ref.startswith("refs/heads/")
+        ):
+            return {
+                "status": "failed",
+                "upstream": upstream_ref,
+                "git_output": self._bounded_git_output(remote)
+                + self._bounded_git_output(merge_ref),
+            }
+        pushed = self._git_network(
+            self.repo,
+            "push",
+            "--",
+            remote_name,
+            f"{main_head}:{remote_branch_ref}",
+        )
         if pushed.returncode != 0:
             return {
                 "status": "failed",
@@ -5902,6 +5932,45 @@ class Integrator:
             errors="replace",
             check=False,
         )
+
+    @staticmethod
+    def _git_network(
+        worktree: Path,
+        *args: str,
+    ) -> subprocess.CompletedProcess[str]:
+        command = ["git", "-C", str(worktree), *args]
+        env = os.environ.copy()
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["SSH_ASKPASS_REQUIRE"] = "never"
+        try:
+            return subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=MAIN_PUSH_TIMEOUT_SECONDS,
+                env=env,
+                start_new_session=True,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+            return subprocess.CompletedProcess(
+                command,
+                124,
+                stdout,
+                stderr + f"\ngit push timed out after {exc.timeout} seconds",
+            )
+        except OSError as exc:
+            return subprocess.CompletedProcess(
+                command,
+                127,
+                "",
+                f"git push could not start: {type(exc).__name__}",
+            )
 
 
 class TaskSourceCompletionError(RuntimeError):

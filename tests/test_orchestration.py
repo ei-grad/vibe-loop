@@ -48,6 +48,7 @@ from vibe_loop.orchestration import (
     Integrator,
     IntegrationResult,
     LEGAL_STAGE_TRANSITIONS,
+    MAIN_PUSH_TIMEOUT_SECONDS,
     RuntimeGateController,
     ReviewBudgetExhausted,
     ReviewClosureUnavailable,
@@ -3680,6 +3681,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
 
     def test_enabled_pushes_main_to_configured_upstream(self) -> None:
         self.configure_origin()
+        git(self.repo, "config", "push.default", "nothing")
 
         result = self.integrator(push_main_to_upstream=True).run()
 
@@ -3691,9 +3693,29 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(result.diagnostics["main_push"]["status"], "pushed")
         self.assertEqual(result.diagnostics["main_push"]["upstream"], "origin/main")
 
+    def test_enabled_pushes_to_configured_remote_branch(self) -> None:
+        self.configure_origin()
+        git(self.repo, "push", "origin", "main:refs/heads/release")
+        git(self.repo, "config", "branch.main.merge", "refs/heads/release")
+        git(self.repo, "config", "push.default", "current")
+        origin_main_before = git(self.repo, "rev-parse", "origin/main").stdout.strip()
+
+        result = self.integrator(push_main_to_upstream=True).run()
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.diagnostics["main_push"]["upstream"], "origin/release")
+        self.assertEqual(
+            git(self.repo, "rev-parse", "main").stdout.strip(),
+            git(self.repo, "rev-parse", "origin/release").stdout.strip(),
+        )
+        self.assertEqual(
+            git(self.repo, "rev-parse", "origin/main").stdout.strip(),
+            origin_main_before,
+        )
+
     def test_push_stays_inside_main_integration_lock(self) -> None:
         self.configure_origin()
-        original_git = Integrator._git
+        original_git_network = Integrator._git_network
         waiter_started = threading.Event()
         waiter_acquired = threading.Event()
         sequence: list[str] = []
@@ -3716,21 +3738,22 @@ class RuntimeIntegrationTests(unittest.TestCase):
                     run_id="run-2",
                 )
 
-        def observe_push(worktree: Path, *args: str):
-            if args == ("push",):
-                sequence.append("push_started")
-                self.assertTrue(self.manager.main_integration_status().locked)
-                waiter = threading.Thread(target=wait_for_lock)
-                waiter_threads.append(waiter)
-                waiter.start()
-                self.assertTrue(waiter_started.wait(1))
-                self.assertFalse(waiter_acquired.wait(0.1))
-                result = original_git(worktree, *args)
-                sequence.append("push_finished")
-                return result
-            return original_git(worktree, *args)
+        def observe_push(
+            worktree: Path,
+            *args: str,
+        ) -> subprocess.CompletedProcess[str]:
+            sequence.append("push_started")
+            self.assertTrue(self.manager.main_integration_status().locked)
+            waiter = threading.Thread(target=wait_for_lock)
+            waiter_threads.append(waiter)
+            waiter.start()
+            self.assertTrue(waiter_started.wait(1))
+            self.assertFalse(waiter_acquired.wait(0.1))
+            result = original_git_network(worktree, *args)
+            sequence.append("push_finished")
+            return result
 
-        with patch.object(Integrator, "_git", side_effect=observe_push):
+        with patch.object(Integrator, "_git_network", side_effect=observe_push):
             result = self.integrator(push_main_to_upstream=True).run()
 
         for waiter in waiter_threads:
@@ -3741,6 +3764,45 @@ class RuntimeIntegrationTests(unittest.TestCase):
             sequence,
             ["push_started", "push_finished", "waiter_acquired"],
         )
+
+    def test_network_push_is_noninteractive_and_bounded(self) -> None:
+        completed = subprocess.CompletedProcess(["git", "push"], 0, "", "")
+        with patch(
+            "vibe_loop.orchestration.subprocess.run",
+            return_value=completed,
+        ) as execute:
+            result = Integrator._git_network(
+                self.repo,
+                "push",
+                "origin",
+                "abc:refs/heads/main",
+            )
+
+        self.assertIs(result, completed)
+        kwargs = execute.call_args.kwargs
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["timeout"], MAIN_PUSH_TIMEOUT_SECONDS)
+        self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(kwargs["env"]["SSH_ASKPASS_REQUIRE"], "never")
+        self.assertTrue(kwargs["start_new_session"])
+
+    def test_network_push_timeout_becomes_explicit_failure(self) -> None:
+        with patch(
+            "vibe_loop.orchestration.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(
+                cmd=["git", "push"],
+                timeout=MAIN_PUSH_TIMEOUT_SECONDS,
+            ),
+        ):
+            result = Integrator._git_network(
+                self.repo,
+                "push",
+                "origin",
+                "abc:refs/heads/main",
+            )
+
+        self.assertEqual(result.returncode, 124)
+        self.assertIn("timed out", result.stderr)
 
     def test_push_failure_is_recorded_without_rolling_back_main(self) -> None:
         remote = self.configure_origin()
@@ -3807,6 +3869,22 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(
             git(self.repo, "rev-list", "--count", self.base + "..main").stdout.strip(),
             "1",
+        )
+
+    def test_already_merged_branch_pushes_main_when_enabled(self) -> None:
+        self.configure_origin()
+        git(self.repo, "merge", "--ff-only", "worker/TASK-01")
+
+        result = self.integrator(
+            integration_keys=(),
+            push_main_to_upstream=True,
+        ).run()
+
+        self.assertEqual(result.outcome, "branch_already_merged")
+        self.assertEqual(result.diagnostics["main_push"]["status"], "pushed")
+        self.assertEqual(
+            git(self.repo, "rev-parse", "main").stdout.strip(),
+            git(self.repo, "rev-parse", "origin/main").stdout.strip(),
         )
 
     def test_already_merged_verification_failure_names_mainline_state(self) -> None:

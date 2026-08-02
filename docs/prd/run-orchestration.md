@@ -370,8 +370,13 @@ itself.
 
 `orchestration.push_main_to_upstream` is a per-project integration policy and
 defaults to `false`. When enabled, the runtime pushes the checked-out main
-branch to its configured Git upstream after successful main verification and
-before it records successful integration or releases the main-integration lock.
+branch's verified commit to the exact configured upstream remote and branch
+with an explicit refspec after successful main verification and before it
+records successful integration or releases the main-integration lock. Ambient
+`push.default` policy cannot widen or redirect the push. The network command is
+noninteractive and time-bounded so a prompt or unavailable remote cannot hold
+the integration lock indefinitely.
+
 This applies to both a new fast-forward and `branch_already_merged`
 reconciliation. A missing upstream, rejected push, or post-push upstream ref
 that does not equal the verified local main commit records
