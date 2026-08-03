@@ -39,6 +39,7 @@ TASK_SOURCE_CAPABILITIES_STREAM_LIMIT = 64 * 1024
 TASK_SOURCE_CAPABILITIES_STRING_LIMIT = 256
 TASK_SOURCE_CAPABILITIES_LIST_LIMIT = 256
 TASK_SOURCE_HEALTH_OUTPUT_LIMIT = 64 * 1024
+TASK_SOURCE_HEALTH_OUTPUT_GRACE_SECONDS = 0.05
 TASK_SOURCE_FENCED_RESET_CAPABILITY = "task-source-reset:fenced-owner:v1"
 TASK_SOURCE_FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 # Names whose *absence* from an adapter invocation is an assertion the runtime
@@ -73,7 +74,18 @@ WITHHELD_ADAPTER_ENV = frozenset(
 
 def _task_source_health_withholds(name: str) -> bool:
     normalized = name.upper()
-    return normalized.startswith("VIBE_LOOP_") or any(
+    if normalized in {
+        "VIBE_LOOP_BRANCH",
+        "VIBE_LOOP_IMPLEMENTER_SESSION",
+        "VIBE_LOOP_LOG",
+        "VIBE_LOOP_PRIOR_FINDINGS",
+        "VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS",
+        "VIBE_LOOP_REVIEWER_SESSION",
+        "VIBE_LOOP_REVIEWER_SESSION_ATTESTATION",
+        "VIBE_LOOP_WORKTREE",
+    }:
+        return True
+    return any(
         marker in normalized
         for marker in (
             "FENCING_TOKEN",
@@ -2939,12 +2951,19 @@ def run_task_source_health(
 
         deadline = start + config.command_timeout_seconds
         reason = ""
+        output_limit_exceeded = False
         while process.poll() is None:
             output.seek(0, os.SEEK_END)
             if output.tell() > output_limit:
-                reason = "output_limit_exceeded"
-                _stop_task_source_health_process(process, force=True)
-                break
+                output_limit_exceeded = True
+                try:
+                    process.wait(timeout=TASK_SOURCE_HEALTH_OUTPUT_GRACE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    reason = "output_limit_exceeded"
+                    _stop_task_source_health_process(process, force=True)
+                    break
+                else:
+                    break
             if time.monotonic() >= deadline:
                 reason = "command_timeout"
                 _stop_task_source_health_process(process, force=True)
@@ -2957,8 +2976,7 @@ def run_task_source_health(
                 _stop_task_source_health_process(process, force=True)
                 process.wait()
         output.seek(0, os.SEEK_END)
-        if not reason and output.tell() > output_limit:
-            reason = "output_limit_exceeded"
+        output_limit_exceeded = output_limit_exceeded or output.tell() > output_limit
         if not reason and process.returncode != 0:
             reason = "nonzero_exit"
         if not reason:
@@ -2970,7 +2988,7 @@ def run_task_source_health(
             exit_code=(process.returncode if reason != "command_timeout" else None),
             duration_seconds=time.monotonic() - start,
             timed_out=reason == "command_timeout",
-            output_limit_exceeded=reason == "output_limit_exceeded",
+            output_limit_exceeded=output_limit_exceeded,
         )
 
 

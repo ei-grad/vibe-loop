@@ -58,6 +58,9 @@ class TaskSourceHealthTests(unittest.TestCase):
                 "import json, os, pathlib, sys\n"
                 "pathlib.Path(sys.argv[1]).write_text(json.dumps({\n"
                 "  'selector': os.environ.get('PROJECT_SELECTOR'),\n"
+                "  'vibe_selector': os.environ.get('VIBE_LOOP_PROJECT'),\n"
+                "  'state_dir': os.environ.get('VIBE_LOOP_STATE_DIR'),\n"
+                "  'repo': os.environ.get('VIBE_LOOP_REPO'),\n"
                 "  'run': os.environ.get('VIBE_LOOP_RUN_ID'),\n"
                 "  'task': os.environ.get('SELECTED_TASK_ID'),\n"
                 "  'thread': os.environ.get('CODEX_THREAD_ID'),\n"
@@ -80,6 +83,9 @@ class TaskSourceHealthTests(unittest.TestCase):
                     config,
                     runtime_context={
                         "PROJECT_SELECTOR": "board-alpha",
+                        "VIBE_LOOP_PROJECT": "board-vibe",
+                        "VIBE_LOOP_STATE_DIR": "/stable/state",
+                        "VIBE_LOOP_REPO": str(repo),
                         "VIBE_LOOP_TASK_ID": "task-runtime-secret",
                     },
                 )
@@ -87,6 +93,9 @@ class TaskSourceHealthTests(unittest.TestCase):
 
         self.assertTrue(result.succeeded)
         self.assertEqual(payload["selector"], "board-alpha")
+        self.assertEqual(payload["vibe_selector"], "board-vibe")
+        self.assertEqual(payload["state_dir"], "/stable/state")
+        self.assertEqual(payload["repo"], str(repo))
         self.assertIsNone(payload["run"])
         self.assertIsNone(payload["task"])
         self.assertIsNone(payload["thread"])
@@ -130,17 +139,38 @@ class TaskSourceHealthTests(unittest.TestCase):
                 repo,
                 TaskSourceConfig(
                     health_command=shlex.join(
-                        [sys.executable, "-c", "print('x' * 10000)"]
+                        [
+                            sys.executable,
+                            "-c",
+                            (
+                                "import sys; "
+                                'exec("while True:\\n '
+                                " sys.stdout.write('x' * 4096); "
+                                'sys.stdout.flush()")'
+                            ),
+                        ]
                     ),
                     command_timeout_seconds=1.0,
                 ),
                 output_limit=128,
+            )
+            completed_over_limit = run_task_source_health(
+                repo,
+                TaskSourceConfig(
+                    health_command=shlex.join(
+                        [sys.executable, "-c", "print('x' * 70000)"]
+                    ),
+                    command_timeout_seconds=1.0,
+                ),
             )
 
         self.assertTrue(timeout.timed_out)
         self.assertEqual(timeout.reason, "command_timeout")
         self.assertTrue(overflow.output_limit_exceeded)
         self.assertEqual(overflow.reason, "output_limit_exceeded")
+        self.assertTrue(completed_over_limit.succeeded)
+        self.assertEqual(completed_over_limit.reason, "healthy")
+        self.assertTrue(completed_over_limit.output_limit_exceeded)
 
 
 def planning_warning(

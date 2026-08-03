@@ -421,6 +421,75 @@ class RunnerTests(unittest.TestCase):
         probe.assert_not_called()
         self.assertEqual(records, [])
 
+    def test_serial_health_rejection_retains_completed_results(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = self.explicit_runner(repo, [])
+            completed = RunResult(
+                run_id="run-1",
+                task_id="TASK-01",
+                classification="completed",
+                exit_code=0,
+                log_path=repo / "run.log",
+                start_main="base",
+                end_main="head",
+            )
+            failed = TaskSourceHealthResult(
+                configured=True,
+                succeeded=False,
+                reason="nonzero_exit",
+                exit_code=9,
+                duration_seconds=0.0,
+            )
+            with patch.object(
+                runner,
+                "run_next",
+                side_effect=[completed, TaskSourceHealthError(failed)],
+            ):
+                results = runner.run_until_done_serial()
+
+        self.assertEqual(results, [completed])
+
+    def test_parallel_health_rejection_drains_in_flight_results(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            task = Task("TASK-01", "First", "Next")
+            runner = self.explicit_runner(repo, [task])
+            completed = RunResult(
+                run_id="run-1",
+                task_id=task.task_id,
+                classification="completed",
+                exit_code=0,
+                log_path=repo / "run.log",
+                start_main="base",
+                end_main="head",
+            )
+            failed = TaskSourceHealthResult(
+                configured=True,
+                succeeded=False,
+                reason="nonzero_exit",
+                exit_code=9,
+                duration_seconds=0.0,
+            )
+            with (
+                patch.object(
+                    runner,
+                    "admitted_candidates",
+                    side_effect=[[task], TaskSourceHealthError(failed)],
+                ),
+                patch.object(
+                    runner, "run_task_with_supervision", return_value=completed
+                ),
+            ):
+                results = runner.run_until_done_parallel(
+                    ask_agent=False,
+                    max_slices=0,
+                    continue_on_failure=False,
+                    jobs=2,
+                )
+
+        self.assertEqual(results, [completed])
+
     def test_run_task_id_dispatches_only_the_named_task_through_supervision(
         self,
     ) -> None:

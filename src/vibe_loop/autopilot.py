@@ -135,7 +135,6 @@ from vibe_loop.tasks import (
     Task,
     TaskSourceHealthResult,
     run_task_source_health,
-    task_source_health_environment,
 )
 from vibe_loop.telemetry import (
     normalize_model_label,
@@ -5340,13 +5339,6 @@ class MaintenanceCommandResult:
             "output_truncated": self.output_truncated,
             "timed_out": self.timed_out,
         }
-        if self.kind == TASK_SOURCE_HEALTH_COMMAND_KIND:
-            record["output"] = ""
-            record["diagnostic"] = (
-                "task-source health check passed"
-                if self.succeeded
-                else "task-source health check failed"
-            )
         return record
 
 
@@ -5466,11 +5458,8 @@ def run_maintenance_command(
     output is truncated on a byte boundary.
     """
 
-    if kind == TASK_SOURCE_HEALTH_COMMAND_KIND:
-        env = task_source_health_environment(env_extra)
-    else:
-        env = os.environ.copy()
-        env.update(env_extra)
+    env = os.environ.copy()
+    env.update(env_extra)
     popen_kwargs: dict[str, Any] = {}
     if os.name != "nt":
         popen_kwargs["start_new_session"] = True
@@ -6783,6 +6772,7 @@ PLANNING_OUTCOME_PROVIDER_LIMIT = "provider_limit"
 PLANNING_OUTCOME_WORKER_ERROR = "worker_error"
 PLANNING_OUTCOME_TASK_SOURCE_ERROR = "task_source_error"
 PLANNING_OUTCOME_ANALYSIS_ERROR = "analysis_error"
+PLANNING_OUTCOME_ANALYSIS_ONLY = "analysis_only"
 
 # Why the analysis stage produced no usable decision. Only ``invalid_plan``
 # says anything about planning's ability to produce work; the rest are
@@ -7718,10 +7708,17 @@ def execute_autopilot_cycle(
     dispatch_min_ready = require_positive_dispatch_min_ready(dispatch_min_ready)
     cycle_started_at = utc_now_iso()
     actions: list[str] = []
+    task_source_health_context = config.runtime_environment
+    task_source_health_context.update(
+        {
+            "VIBE_LOOP_REPO": str(config.repo),
+            "VIBE_LOOP_STATE_DIR": str(config.state_path),
+        }
+    )
     task_source_health = task_source_health_runner(
         config.repo,
         config.task_source,
-        runtime_context=config.runtime_environment,
+        runtime_context=task_source_health_context,
     )
     if task_source_health.configured:
         run_store.append_record(
@@ -7981,30 +7978,76 @@ def execute_autopilot_cycle(
     blockers = tuple(blocker_list)
     blockers_checked_after_planning = False
     if blockers == ("task_source_health_failed",) and runnable < min_ready:
-        native_planning = native_planning_runner(
-            config,
-            cycle_id=cycle_id,
-            status=status,
-            min_ready=min_ready,
-            run_store=run_store,
-            analysis_only=True,
-        )
-        actions.append("native_planning_analysis_only")
-        if native_planning.decision.provider_limit:
-            planning_provider_limit_pause = (
-                native_planning.decision.provider_limit_pause_seconds
-            )
-            actions.append(
-                f"{NATIVE_PLANNING_PROVIDER_LIMIT_ACTION}:"
-                f"{planning_provider_limit_pause:.0f}s"
-            )
-        elif native_planning.decision.agent_error:
-            actions.append("native_planning_analysis_error")
-        elif native_planning.decision.should_plan:
-            actions.append("native_planning_decision:plan_analysis_only")
+        if config.autopilot.planning_command:
+            actions.append("configured_planning_withheld:task_source_health_failed")
         else:
-            actions.append("native_planning_decision:no_plan_analysis_only")
-        actions.append("native_planning_author_withheld")
+            fingerprint = planning_source_fingerprint(status.queue)
+            planning_backoff = planning_outcome_backoff(
+                run_store,
+                repo=config.repo,
+                fingerprint=fingerprint,
+                backoff_seconds=config.autopilot.planning_backoff_seconds,
+                max_launches_per_day=(config.autopilot.planning_max_launches_per_day),
+                unproductive_threshold=(
+                    config.autopilot.planning_unproductive_threshold
+                ),
+            )
+            if planning_backoff is not None:
+                planning_backoff_pause = planning_backoff.remaining_seconds
+                actions.append(planning_backoff.action)
+                actions.append("native_planning_analysis_only_withheld")
+            else:
+                run_store.append_record(
+                    planning_launch_record(
+                        config.repo, cycle_id=cycle_id, fingerprint=fingerprint
+                    )
+                )
+                native_planning = native_planning_runner(
+                    config,
+                    cycle_id=cycle_id,
+                    status=status,
+                    min_ready=min_ready,
+                    run_store=run_store,
+                    analysis_only=True,
+                )
+                run_store.append_record(
+                    planning_outcome_record(
+                        config.repo,
+                        cycle_id=cycle_id,
+                        outcome=PLANNING_OUTCOME_ANALYSIS_ONLY,
+                        fingerprint=fingerprint,
+                        runnable_before=native_planning.worker.runnable_before,
+                        runnable_after=native_planning.worker.runnable_after,
+                        created_count=0,
+                        created_task_ids=(),
+                        provider_launched=planning_provider_launched(native_planning),
+                        model_provider=native_planning.model_provider,
+                        model_id=native_planning.model_id,
+                        attribution_diagnostics=(
+                            native_planning.attribution_diagnostics
+                        ),
+                        stats=native_planning.stats,
+                    )
+                )
+                actions.append(
+                    f"{PLANNING_OUTCOME_ACTION_PREFIX}{PLANNING_OUTCOME_ANALYSIS_ONLY}"
+                )
+                actions.append("native_planning_analysis_only")
+                if native_planning.decision.provider_limit:
+                    planning_provider_limit_pause = (
+                        native_planning.decision.provider_limit_pause_seconds
+                    )
+                    actions.append(
+                        f"{NATIVE_PLANNING_PROVIDER_LIMIT_ACTION}:"
+                        f"{planning_provider_limit_pause:.0f}s"
+                    )
+                elif native_planning.decision.agent_error:
+                    actions.append("native_planning_analysis_error")
+                elif native_planning.decision.should_plan:
+                    actions.append("native_planning_decision:plan_analysis_only")
+                else:
+                    actions.append("native_planning_decision:no_plan_analysis_only")
+                actions.append("native_planning_author_withheld")
     if not blockers and runnable < min_ready:
         active_conflict_workers = active_conflict_worker_count(status.workers)
         planning = run_maintenance("planning")

@@ -480,9 +480,11 @@ planning-refill threshold, autopilot still runs native planning detection in
 explicit `analysis_only` mode. That mode may produce a plan/no-plan decision
 from read-only evidence but never requests, attempts, or starts the authoring
 worker, never re-reads for authored tasks, reports zero created tasks, and is
-not recorded as a planning launch, productive replenishment, or author. A later
-successful fresh check restores ordinary maintenance, planning, and dispatch
-admission without carrying the prior blocker forward.
+recorded as provider spend subject to the ordinary planning backoff and daily
+launch ceiling, but not as productive replenishment or an author. An explicitly
+configured planning command is withheld rather than replaced by native
+analysis. A later successful fresh check restores ordinary maintenance,
+planning, and dispatch admission without carrying the prior blocker forward.
 
 Acceptance must cover an `[autopilot]` config section, bounded command output,
 safe environment variables, command-result records, command redaction in status

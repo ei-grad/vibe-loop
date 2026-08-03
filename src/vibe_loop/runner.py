@@ -1860,10 +1860,17 @@ class VibeRunner:
         )
 
     def require_task_source_health(self) -> None:
+        runtime_context = self.config.runtime_environment
+        runtime_context.update(
+            {
+                "VIBE_LOOP_REPO": str(self.config.repo),
+                "VIBE_LOOP_STATE_DIR": str(self.config.state_path),
+            }
+        )
         result = run_task_source_health(
             self.config.repo,
             self.config.task_source,
-            runtime_context=self.config.runtime_environment,
+            runtime_context=runtime_context,
         )
         if not result.succeeded:
             raise TaskSourceHealthError(result)
@@ -5351,18 +5358,28 @@ class VibeRunner:
                 None,
             )
             if pending is not None:
-                result = self.resume_pending_recovery(pending)
+                try:
+                    result = self.resume_pending_recovery(pending)
+                except TaskSourceHealthError as exc:
+                    report_status(f"task-source health stopped further dispatch: {exc}")
+                    break
                 if result is None:
                     skipped.add(pending.task_id)
                     continue
                 recovery_attempts[pending.task_id] = pending.attempt
                 results.append(result)
                 if run_requires_recovery(result):
-                    result = self.drive_unknown_recovery(
-                        result,
-                        attempts=recovery_attempts,
-                        results=results,
-                    )
+                    try:
+                        result = self.drive_unknown_recovery(
+                            result,
+                            attempts=recovery_attempts,
+                            results=results,
+                        )
+                    except TaskSourceHealthError as exc:
+                        report_status(
+                            f"task-source health stopped further dispatch: {exc}"
+                        )
+                        break
                 if result.classification == "completed":
                     transient_retries.pop(result.task_id, None)
                     recovery_attempts.pop(result.task_id, None)
@@ -5378,11 +5395,15 @@ class VibeRunner:
                 ):
                     break
                 continue
-            result = self.run_next(
-                ask_agent=ask_agent,
-                exclude=skipped | yielded,
-                restart_counts=transient_retries,
-            )
+            try:
+                result = self.run_next(
+                    ask_agent=ask_agent,
+                    exclude=skipped | yielded,
+                    restart_counts=transient_retries,
+                )
+            except TaskSourceHealthError as exc:
+                report_status(f"task-source health stopped further dispatch: {exc}")
+                break
             if result is None:
                 if yielded:
                     yielded.clear()
@@ -5433,11 +5454,15 @@ class VibeRunner:
                     f"transient retries exhausted for {result.task_id}, skipping"
                 )
             if run_requires_recovery(result):
-                result = self.drive_unknown_recovery(
-                    result,
-                    attempts=recovery_attempts,
-                    results=results,
-                )
+                try:
+                    result = self.drive_unknown_recovery(
+                        result,
+                        attempts=recovery_attempts,
+                        results=results,
+                    )
+                except TaskSourceHealthError as exc:
+                    report_status(f"task-source health stopped further dispatch: {exc}")
+                    break
                 if result.classification == "completed":
                     transient_retries.pop(result.task_id, None)
                     recovery_attempts.pop(result.task_id, None)
@@ -5482,18 +5507,28 @@ class VibeRunner:
         for recovery in pending_contexts:
             if max_slices > 0 and len(results) >= max_slices:
                 break
-            result = self.resume_pending_recovery(recovery)
+            try:
+                result = self.resume_pending_recovery(recovery)
+            except TaskSourceHealthError as exc:
+                report_status(f"task-source health stopped further dispatch: {exc}")
+                stop_after_running = True
+                break
             if result is None:
                 skipped.add(recovery.task_id)
                 continue
             recovery_attempts[recovery.task_id] = recovery.attempt
             results.append(result)
             if run_requires_recovery(result):
-                result = self.drive_unknown_recovery(
-                    result,
-                    attempts=recovery_attempts,
-                    results=results,
-                )
+                try:
+                    result = self.drive_unknown_recovery(
+                        result,
+                        attempts=recovery_attempts,
+                        results=results,
+                    )
+                except TaskSourceHealthError as exc:
+                    report_status(f"task-source health stopped further dispatch: {exc}")
+                    stop_after_running = True
+                    break
             if result.classification == "completed":
                 completed_count += 1
                 recovery_attempts.pop(result.task_id, None)
@@ -5525,9 +5560,16 @@ class VibeRunner:
                         for task_id, ready_at in retry_ready_at.items()
                         if ready_at > now
                     }
-                    candidates = self.admitted_candidates(
-                        exclude=skipped | set(scheduled) | cooling_down
-                    )
+                    try:
+                        candidates = self.admitted_candidates(
+                            exclude=skipped | set(scheduled) | cooling_down
+                        )
+                    except TaskSourceHealthError as exc:
+                        report_status(
+                            f"task-source health stopped further dispatch: {exc}"
+                        )
+                        stop_after_running = True
+                        break
                     candidates = filter_scheduled_conflicts(
                         candidates,
                         list(scheduled.values()),
@@ -5603,9 +5645,16 @@ class VibeRunner:
                             for task_id, ready_at in retry_ready_at.items()
                             if ready_at > now
                         }
-                        candidates = self.admitted_candidates(
-                            exclude=skipped | set(scheduled) | cooling_down
-                        )
+                        try:
+                            candidates = self.admitted_candidates(
+                                exclude=skipped | set(scheduled) | cooling_down
+                            )
+                        except TaskSourceHealthError as exc:
+                            report_status(
+                                f"task-source health stopped further dispatch: {exc}"
+                            )
+                            stop_after_running = True
+                            break
                         candidates = filter_scheduled_conflicts(
                             candidates,
                             list(scheduled.values()),
@@ -5724,11 +5773,18 @@ class VibeRunner:
                         # state). It does briefly serialize new-work scheduling
                         # behind the recovery worker, which is acceptable for a
                         # bounded recovery.
-                        result = self.drive_unknown_recovery(
-                            result,
-                            attempts=recovery_attempts,
-                            results=results,
-                        )
+                        try:
+                            result = self.drive_unknown_recovery(
+                                result,
+                                attempts=recovery_attempts,
+                                results=results,
+                            )
+                        except TaskSourceHealthError as exc:
+                            report_status(
+                                f"task-source health stopped further dispatch: {exc}"
+                            )
+                            stop_after_running = True
+                            continue
                         if result.classification == "completed":
                             transient_retries.pop(result.task_id, None)
                             retry_ready_at.pop(result.task_id, None)

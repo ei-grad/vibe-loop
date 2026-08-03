@@ -59,6 +59,7 @@ from vibe_loop.autopilot import (
     PLANNING_ERROR_OS_ERROR,
     PLANNING_ERROR_SUBPROCESS,
     PLANNING_OUTCOME_ANALYSIS_ERROR,
+    PLANNING_OUTCOME_ANALYSIS_ONLY,
     PLANNING_OUTCOME_INVALID_PLAN,
     PLANNING_OUTCOME_PROVIDER_LIMIT,
     PLANNING_OUTCOME_NO_TASKS,
@@ -10162,7 +10163,6 @@ class AutopilotMaintenanceTests(unittest.TestCase):
                 extra_toml=(
                     '[task_source]\nhealth = "backend-health"\n'
                     '[autopilot]\nhealth_command = "general-health"\n'
-                    'planning_command = "write-planner"\n'
                 ),
             )
             config = load_config(repo)
@@ -10215,6 +10215,7 @@ class AutopilotMaintenanceTests(unittest.TestCase):
                 ),
                 native_planning_runner=native_planning,
             )
+            records = RunStore(config.state_path / "runs.jsonl").read_records()
 
         cycle = summary.cycles[0]
         self.assertEqual(cycle.status, "blocked")
@@ -10228,6 +10229,114 @@ class AutopilotMaintenanceTests(unittest.TestCase):
         self.assertIn("native_planning_author_withheld", cycle.actions)
         self.assertIn(
             "autopilot_health_withheld:task_source_health_failed", cycle.actions
+        )
+        planning_records = [
+            record
+            for record in records
+            if record.get("record_type")
+            in {
+                AUTOPILOT_PLANNING_LAUNCH_RECORD_TYPE,
+                AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE,
+            }
+        ]
+        self.assertEqual(len(planning_records), 2)
+        self.assertEqual(planning_records[1]["outcome"], PLANNING_OUTCOME_ANALYSIS_ONLY)
+
+    def test_health_failure_does_not_replace_configured_planning_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=(
+                    '[task_source]\nhealth = "backend-health"\n'
+                    '[autopilot]\nplanning_command = "write-planner"\n'
+                ),
+            )
+            config = load_config(repo)
+            health_runner, _calls = self._stub_task_source_health(9)
+            planning_calls: list[dict[str, object]] = []
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                min_ready=2,
+                launcher=lambda *args, **kwargs: 0,
+                task_source_health_runner=health_runner,
+                native_planning_runner=lambda *args, **kwargs: planning_calls.append(
+                    dict(kwargs)
+                ),
+            )
+
+        self.assertEqual(planning_calls, [])
+        self.assertIn(
+            "configured_planning_withheld:task_source_health_failed",
+            summary.cycles[0].actions,
+        )
+
+    def test_health_failure_analysis_only_obeys_daily_planning_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=(
+                    '[task_source]\nhealth = "backend-health"\n'
+                    "[autopilot]\nplanning_max_launches_per_day = 1\n"
+                ),
+            )
+            config = load_config(repo)
+            health_runner, _calls = self._stub_task_source_health(9)
+            planning_calls = 0
+
+            def native_planning(*args, **kwargs):
+                nonlocal planning_calls
+                planning_calls += 1
+                return NativePlanningCycleResult(
+                    decision=NativePlanningDecision(
+                        cycle_id=kwargs["cycle_id"],
+                        runnable=1,
+                        min_ready=2,
+                        status="decided",
+                        should_plan=False,
+                        reason="queue requires no new work",
+                        objective="",
+                        agent_invoked=True,
+                        mode="analysis_only",
+                    ),
+                    worker=NativePlanningWorkerResult(
+                        cycle_id=kwargs["cycle_id"],
+                        phase="terminal",
+                        status="skipped_analysis_only",
+                        requested=False,
+                        attempted=False,
+                        started=False,
+                        pid=None,
+                        exit_code=None,
+                        log_path=None,
+                        runnable_before=1,
+                        runnable_after=1,
+                        analysis_only=True,
+                    ),
+                )
+
+            summary = run_autopilot(
+                config,
+                max_cycles=2,
+                interval=60,
+                min_ready=2,
+                sleep=lambda _seconds: None,
+                launcher=lambda *args, **kwargs: 0,
+                task_source_health_runner=health_runner,
+                native_planning_runner=native_planning,
+            )
+
+        self.assertEqual(planning_calls, 1)
+        self.assertTrue(
+            any("daily_launch_cap" in action for action in summary.cycles[1].actions)
+        )
+        self.assertIn(
+            "native_planning_analysis_only_withheld", summary.cycles[1].actions
         )
 
     def test_fresh_healthy_cycle_clears_task_source_health_blocker(self) -> None:
@@ -10315,7 +10424,7 @@ class AutopilotMaintenanceTests(unittest.TestCase):
             payload = json.loads(observed.read_text(encoding="utf-8"))
 
         self.assertEqual(summary.cycles[0].status, "idle")
-        self.assertEqual(payload["present"], [])
+        self.assertEqual(payload["present"], ["VIBE_LOOP_REPO"])
         self.assertEqual(payload["selector"], "shared-backend")
         self.assertEqual(command_record["output"], "")
         self.assertEqual(

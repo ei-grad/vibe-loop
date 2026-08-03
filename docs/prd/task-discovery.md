@@ -269,15 +269,18 @@ dispatch mutation. A success applies only to the immediately admitted attempt;
 it is never cached across retries, recovery attempts, tasks, or autopilot
 cycles. An absent command preserves existing behavior.
 
-The subprocess uses `task_source.command_timeout_seconds`, retains at most 64
-KiB of combined output, and terminates its owned process group on timeout or
-overflow. It receives validated project-selector context but no run, task,
-selection, session, thread, branch, worktree, lock-owner, fencing, or other
-per-dispatch identity or capability context from either ambient environment or
-runtime context. Neither command text nor captured output is exposed. Durable
-and user-facing results contain only bounded categorical state, exit status,
-timing, timeout/overflow flags, and a controlled diagnostic without host paths,
-credentials, private adapter metadata, or subprocess output.
+The subprocess uses `task_source.command_timeout_seconds`, observes a 64 KiB
+combined-output ceiling, and terminates its owned process group on timeout or a
+sustained overflow. A command that has already emitted its final output gets a
+short exit grace so a clean exit is not misclassified as a flood. It receives
+validated project-selector and stable repository/state context but no run,
+task, selection, session, thread, branch, worktree, lock-owner, fencing, or
+other per-dispatch identity or capability context from either ambient
+environment or runtime context. Neither command text nor captured output is
+exposed. Durable and user-facing results contain only bounded categorical
+state, exit status, timing, timeout/overflow flags, and a controlled diagnostic
+without host paths, credentials, private adapter metadata, or subprocess
+output.
 
 Read-only task discovery and troubleshooting remain outside admission:
 `tasks`, `tasks next`, `tasks list`, inspect/tree views, probes, queue/status
