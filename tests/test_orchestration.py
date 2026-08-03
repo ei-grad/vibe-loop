@@ -3915,6 +3915,108 @@ class RuntimeIntegrationTests(unittest.TestCase):
             ("failed", "main_push_failed", "fetch-failed-after-timeout"),
         )
 
+    def test_push_timeout_with_remote_ref_mismatch_fails_closed(self) -> None:
+        self.configure_origin()
+        original_git_network = Integrator._git_network
+        remote_head = git(self.repo, "rev-parse", "origin/main").stdout.strip()
+
+        def timeout_before_delivery(
+            worktree: Path,
+            *args: str,
+            **kwargs,
+        ) -> subprocess.CompletedProcess[str]:
+            if args[0] == "push":
+                return subprocess.CompletedProcess(
+                    ["git", *args],
+                    124,
+                    "",
+                    "git push timed out before delivery",
+                )
+            return original_git_network(worktree, *args, **kwargs)
+
+        with patch.object(
+            Integrator,
+            "_git_network",
+            side_effect=timeout_before_delivery,
+        ):
+            result = self.integrator(push_main_to_upstream=True).run()
+
+        diagnostics = result.diagnostics["main_push"]
+        self.assertEqual(
+            (
+                result.status,
+                result.reason,
+                diagnostics["verification"],
+                diagnostics["expected_head"],
+                diagnostics["actual_head"],
+            ),
+            (
+                "failed",
+                "main_push_failed",
+                "remote-ref-mismatch-after-timeout",
+                self.candidate_head,
+                remote_head,
+            ),
+        )
+
+    def test_push_timeout_with_unreadable_remote_ref_fails_closed(self) -> None:
+        self.configure_origin()
+        original_git = Integrator._git
+
+        def timeout_then_fetch(
+            worktree: Path,
+            *args: str,
+            **kwargs,
+        ) -> subprocess.CompletedProcess[str]:
+            del worktree, kwargs
+            if args[0] == "push":
+                return subprocess.CompletedProcess(
+                    ["git", *args],
+                    124,
+                    "",
+                    "git push timed out",
+                )
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
+
+        def unreadable_fetch_head(
+            worktree: Path,
+            *args: str,
+        ) -> subprocess.CompletedProcess[str]:
+            if args == ("rev-parse", "--verify", "FETCH_HEAD^{commit}"):
+                return subprocess.CompletedProcess(
+                    ["git", *args],
+                    128,
+                    "",
+                    "FETCH_HEAD is unreadable",
+                )
+            return original_git(worktree, *args)
+
+        with (
+            patch.object(
+                Integrator,
+                "_git_network",
+                side_effect=timeout_then_fetch,
+            ),
+            patch.object(Integrator, "_git", side_effect=unreadable_fetch_head),
+        ):
+            result = self.integrator(push_main_to_upstream=True).run()
+
+        diagnostics = result.diagnostics["main_push"]
+        self.assertEqual(
+            (
+                result.status,
+                result.reason,
+                diagnostics["verification"],
+                "FETCH_HEAD is unreadable" in diagnostics["git_output"],
+            ),
+            (
+                "failed",
+                "main_push_failed",
+                "remote-ref-unreadable-after-timeout",
+                True,
+            ),
+        )
+
     def test_push_failure_is_recorded_without_rolling_back_main(self) -> None:
         remote = self.configure_origin()
         hook = remote / "hooks" / "pre-receive"
