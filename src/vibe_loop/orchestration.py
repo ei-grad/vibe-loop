@@ -22,6 +22,7 @@ from vibe_loop.config import (
     AgentConfig,
     AgentResolutionError,
     AgentSelection,
+    ORCHESTRATION_DEFAULT_MAIN_PUSH_TIMEOUT_SECONDS,
     OrchestrationConfig,
     TaskAgentResolutionError,
     TaskSourceConfig,
@@ -63,7 +64,7 @@ from vibe_loop.upstream import UPSTREAM_FETCH_TIMEOUT_SECONDS
 
 
 RUN_CONTRACT_VERSION = 1
-MAIN_PUSH_TIMEOUT_SECONDS = UPSTREAM_FETCH_TIMEOUT_SECONDS
+MAIN_PUSH_TIMEOUT_SECONDS = ORCHESTRATION_DEFAULT_MAIN_PUSH_TIMEOUT_SECONDS
 RUN_CONTRACT_SOURCE_KINDS = ("config", "profile", "skill-proposal")
 WORKSPACE_BRANCH_PREFIX = "vibe-loop/"
 WORKSPACE_NAME_MAX_LENGTH = 64
@@ -4562,6 +4563,7 @@ class Integrator:
         integration_keys: Sequence[str],
         verify_on_main_keys: Sequence[str],
         push_main_to_upstream: bool = False,
+        main_push_timeout_seconds: float = MAIN_PUSH_TIMEOUT_SECONDS,
         lock_manager: object,
         run_store: object,
         run_id: str,
@@ -4588,6 +4590,7 @@ class Integrator:
         self.integration_keys = tuple(integration_keys)
         self.verify_on_main_keys = tuple(verify_on_main_keys)
         self.push_main_to_upstream = push_main_to_upstream
+        self.main_push_timeout_seconds = main_push_timeout_seconds
         self.lock_manager = lock_manager
         self.run_store = run_store
         self.run_id = run_id
@@ -5041,7 +5044,16 @@ class Integrator:
             "--",
             remote_name,
             f"{main_head}:{remote_branch_ref}",
+            timeout_seconds=self.main_push_timeout_seconds,
         )
+        if pushed.returncode == 124:
+            return self._verify_timed_out_push(
+                main_head=main_head,
+                upstream_ref=upstream_ref,
+                remote_name=remote_name,
+                remote_branch_ref=remote_branch_ref,
+                pushed=pushed,
+            )
         if pushed.returncode != 0:
             return {
                 "status": "failed",
@@ -5072,6 +5084,63 @@ class Integrator:
             "status": "pushed",
             "upstream": upstream_ref,
             "head": main_head,
+        }
+
+    def _verify_timed_out_push(
+        self,
+        *,
+        main_head: str,
+        upstream_ref: str,
+        remote_name: str,
+        remote_branch_ref: str,
+        pushed: subprocess.CompletedProcess[str],
+    ) -> dict[str, object]:
+        fetched = self._git_network(
+            self.repo,
+            "fetch",
+            "--no-tags",
+            "--",
+            remote_name,
+            remote_branch_ref,
+            timeout_seconds=UPSTREAM_FETCH_TIMEOUT_SECONDS,
+        )
+        if fetched.returncode != 0:
+            return {
+                "status": "failed",
+                "upstream": upstream_ref,
+                "verification": "fetch-failed-after-timeout",
+                "git_output": self._bounded_git_output(pushed)
+                + self._bounded_git_output(fetched),
+            }
+        fetched_head = self._git(
+            self.repo,
+            "rev-parse",
+            "--verify",
+            "FETCH_HEAD^{commit}",
+        )
+        if fetched_head.returncode != 0:
+            return {
+                "status": "failed",
+                "upstream": upstream_ref,
+                "verification": "remote-ref-unreadable-after-timeout",
+                "git_output": self._bounded_git_output(pushed)
+                + self._bounded_git_output(fetched_head),
+            }
+        actual_head = fetched_head.stdout.strip()
+        if actual_head != main_head:
+            return {
+                "status": "failed",
+                "upstream": upstream_ref,
+                "verification": "remote-ref-mismatch-after-timeout",
+                "expected_head": main_head,
+                "actual_head": actual_head,
+                "git_output": self._bounded_git_output(pushed),
+            }
+        return {
+            "status": "pushed",
+            "upstream": upstream_ref,
+            "head": main_head,
+            "verification": "remote-ref-match-after-timeout",
         }
 
     def _record_completed_result(
@@ -5937,6 +6006,7 @@ class Integrator:
     def _git_network(
         worktree: Path,
         *args: str,
+        timeout_seconds: float = MAIN_PUSH_TIMEOUT_SECONDS,
     ) -> subprocess.CompletedProcess[str]:
         command = ["git", "-C", str(worktree), *args]
         env = os.environ.copy()
@@ -5951,7 +6021,7 @@ class Integrator:
                 encoding="utf-8",
                 errors="replace",
                 check=False,
-                timeout=MAIN_PUSH_TIMEOUT_SECONDS,
+                timeout=timeout_seconds,
                 env=env,
                 start_new_session=True,
             )
@@ -5962,14 +6032,14 @@ class Integrator:
                 command,
                 124,
                 stdout,
-                stderr + f"\ngit push timed out after {exc.timeout} seconds",
+                stderr + f"\ngit {args[0]} timed out after {exc.timeout} seconds",
             )
         except OSError as exc:
             return subprocess.CompletedProcess(
                 command,
                 127,
                 "",
-                f"git push could not start: {type(exc).__name__}",
+                f"git {args[0]} could not start: {type(exc).__name__}",
             )
 
 
@@ -7245,6 +7315,7 @@ class RunContractResolver:
                 "verify_on_main": list(effective.verify_on_main),
                 "lock_timeout_seconds": (effective.integration_lock_timeout_seconds),
                 "push_main_to_upstream": effective.push_main_to_upstream,
+                "main_push_timeout_seconds": effective.main_push_timeout_seconds,
             },
             "task_provenance": task_provenance_payload,
             "candidate_stabilization": {

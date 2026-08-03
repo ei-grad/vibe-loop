@@ -73,6 +73,9 @@ mode = "runtime-owned"
 # Push verified main to its configured Git upstream while the integration lock
 # is still held. Disabled by default.
 # push_main_to_upstream = false
+# Object transfer has a separate five-minute budget; increase it for large or
+# slow repositories without extending metadata-only upstream fetches.
+# main_push_timeout_seconds = 300.0
 
 [supervision]
 max_restarts = 3
@@ -394,7 +397,7 @@ configuration section now lives.
 | `task_source.capabilities` | Task-source configuration above and [PRD-TSK-008](prd/task-discovery.md#prd-tsk-008-adapter-capability-diagnostics). |
 | Profile fields `resources`, `paths`, `column`, `none_values`; ralphex conflict surfaces; `spec-kit`, `kiro`, `openspec` | [Generated Task Discovery](generated-task-discovery.md) and the [ralphex example](examples/ralphex-markdown-plan.md). |
 | `completion.commands` | Other configuration groups above and [PRD-CLI-003](prd/cli-runtime.md#prd-cli-003-completion-checks). |
-| `orchestration.mode`, `reviewer_profile`; reviewer routing `profile`, `match_implementer_profile`, `match_implementer_provider`; `task_provenance_mode`, `external_completion_actor`, `max_initial_review_passes`, `max_closure_review_passes`, `reviewer_concurrency_budget`, `max_candidate_reanchors`, `integration_lock_timeout_seconds`, `push_main_to_upstream` | Reviewer routing above, [PRD-ORC-005](prd/run-orchestration.md#prd-orc-005-reviewer-routing-identity-and-continuation), and [runtime integration](prd/run-orchestration.md#prd-orc-007-runtime-integration-and-task-provenance). |
+| `orchestration.mode`, `reviewer_profile`; reviewer routing `profile`, `match_implementer_profile`, `match_implementer_provider`; `task_provenance_mode`, `external_completion_actor`, `max_initial_review_passes`, `max_closure_review_passes`, `reviewer_concurrency_budget`, `max_candidate_reanchors`, `integration_lock_timeout_seconds`, `push_main_to_upstream`, `main_push_timeout_seconds` | Reviewer routing above, [PRD-ORC-005](prd/run-orchestration.md#prd-orc-005-reviewer-routing-identity-and-continuation), and [runtime integration](prd/run-orchestration.md#prd-orc-007-runtime-integration-and-task-provenance). |
 | `supervision.max_restarts`, `cooldown_seconds`, `recover_unknown_runs`, `worker_timeout_seconds`, `slice_token_threshold`, `cross_run_attempt_threshold` | Annotated and other groups above; supervision contracts in [Worker Supervision PRD](prd/worker-supervision.md). |
 | `locks.type`, `acquire_command`, `release_command`, `status_command`, `list_command`, `lease_seconds` | [PRD-WRK-011 and PRD-WRK-012](prd/worker-supervision.md#prd-wrk-011-pluggable-lock-backends). |
 | `budget.enabled`, `metric`, `fail_safe`, `fail_safe_amount`, `default_declared`, `on_insufficient`, `declared.*`; limit `project`, `provider`, `phase`, `model`, `effort`, `limit`, `warn_at`, `window_hours` | Usage budgets and reservations above. |

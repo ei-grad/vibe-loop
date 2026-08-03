@@ -375,7 +375,10 @@ with an explicit refspec after successful main verification and before it
 records successful integration or releases the main-integration lock. Ambient
 `push.default` policy cannot widen or redirect the push. The network command is
 noninteractive and time-bounded so a prompt or unavailable remote cannot hold
-the integration lock indefinitely.
+the integration lock indefinitely. `orchestration.main_push_timeout_seconds`
+sets the per-project object-transfer budget and defaults to 300 seconds; this is
+separate from the shorter metadata-fetch budget because a push may need to
+transfer a large pack.
 
 This applies to both a new fast-forward and `branch_already_merged`
 reconciliation. A missing upstream, rejected push, or post-push upstream ref
@@ -384,6 +387,11 @@ that does not equal the verified local main commit records
 intact so a transport or policy failure cannot discard reviewed work, but the
 run does not report completed. With the option omitted or false, integration
 does not inspect or push an upstream and preserves the prior result payload.
+A push timeout leaves delivery unknown, so the runtime fetches the exact
+configured upstream branch and compares its commit with verified local main.
+An exact match settles the push as successful. A failed verification fetch,
+unreadable fetched ref, or mismatch remains `main_push_failed`; an unreachable
+remote therefore cannot silently pass.
 
 A failed `git merge --ff-only` records bounded, redacted Git output including
 stderr. The reason is `main_fast_forward_failed` only when successful ancestry

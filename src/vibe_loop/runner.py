@@ -4510,6 +4510,12 @@ class VibeRunner:
                 if isinstance(item, str)
             ),
             push_main_to_upstream=bool(integration.get("push_main_to_upstream", False)),
+            main_push_timeout_seconds=float(
+                integration.get(
+                    "main_push_timeout_seconds",
+                    self.config.orchestration.main_push_timeout_seconds,
+                )
+            ),
             lock_manager=self.lock_manager,
             run_store=self.run_store,
             run_id=run_id,

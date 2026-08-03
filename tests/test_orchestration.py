@@ -114,6 +114,7 @@ class OrchestrationConfigTests(unittest.TestCase):
             config.orchestration.integration_lock_timeout_seconds,
             900.0,
         )
+        self.assertEqual(config.orchestration.main_push_timeout_seconds, 300.0)
         self.assertEqual(config.orchestration.max_candidate_reanchors, 2)
         self.assertTrue(config.orchestration.integration_enabled)
         self.assertFalse(config.orchestration.push_main_to_upstream)
@@ -138,6 +139,7 @@ class OrchestrationConfigTests(unittest.TestCase):
                 'gates = ["completion.commands[0]"]\n'
                 'verify_on_main = ["completion.commands[1]"]\n'
                 "integration_lock_timeout_seconds = 1200\n"
+                "main_push_timeout_seconds = 480\n"
                 "max_initial_review_passes = 2\n"
                 "max_closure_review_passes = 3\n"
                 "reviewer_concurrency_budget = 2\n"
@@ -163,6 +165,7 @@ class OrchestrationConfigTests(unittest.TestCase):
             config.orchestration.integration_lock_timeout_seconds,
             1200.0,
         )
+        self.assertEqual(config.orchestration.main_push_timeout_seconds, 480.0)
         self.assertEqual(config.orchestration.max_initial_review_passes, 2)
         self.assertEqual(config.orchestration.max_closure_review_passes, 3)
         self.assertEqual(config.orchestration.reviewer_concurrency_budget, 2)
@@ -285,6 +288,10 @@ class OrchestrationConfigTests(unittest.TestCase):
             (
                 'integration_lock_timeout_seconds = "slow"\n',
                 "orchestration.integration_lock_timeout_seconds",
+            ),
+            (
+                "main_push_timeout_seconds = 0\n",
+                "orchestration.main_push_timeout_seconds",
             ),
             (
                 'push_main_to_upstream = "yes"\n',
@@ -437,12 +444,14 @@ class RunContractResolverTests(unittest.TestCase):
                 reviewer_profile="review",
                 max_remediation_rounds=7,
                 push_main_to_upstream=True,
+                main_push_timeout_seconds=480,
                 explicit_keys=frozenset(
                     {
                         "mode",
                         "reviewer_profile",
                         "max_remediation_rounds",
                         "push_main_to_upstream",
+                        "main_push_timeout_seconds",
                     }
                 ),
             ),
@@ -472,6 +481,10 @@ class RunContractResolverTests(unittest.TestCase):
 
         self.assertEqual(contract.payload["remediation"], {"max_rounds": 7})
         self.assertTrue(contract.payload["integration"]["push_main_to_upstream"])
+        self.assertEqual(
+            contract.payload["integration"]["main_push_timeout_seconds"],
+            480,
+        )
         self.assertEqual(
             contract.payload["candidate_stabilization"],
             {"max_reanchors": 2},
@@ -3576,6 +3589,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
         completion_fence=None,
         default_verification_cache: bool = False,
         push_main_to_upstream: bool = False,
+        main_push_timeout_seconds: float = MAIN_PUSH_TIMEOUT_SECONDS,
     ) -> Integrator:
         return Integrator(
             repo=self.repo,
@@ -3592,6 +3606,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
             integration_keys=integration_keys,
             verify_on_main_keys=main_keys,
             push_main_to_upstream=push_main_to_upstream,
+            main_push_timeout_seconds=main_push_timeout_seconds,
             lock_manager=self.manager,
             run_store=self.store,
             run_id="run-1",
@@ -3741,6 +3756,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
         def observe_push(
             worktree: Path,
             *args: str,
+            **kwargs,
         ) -> subprocess.CompletedProcess[str]:
             sequence.append("push_started")
             self.assertTrue(self.manager.main_integration_status().locked)
@@ -3749,7 +3765,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
             waiter.start()
             self.assertTrue(waiter_started.wait(1))
             self.assertFalse(waiter_acquired.wait(0.1))
-            result = original_git_network(worktree, *args)
+            result = original_git_network(worktree, *args, **kwargs)
             sequence.append("push_finished")
             return result
 
@@ -3803,6 +3819,101 @@ class RuntimeIntegrationTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 124)
         self.assertIn("timed out", result.stderr)
+
+    def test_configured_push_timeout_is_applied(self) -> None:
+        self.configure_origin()
+        original_git_network = Integrator._git_network
+        observed_timeouts: list[float] = []
+
+        def observe_timeout(
+            worktree: Path,
+            *args: str,
+            **kwargs,
+        ) -> subprocess.CompletedProcess[str]:
+            if args[0] == "push":
+                observed_timeouts.append(kwargs["timeout_seconds"])
+            return original_git_network(worktree, *args, **kwargs)
+
+        with patch.object(Integrator, "_git_network", side_effect=observe_timeout):
+            result = self.integrator(
+                push_main_to_upstream=True,
+                main_push_timeout_seconds=480,
+            ).run()
+
+        self.assertEqual((result.status, observed_timeouts), ("completed", [480]))
+
+    def test_push_timeout_that_landed_is_reverified_and_completes(self) -> None:
+        self.configure_origin()
+        original_git_network = Integrator._git_network
+
+        def timeout_after_landing(
+            worktree: Path,
+            *args: str,
+            **kwargs,
+        ) -> subprocess.CompletedProcess[str]:
+            if args[0] == "push":
+                pushed = Integrator._git(worktree, *args)
+                return subprocess.CompletedProcess(
+                    pushed.args,
+                    124,
+                    pushed.stdout,
+                    pushed.stderr + "\ngit push timed out after 300.0 seconds",
+                )
+            return original_git_network(worktree, *args, **kwargs)
+
+        with patch.object(
+            Integrator,
+            "_git_network",
+            side_effect=timeout_after_landing,
+        ):
+            result = self.integrator(push_main_to_upstream=True).run()
+
+        self.assertEqual(
+            (
+                result.status,
+                result.diagnostics["main_push"]["status"],
+                result.diagnostics["main_push"]["verification"],
+                git(self.repo, "rev-parse", "origin/main").stdout.strip(),
+            ),
+            (
+                "completed",
+                "pushed",
+                "remote-ref-match-after-timeout",
+                self.candidate_head,
+            ),
+        )
+
+    def test_push_timeout_with_failed_remote_verification_fails_closed(self) -> None:
+        self.configure_origin()
+
+        def timeout_network_command(
+            worktree: Path,
+            *args: str,
+            **kwargs,
+        ) -> subprocess.CompletedProcess[str]:
+            del worktree, kwargs
+            return subprocess.CompletedProcess(
+                ["git", *args],
+                124,
+                "",
+                f"git {args[0]} timed out",
+            )
+
+        with patch.object(
+            Integrator,
+            "_git_network",
+            side_effect=timeout_network_command,
+        ):
+            result = self.integrator(push_main_to_upstream=True).run()
+
+        self.assertEqual(
+            (
+                result.status,
+                result.reason,
+                result.diagnostics["main_push"]["verification"],
+            ),
+            ("failed", "main_push_failed", "fetch-failed-after-timeout"),
+        )
 
     def test_push_failure_is_recorded_without_rolling_back_main(self) -> None:
         remote = self.configure_origin()
