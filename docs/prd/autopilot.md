@@ -1065,13 +1065,26 @@ workspace-claim mismatches for one task and reason produce a
 `persistent_claim_mismatch` observation. A `task_restart` record whose restart
 budget is exhausted is already aggregate recurrence evidence and produces a
 `restart_budget_exhausted` observation immediately. These task-scoped
-diagnostics do not become project-global dispatch blockers. Run-result and
-claim-mismatch evidence is deduplicated by run ID. Every cycle journals one
+diagnostics are lifecycle-aware: the troubleshoot step indexes the complete
+normalized task snapshot already collected for the cycle and retains findings
+only for tasks that remain nonterminal. A task normalized to `Done`, or absent
+from that complete snapshot because it was superseded or removed, is omitted
+from the current findings. The step does not read the task source again or
+query it per finding. Snapshot absence, source errors, incomplete snapshots,
+and unknown or unresolvable task identities fail open so historical findings
+remain visible; source failures continue through the existing task-source
+diagnostic contract. These task-scoped diagnostics do not become
+project-global dispatch blockers. Run-result and claim-mismatch evidence is
+deduplicated by run ID. Every cycle journals one
 `autopilot_troubleshoot` record containing the bounded findings and appends
 `native_troubleshoot:observations=<COUNT>:blockers=<COUNT>` to its actions.
 Successful task completion clears prior failure and restart-exhaustion evidence
 for that task, and a successful workspace claim clears its prior claim-mismatch
-evidence, so resolved incidents do not remain persistent.
+evidence, so resolved incidents do not remain persistent. If lifecycle
+filtering removes a previously current observation, the next cycle's
+`autopilot_troubleshoot` record omits it and status retracts it from the current
+observation set while retaining the underlying run and lifecycle journal
+history.
 Status collection searches only the 100-record journal tail for the latest
 journaled troubleshoot record instead of rerunning detection. Findings only
 withhold new dispatch when classified as blockers; the current task-scoped

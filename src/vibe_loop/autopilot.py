@@ -6210,6 +6210,40 @@ class NativeTroubleshootCycleResult:
 NativeTroubleshootRunner = Callable[..., NativeTroubleshootCycleResult]
 
 
+def _nonterminal_troubleshoot_task_ids(
+    task_snapshot: TaskQueueStatus | None,
+) -> frozenset[str] | None:
+    """Index a complete normalized snapshot, or fail open when it is unusable."""
+
+    if (
+        task_snapshot is None
+        or task_snapshot.source_error
+        or task_snapshot.total != len(task_snapshot.source_tasks)
+    ):
+        return None
+
+    nonterminal: set[str] = set()
+    seen: set[str] = set()
+    for task in task_snapshot.source_tasks:
+        task_id = str(task.get("id") or task.get("task_id") or "")
+        if not task_id or task_id in seen:
+            return None
+        seen.add(task_id)
+        status = task.get("status")
+        if not isinstance(status, str) or status.casefold() != "done":
+            nonterminal.add(task_id)
+    return frozenset(nonterminal)
+
+
+def _troubleshoot_task_is_current(
+    task_id: str,
+    nonterminal_task_ids: frozenset[str] | None,
+) -> bool:
+    if nonterminal_task_ids is None or task_id.casefold() == "unknown":
+        return True
+    return task_id in nonterminal_task_ids
+
+
 def latest_native_troubleshoot(
     run_store: RunStore,
 ) -> NativeTroubleshootCycleResult:
@@ -6229,6 +6263,7 @@ def run_native_troubleshoot(
     *,
     cycle_id: str,
     run_store: RunStore,
+    task_snapshot: TaskQueueStatus | None = None,
     window_records: int = NATIVE_TROUBLESHOOT_WINDOW_RECORDS,
     recurrence_threshold: int = NATIVE_TROUBLESHOOT_RECURRENCE_THRESHOLD,
 ) -> NativeTroubleshootCycleResult:
@@ -6238,6 +6273,8 @@ def run_native_troubleshoot(
         raise ValueError("troubleshoot record window must be positive")
     if recurrence_threshold <= 0:
         raise ValueError("troubleshoot recurrence threshold must be positive")
+
+    nonterminal_task_ids = _nonterminal_troubleshoot_task_ids(task_snapshot)
 
     records = run_store.recent_records_matching(
         record_types=frozenset(
@@ -6291,7 +6328,9 @@ def run_native_troubleshoot(
     findings: list[NativeTroubleshootFinding] = []
     for (task_id, classification), run_ids in sorted(failures.items()):
         count = len(run_ids)
-        if count < recurrence_threshold:
+        if count < recurrence_threshold or not _troubleshoot_task_is_current(
+            task_id, nonterminal_task_ids
+        ):
             continue
         findings.append(
             NativeTroubleshootFinding(
@@ -6305,6 +6344,8 @@ def run_native_troubleshoot(
             )
         )
     for task_id, reason in sorted(exhausted_restarts.items()):
+        if not _troubleshoot_task_is_current(task_id, nonterminal_task_ids):
+            continue
         findings.append(
             NativeTroubleshootFinding(
                 kind="restart_budget_exhausted",
@@ -6318,7 +6359,9 @@ def run_native_troubleshoot(
         )
     for (task_id, reason), run_ids in sorted(claim_mismatches.items()):
         count = len(run_ids)
-        if count < recurrence_threshold:
+        if count < recurrence_threshold or not _troubleshoot_task_is_current(
+            task_id, nonterminal_task_ids
+        ):
             continue
         findings.append(
             NativeTroubleshootFinding(
@@ -7775,6 +7818,7 @@ def execute_autopilot_cycle(
     troubleshoot = native_troubleshoot_runner(
         cycle_id=cycle_id,
         run_store=run_store,
+        task_snapshot=status.queue,
     )
     run_store.append_record(troubleshoot.to_record(config.repo))
     actions.append(troubleshoot.action)

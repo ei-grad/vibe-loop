@@ -9618,10 +9618,130 @@ class AutopilotMaintenanceTests(unittest.TestCase):
             NATIVE_TROUBLESHOOT_RECURRENCE_THRESHOLD,
         )
 
+    def test_native_troubleshoot_filters_all_task_findings_by_lifecycle(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            store = RunStore(repo / "runs.jsonl")
+            for lifecycle in ("terminal", "absent", "current"):
+                for ordinal in range(NATIVE_TROUBLESHOOT_RECURRENCE_THRESHOLD):
+                    store.append_result(
+                        RunResult(
+                            run_id=f"failure-{lifecycle}-{ordinal}",
+                            task_id=f"FAIL-{lifecycle}",
+                            classification="failed",
+                            exit_code=1,
+                            log_path=repo / f"failure-{lifecycle}-{ordinal}.log",
+                            start_main="base",
+                            end_main="base",
+                        )
+                    )
+                    store.append_lifecycle_event(
+                        RunLifecycleEvent.workspace_claim_mismatch(
+                            run_id=f"claim-{lifecycle}-{ordinal}",
+                            task_id=f"CLAIM-{lifecycle}",
+                            reason="branch_worktree_mismatch",
+                            message="workspace claim refused",
+                        )
+                    )
+                store.append_lifecycle_event(
+                    RunLifecycleEvent.task_restart(
+                        run_id=f"restart-{lifecycle}",
+                        task_id=f"RESTART-{lifecycle}",
+                        restart_count=2,
+                        max_restarts=2,
+                        cooldown_seconds=0.0,
+                        reason="restart_budget_exhausted",
+                        exhausted=True,
+                        attempted_restart_count=3,
+                    )
+                )
+            source_tasks = tuple(
+                {"id": f"{kind}-{lifecycle}", "status": status}
+                for lifecycle, status in (("terminal", "Done"), ("current", "Next"))
+                for kind in ("FAIL", "RESTART", "CLAIM")
+            )
+
+            result = run_native_troubleshoot(
+                cycle_id="cycle-1",
+                run_store=store,
+                task_snapshot=TaskQueueStatus(
+                    total=len(source_tasks),
+                    source_tasks=source_tasks,
+                ),
+            )
+
+        self.assertEqual(
+            result.observations,
+            (
+                "recurring_task_failure:FAIL-current:failed",
+                "restart_budget_exhausted:RESTART-current",
+                "persistent_claim_mismatch:CLAIM-current:branch_worktree_mismatch",
+            ),
+        )
+
+    def test_native_troubleshoot_fails_open_for_unusable_task_lifecycle(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            store = RunStore(repo / "runs.jsonl")
+            for task_id in ("TASK-01", "unknown"):
+                for ordinal in range(NATIVE_TROUBLESHOOT_RECURRENCE_THRESHOLD):
+                    store.append_result(
+                        RunResult(
+                            run_id=f"{task_id}-{ordinal}",
+                            task_id=task_id,
+                            classification="failed",
+                            exit_code=1,
+                            log_path=repo / f"{task_id}-{ordinal}.log",
+                            start_main="base",
+                            end_main="base",
+                        )
+                    )
+
+            snapshots = (
+                None,
+                TaskQueueStatus(source_error="source unavailable"),
+                TaskQueueStatus(
+                    total=2,
+                    source_tasks=({"id": "TASK-01", "status": "Done"},),
+                ),
+                TaskQueueStatus(total=0),
+            )
+            results = tuple(
+                run_native_troubleshoot(
+                    cycle_id=f"cycle-{index}",
+                    run_store=store,
+                    task_snapshot=snapshot,
+                )
+                for index, snapshot in enumerate(snapshots)
+            )
+
+        for result in results[:3]:
+            self.assertEqual(
+                result.observations,
+                (
+                    "recurring_task_failure:TASK-01:failed",
+                    "recurring_task_failure:unknown:failed",
+                ),
+            )
+        self.assertEqual(
+            results[3].observations,
+            ("recurring_task_failure:unknown:failed",),
+        )
+
     def test_native_troubleshoot_surfaces_observations_in_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
-            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            configured_repo(
+                repo,
+                [
+                    ("TASK-01", "Next", "", "ready slice"),
+                    ("TASK-FAIL", "Next", "", "failing slice"),
+                ],
+            )
             config = load_config(repo)
             run_store = RunStore(config.state_path / "runs.jsonl")
             for ordinal in range(NATIVE_TROUBLESHOOT_RECURRENCE_THRESHOLD):
@@ -9678,6 +9798,57 @@ class AutopilotMaintenanceTests(unittest.TestCase):
             current_status.observations,
         )
 
+    def test_native_troubleshoot_retracts_terminal_observation_next_cycle(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-FAIL", "Next", "", "failing slice")])
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            for ordinal in range(NATIVE_TROUBLESHOOT_RECURRENCE_THRESHOLD):
+                run_store.append_result(
+                    RunResult(
+                        run_id=f"failure-{ordinal}",
+                        task_id="TASK-FAIL",
+                        classification="failed",
+                        exit_code=1,
+                        log_path=config.state_path / f"failure-{ordinal}.log",
+                        start_main="base",
+                        end_main="base",
+                    )
+                )
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                write_plan(repo, [("TASK-FAIL", "Done", "", "failing slice")])
+                run(repo, "git", "add", "PLAN.md")
+                run(repo, "git", "commit", "-m", "complete task")
+                return 0
+
+            first = run_autopilot(
+                config,
+                once=True,
+                launcher=launcher,
+                native_planning_runner=native_no_plan,
+            )
+            second = run_autopilot(
+                config,
+                once=True,
+                launcher=lambda *args, **kwargs: 0,
+                native_planning_runner=native_no_plan,
+            )
+            troubleshoot_records = [
+                record
+                for record in run_store.read_records()
+                if record.get("record_type") == AUTOPILOT_TROUBLESHOOT_RECORD_TYPE
+            ]
+
+        observation = "recurring_task_failure:TASK-FAIL:failed"
+        self.assertIn(observation, first.cycles[0].project_status.observations)
+        self.assertNotIn(observation, second.cycles[0].project_status.observations)
+        self.assertEqual(troubleshoot_records[0]["observations"], [observation])
+        self.assertEqual(troubleshoot_records[1]["observations"], [])
+
     def test_native_troubleshoot_restart_exhaustion_does_not_block_launch(
         self,
     ) -> None:
@@ -9733,10 +9904,10 @@ class AutopilotMaintenanceTests(unittest.TestCase):
             repo = Path(directory)
             configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
             config = load_config(repo)
-            calls: list[str] = []
+            calls: list[tuple[str, TaskQueueStatus]] = []
 
-            def troubleshoot_runner(*, cycle_id, run_store):
-                calls.append(cycle_id)
+            def troubleshoot_runner(*, cycle_id, run_store, task_snapshot):
+                calls.append((cycle_id, task_snapshot))
                 return NativeTroubleshootCycleResult(
                     cycle_id=cycle_id,
                     records_scanned=1,
@@ -9766,6 +9937,8 @@ class AutopilotMaintenanceTests(unittest.TestCase):
             )
 
         self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1].total, 1)
+        self.assertEqual(calls[0][1].source_tasks[0]["id"], "TASK-01")
         self.assertIn(
             "recurring_task_failure:TASK-09:failed",
             summary.cycles[0].project_status.observations,
