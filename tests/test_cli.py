@@ -236,6 +236,51 @@ class DirectUrlDistribution:
 
 
 class CliTests(unittest.TestCase):
+    def test_task_source_health_gates_write_cli_but_not_read_only_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            secret = "private-health-command-detail"
+            health_command = shlex.join(
+                [
+                    sys.executable,
+                    "-c",
+                    f"import sys; print({secret!r}); sys.exit(6)",
+                ]
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                "[task_source]\n"
+                'plan_path = "docs/PLAN.md"\n'
+                f"health = {toml_string(health_command)}\n",
+                encoding="utf-8",
+            )
+
+            for arguments in (
+                ["run", "TASK-01"],
+                ["run-next"],
+                ["run-until-done"],
+            ):
+                with self.subTest(command=arguments[0]):
+                    stdout = StringIO()
+                    stderr = StringIO()
+                    with redirect_stdout(stdout), redirect_stderr(stderr):
+                        exit_code = main([*arguments, "--repo", str(repo)])
+                    self.assertEqual(exit_code, 1)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertIn("task-source health check", stderr.getvalue())
+                    self.assertNotIn(secret, stderr.getvalue())
+                    self.assertNotIn(health_command, stderr.getvalue())
+
+            for arguments in (["tasks", "list"], ["tasks", "next"]):
+                with self.subTest(command=" ".join(arguments)):
+                    stdout = StringIO()
+                    stderr = StringIO()
+                    with redirect_stdout(stdout), redirect_stderr(stderr):
+                        exit_code = main([*arguments, "--repo", str(repo)])
+                    self.assertEqual(exit_code, 0)
+                    self.assertIn("TASK-01", stdout.getvalue())
+
     def test_run_dispatches_the_explicit_task_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

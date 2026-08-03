@@ -467,23 +467,37 @@ planning commands, but only when those commands are explicitly user-authored in
 `.vibe-loop.toml`.
 
 An external task-source backend may additionally define `task_source.health`.
-Every repository that configures the hook runs it independently on every cycle;
-a failing hook blocks that repository as `task_source_health_failed`, even when
-a sibling repository checks the same backend. The hook is operational metadata,
-not source selection, so it does not disable generated task-source discovery.
-Unlike general maintenance hooks, it receives the same validated project
-binding/runtime selector context and the same absent-identity boundary as the
-task-source adapters it checks. Ambient branch, worktree, fencing, and session
-variables are withheld unless the runtime explicitly supplies them.
+Its universal invocation, environment, bounding, redaction, and freshness
+contract is owned by
+[PRD-TSK-009](task-discovery.md#prd-tsk-009-task-source-health-admission).
+Every repository runs its own fresh cycle admission. Rejection journals
+`task_source_health_failed`, withholds stale-lock settlement, worktree
+disposition, every `run-until-done` child, configured planning hook, and native
+read-write planning author, and cannot be cleared by a prior cycle's success.
+
+When task-source health is the sole relevant blocker and the queue is below the
+planning-refill threshold, autopilot still runs native planning detection in
+explicit `analysis_only` mode. That mode may produce a plan/no-plan decision
+from read-only evidence but never requests, attempts, or starts the authoring
+worker, never re-reads for authored tasks, reports zero created tasks, and is
+not recorded as a planning launch, productive replenishment, or author. A later
+successful fresh check restores ordinary maintenance, planning, and dispatch
+admission without carrying the prior blocker forward.
 
 Acceptance must cover an `[autopilot]` config section, bounded command output,
 safe environment variables, command-result records, command redaction in status
 JSON, low-ready queue handling, and the rule that generated task-source
 profiles cannot introduce maintenance commands. An explicitly configured
 `planning_command` takes precedence over native planning. The health command
-runs even when another cycle blocker is already present. Human status reports
-the latest cycle's health failures beside its timestamped cycle summary and
-separately from current task-scoped dispatch blockers.
+runs even when another cycle blocker is already present, except that a
+task-source-health rejection withholds it at the universal admission boundary.
+Human status reports the latest cycle's health failures beside its timestamped
+cycle summary and separately from current task-scoped dispatch blockers.
+
+Acceptance must additionally cover task-source rejection before lock,
+worktree, planner, or child mutation; controlled command-result diagnostics;
+analysis-only decision and worker records; configured/native author
+withholding; author-count exclusion; and next-cycle restoration.
 
 A failed `task_source.activate` writes a bounded, redacted lifecycle diagnostic
 with the adapter exit status and stderr. The enclosing autopilot cycle reports

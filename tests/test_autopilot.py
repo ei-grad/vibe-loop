@@ -186,6 +186,7 @@ from vibe_loop.tasks import (
     DELIVERABLE_COLLISION_PRECISION,
     WITHHELD_ADAPTER_ENV,
     Task,
+    TaskSourceHealthResult,
 )
 from vibe_loop.workers import (
     KEEP_EVIDENCE_CHANGED,
@@ -8693,6 +8694,47 @@ class AutopilotIdleWaitTests(unittest.TestCase):
 
 
 class NativePlanningTests(unittest.TestCase):
+    def test_analysis_only_mode_never_launches_or_counts_an_author(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            status = collect_project_status(config)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            result = run_native_planning(
+                config,
+                cycle_id="cycle-analysis-only",
+                status=status,
+                min_ready=2,
+                run_store=run_store,
+                analysis_runner=lambda prompt, output_path: {
+                    "should_plan": True,
+                    "reason": "queue low",
+                    "objective": "add one task",
+                },
+                worker_launcher=lambda *args, **kwargs: (_ for _ in ()).throw(
+                    AssertionError("analysis-only mode must not launch an author")
+                ),
+                analysis_only=True,
+            )
+            records = run_store.read_records()
+
+        self.assertEqual(result.decision.mode, "analysis_only")
+        self.assertEqual(result.worker.status, "skipped_analysis_only")
+        self.assertTrue(result.worker.analysis_only)
+        self.assertFalse(result.worker.requested)
+        self.assertFalse(result.worker.attempted)
+        self.assertFalse(result.worker.started)
+        self.assertEqual(result.worker.created_count, 0)
+        worker_record = next(
+            record
+            for record in records
+            if record["record_type"] == AUTOPILOT_PLANNING_WORKER_RECORD_TYPE
+        )
+        self.assertEqual(worker_record["stage"], "analysis_only")
+        self.assertTrue(worker_record["analysis_only"])
+
     def test_mixed_command_providers_override_unavailable_usage_provider(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -9435,6 +9477,27 @@ class AutopilotMaintenanceTests(unittest.TestCase):
 
         return runner, calls
 
+    def _stub_task_source_health(self, exit_code: int):
+        calls: list[dict[str, object]] = []
+
+        def runner(repo, config, *, runtime_context):
+            calls.append(
+                {
+                    "repo": repo,
+                    "timeout": config.command_timeout_seconds,
+                    "runtime_context": dict(runtime_context),
+                }
+            )
+            return TaskSourceHealthResult(
+                configured=True,
+                succeeded=exit_code == 0,
+                reason="healthy" if exit_code == 0 else "nonzero_exit",
+                exit_code=exit_code,
+                duration_seconds=0.0,
+            )
+
+        return runner, calls
+
     def _command_records(self, config) -> list[dict[str, object]]:
         records = RunStore(config.state_path / "runs.jsonl").read_records()
         return [
@@ -10056,12 +10119,12 @@ class AutopilotMaintenanceTests(unittest.TestCase):
                     repo,
                     runtime_context={"LOOPYARD_PROJECT": name},
                 )
-                runner, calls = self._stub_runner({"task_source_health": 11})
+                health_runner, calls = self._stub_task_source_health(11)
                 summary = run_autopilot(
                     config,
                     once=True,
                     launcher=lambda command, **kwargs: launched.append(command) or 0,
-                    maintenance_runner=runner,
+                    task_source_health_runner=health_runner,
                 )
                 cycles.append(summary.cycles[0])
                 calls_by_board.append(calls)
@@ -10075,11 +10138,14 @@ class AutopilotMaintenanceTests(unittest.TestCase):
         )
         self.assertEqual(launched, [])
         self.assertEqual(
-            [[call["kind"] for call in calls] for calls in calls_by_board],
-            [["task_source_health"], ["task_source_health"]],
+            [len(calls) for calls in calls_by_board],
+            [1, 1],
         )
         self.assertEqual(
-            [calls[0]["env_extra"]["LOOPYARD_PROJECT"] for calls in calls_by_board],
+            [
+                calls[0]["runtime_context"]["LOOPYARD_PROJECT"]
+                for calls in calls_by_board
+            ],
             ["alpha", "beta"],
         )
         self.assertEqual(
@@ -10087,14 +10153,130 @@ class AutopilotMaintenanceTests(unittest.TestCase):
             [37.0, 37.0],
         )
 
+    def test_task_source_health_failure_runs_native_analysis_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=(
+                    '[task_source]\nhealth = "backend-health"\n'
+                    '[autopilot]\nhealth_command = "general-health"\n'
+                    'planning_command = "write-planner"\n'
+                ),
+            )
+            config = load_config(repo)
+            maintenance, calls = self._stub_runner({})
+            health_runner, health_calls = self._stub_task_source_health(9)
+            planning_calls: list[dict[str, object]] = []
+            launched: list[object] = []
+
+            def native_planning(*args, **kwargs):
+                planning_calls.append(dict(kwargs))
+                return NativePlanningCycleResult(
+                    decision=NativePlanningDecision(
+                        cycle_id=kwargs["cycle_id"],
+                        runnable=1,
+                        min_ready=2,
+                        status="decided",
+                        should_plan=True,
+                        reason="queue is shallow",
+                        objective="author another task",
+                        agent_invoked=True,
+                        mode="analysis_only",
+                    ),
+                    worker=NativePlanningWorkerResult(
+                        cycle_id=kwargs["cycle_id"],
+                        phase="terminal",
+                        status="skipped_analysis_only",
+                        requested=False,
+                        attempted=False,
+                        started=False,
+                        pid=None,
+                        exit_code=None,
+                        log_path=None,
+                        runnable_before=1,
+                        runnable_after=1,
+                        analysis_only=True,
+                    ),
+                )
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                min_ready=2,
+                launcher=lambda command, **kwargs: launched.append(command) or 0,
+                maintenance_runner=maintenance,
+                task_source_health_runner=health_runner,
+                worktree_disposition_runner=lambda *args, **kwargs: (
+                    _ for _ in ()
+                ).throw(
+                    AssertionError("health rejection must withhold disposition work")
+                ),
+                native_planning_runner=native_planning,
+            )
+
+        cycle = summary.cycles[0]
+        self.assertEqual(cycle.status, "blocked")
+        self.assertEqual(cycle.blockers, ("task_source_health_failed",))
+        self.assertEqual(launched, [])
+        self.assertEqual(calls, [])
+        self.assertEqual(len(health_calls), 1)
+        self.assertEqual(len(planning_calls), 1)
+        self.assertTrue(planning_calls[0]["analysis_only"])
+        self.assertIn("native_planning_analysis_only", cycle.actions)
+        self.assertIn("native_planning_author_withheld", cycle.actions)
+        self.assertIn(
+            "autopilot_health_withheld:task_source_health_failed", cycle.actions
+        )
+
+    def test_fresh_healthy_cycle_clears_task_source_health_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml='[task_source]\nhealth = "backend-health"\n',
+            )
+            config = load_config(repo)
+            health_calls = 0
+            launched: list[object] = []
+
+            def health_runner(repo, task_source, *, runtime_context):
+                nonlocal health_calls
+                health_calls += 1
+                exit_code = 8 if health_calls == 1 else 0
+                return TaskSourceHealthResult(
+                    configured=True,
+                    succeeded=exit_code == 0,
+                    reason="nonzero_exit" if exit_code else "healthy",
+                    exit_code=exit_code,
+                    duration_seconds=0.0,
+                )
+
+            summary = run_autopilot(
+                config,
+                max_cycles=2,
+                interval=60,
+                sleep=lambda _seconds: None,
+                launcher=lambda command, **kwargs: launched.append(command) or 0,
+                task_source_health_runner=health_runner,
+            )
+
+        self.assertEqual(len(summary.cycles), 2)
+        self.assertIn("task_source_health_failed", summary.cycles[0].blockers)
+        self.assertNotIn("task_source_health_failed", summary.cycles[1].blockers)
+        self.assertEqual(len(launched), 1)
+
     def test_task_source_health_withholds_ambient_run_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             health_script = repo / "health.py"
+            observed = repo / ".vibe-loop" / "health-observed.json"
             health_script.write_text(
-                "import json, os\n"
+                "import json, os, pathlib, sys\n"
                 f"names = {sorted(WITHHELD_ADAPTER_ENV)!r}\n"
-                "print(json.dumps({\n"
+                "pathlib.Path(sys.argv[1]).write_text(json.dumps({\n"
                 "    'present': [name for name in names if name in os.environ],\n"
                 "    'selector': os.environ.get('PROJECT_SELECTOR'),\n"
                 "}))\n",
@@ -10105,7 +10287,7 @@ class AutopilotMaintenanceTests(unittest.TestCase):
                 [("TASK-01", "Next", "", "ready slice")],
                 extra_toml=(
                     "[task_source]\n"
-                    f"health = {json.dumps(shlex.join([sys.executable, str(health_script)]))}\n"
+                    f"health = {json.dumps(shlex.join([sys.executable, str(health_script), str(observed)]))}\n"
                 ),
             )
             run(repo, "git", "add", "health.py")
@@ -10130,11 +10312,15 @@ class AutopilotMaintenanceTests(unittest.TestCase):
                 if record.get("record_type") == AUTOPILOT_COMMAND_RESULT_RECORD_TYPE
                 and record.get("kind") == "task_source_health"
             )
-            payload = json.loads(command_record["output"])
+            payload = json.loads(observed.read_text(encoding="utf-8"))
 
         self.assertEqual(summary.cycles[0].status, "idle")
         self.assertEqual(payload["present"], [])
         self.assertEqual(payload["selector"], "shared-backend")
+        self.assertEqual(command_record["output"], "")
+        self.assertEqual(
+            command_record["diagnostic"], "task-source health check passed"
+        )
 
     def test_activation_failure_record_becomes_visible_cycle_blocker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -257,3 +257,36 @@ complete fingerprint preservation, nullable editable-install classification,
 unknown-field omission, conditional fenced-reset capability, fixed doctor
 projection, command and stream secrecy, complete/park/capabilities command
 redaction, and comparison against the real Loopyard producer.
+
+## PRD-TSK-009 Task-Source Health Admission
+
+An explicitly configured `task_source.health` command is the universal runtime
+admission check for write-capable dispatch. Every `run`, `run-next`, and
+`run-until-done` serial, parallel, retry, and recovery attempt runs a fresh
+check before task lookup or selection and before task, scheduler, or backend
+lock acquisition, task activation, run provenance, worker launch, or other
+dispatch mutation. A success applies only to the immediately admitted attempt;
+it is never cached across retries, recovery attempts, tasks, or autopilot
+cycles. An absent command preserves existing behavior.
+
+The subprocess uses `task_source.command_timeout_seconds`, retains at most 64
+KiB of combined output, and terminates its owned process group on timeout or
+overflow. It receives validated project-selector context but no run, task,
+selection, session, thread, branch, worktree, lock-owner, fencing, or other
+per-dispatch identity or capability context from either ambient environment or
+runtime context. Neither command text nor captured output is exposed. Durable
+and user-facing results contain only bounded categorical state, exit status,
+timing, timeout/overflow flags, and a controlled diagnostic without host paths,
+credentials, private adapter metadata, or subprocess output.
+
+Read-only task discovery and troubleshooting remain outside admission:
+`tasks`, `tasks next`, `tasks list`, inspect/tree views, probes, queue/status
+collection, doctor, and specs diagnostics neither invoke nor depend on health.
+Autopilot's rejection journal and analysis-only planning behavior are owned by
+[PRD-AUT-005](autopilot.md#prd-aut-005-configured-maintenance-hooks).
+
+Acceptance must cover every dispatch family and recovery path; ordering before
+selection, locks, status transitions, provenance, and workers; ambient and
+runtime identity withholding; timeout, output, and diagnostic bounds; fresh
+checks after failures and retries; ungated read-only commands; and restoration
+after a later successful check.

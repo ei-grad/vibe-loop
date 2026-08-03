@@ -64,10 +64,11 @@ operator-facing map of the shipped behavior, not a second contract account.
 Each supervisor cycle provides these behaviors without requiring
 repository-specific maintenance commands:
 
-1. It collects queue, worker, lock, git, and supervisor status; performs only
-   evidence-gated stale-lock settlement; refreshes required upstream-sync
-   evidence; and runs configured health and task-source-health hooks as
-   additional preflight gates.
+1. It runs the configured task-source-health admission before lock, worktree,
+   planner, or child mutation, then collects queue, worker, lock, git, and
+   supervisor status; performs only admitted evidence-gated stale-lock
+   settlement; refreshes required upstream-sync evidence; and runs the general
+   configured health hook.
 2. It inspects worktree ownership, liveness, dirty state, and merge state. The
    default `report-only` policy records candidates without mutation. Explicit
    `reap` uses a reasoned decision from the read-only analysis agent, while code
@@ -81,7 +82,10 @@ repository-specific maintenance commands:
    Otherwise the read-only analysis agent returns a structured plan-or-no-plan
    decision from bounded evidence. Only a separate supervised read-write worker
    may author tasks, invalid decisions fail closed, and the supervisor re-reads
-   rather than edits the authoritative task source.
+   rather than edits the authoritative task source. If task-source health is the
+   sole blocker, the supervisor runs only explicit analysis-only detection and
+   withholds both configured and native authors; that pass does not count as
+   queue replenishment.
 5. It re-collects status, honors blockers, dispatch floors, provider pauses, and
    planning budgets, then observes an existing child or launches
    `run-until-done`. A configured summary hook runs only in that observe/launch

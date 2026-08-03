@@ -132,9 +132,10 @@ from vibe_loop.tasks import (
     DELIVERABLE_COLLISION_PATH_MAX_BYTES,
     DELIVERABLE_COLLISION_PRECISION,
     DELIVERABLE_COLLISION_WARNING_MAX_BYTES,
-    WITHHELD_ADAPTER_ENV,
     Task,
-    build_adapter_environment,
+    TaskSourceHealthResult,
+    run_task_source_health,
+    task_source_health_environment,
 )
 from vibe_loop.telemetry import (
     normalize_model_label,
@@ -5326,7 +5327,7 @@ class MaintenanceCommandResult:
         return self.exit_code == 0
 
     def to_record(self, repo: Path) -> dict[str, object]:
-        return {
+        record = {
             "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
             "record_type": AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
             "occurred_at": utc_now_iso(),
@@ -5339,9 +5340,41 @@ class MaintenanceCommandResult:
             "output_truncated": self.output_truncated,
             "timed_out": self.timed_out,
         }
+        if self.kind == TASK_SOURCE_HEALTH_COMMAND_KIND:
+            record["output"] = ""
+            record["diagnostic"] = (
+                "task-source health check passed"
+                if self.succeeded
+                else "task-source health check failed"
+            )
+        return record
 
 
 MaintenanceRunner = Callable[..., MaintenanceCommandResult]
+TaskSourceHealthRunner = Callable[..., TaskSourceHealthResult]
+
+
+def task_source_health_cycle_record(
+    result: TaskSourceHealthResult,
+    *,
+    repo: Path,
+    cycle_id: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+        "record_type": AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
+        "occurred_at": utc_now_iso(),
+        "repo": str(repo),
+        "cycle_id": cycle_id,
+        "kind": TASK_SOURCE_HEALTH_COMMAND_KIND,
+        "exit_code": result.exit_code,
+        "duration_seconds": round(result.duration_seconds, 6),
+        "output": "",
+        "output_truncated": result.output_limit_exceeded,
+        "timed_out": result.timed_out,
+        "reason": result.reason,
+        "diagnostic": result.diagnostic,
+    }
 
 
 def maintenance_command_env(
@@ -5434,7 +5467,7 @@ def run_maintenance_command(
     """
 
     if kind == TASK_SOURCE_HEALTH_COMMAND_KIND:
-        env = build_adapter_environment(env_extra)
+        env = task_source_health_environment(env_extra)
     else:
         env = os.environ.copy()
         env.update(env_extra)
@@ -6643,6 +6676,7 @@ class NativePlanningDecision:
     reason: str
     objective: str
     agent_invoked: bool
+    mode: str = "authoring_enabled"
     agent_error: str = ""
     agent_error_kind: str = ""
     provider_limit_reset_text: str = ""
@@ -6667,6 +6701,7 @@ class NativePlanningDecision:
             "reason": self.reason,
             "objective": self.objective,
             "agent_invoked": self.agent_invoked,
+            "mode": self.mode,
             "agent_error": self.agent_error,
             "agent_error_kind": self.agent_error_kind,
             "provider_limit_reset_text": self.provider_limit_reset_text,
@@ -6691,6 +6726,7 @@ class NativePlanningWorkerResult:
     timed_out: bool = False
     task_source_error: str = ""
     error: str = ""
+    analysis_only: bool = False
     # Task identities that appeared in the authoritative task source across the
     # launch, including tasks claimed before the post-launch snapshot.
     # ``None`` means the post-launch snapshot was unreadable, so nothing can be
@@ -6708,7 +6744,7 @@ class NativePlanningWorkerResult:
             "occurred_at": utc_now_iso(),
             "repo": str(repo),
             "cycle_id": self.cycle_id,
-            "stage": "read_write_authoring",
+            "stage": "analysis_only" if self.analysis_only else "read_write_authoring",
             "phase": self.phase,
             "status": self.status,
             "requested": self.requested,
@@ -6723,6 +6759,7 @@ class NativePlanningWorkerResult:
             "timed_out": self.timed_out,
             "task_source_error": self.task_source_error,
             "error": self.error,
+            "analysis_only": self.analysis_only,
             "created_task_ids": list(self.created_task_ids),
             "created_count": self.created_count,
         }
@@ -7364,6 +7401,7 @@ def run_native_planning(
     run_store: RunStore,
     analysis_runner: AnalysisRunner | None = None,
     worker_launcher: PlanningWorkerLauncher = launch_native_planning_worker,
+    analysis_only: bool = False,
 ) -> NativePlanningCycleResult:
     planning_started = time_module.monotonic()
     analysis_vibe_runner = VibeRunner(config) if analysis_runner is None else None
@@ -7438,6 +7476,7 @@ def run_native_planning(
         reason=reason,
         objective=objective,
         agent_invoked=True,
+        mode="analysis_only" if analysis_only else "authoring_enabled",
         agent_error=agent_error,
         agent_error_kind=agent_error_kind,
         provider_limit_reset_text=provider_limit_reset_text,
@@ -7445,14 +7484,20 @@ def run_native_planning(
     )
     run_store.append_record(decision.to_record(config.repo))
 
-    if agent_error or not should_plan:
+    if agent_error or not should_plan or analysis_only:
         worker = NativePlanningWorkerResult(
             cycle_id=cycle_id,
             phase="terminal",
             status=(
                 "skipped_provider_limit"
                 if provider_limit_pause is not None
-                else ("skipped_analysis_error" if agent_error else "skipped_not_needed")
+                else (
+                    "skipped_analysis_error"
+                    if agent_error
+                    else "skipped_analysis_only"
+                    if analysis_only
+                    else "skipped_not_needed"
+                )
             ),
             requested=False,
             attempted=False,
@@ -7463,6 +7508,7 @@ def run_native_planning(
             runnable_before=status.queue.runnable,
             runnable_after=status.queue.runnable,
             error=agent_error,
+            analysis_only=analysis_only,
         )
         run_store.append_record(worker.to_record(config.repo))
         model_provider, model_id, attribution_diagnostics = planning_runtime_identity(
@@ -7657,6 +7703,7 @@ def execute_autopilot_cycle(
     launcher: RunUntilDoneLauncher,
     run_store: RunStore,
     maintenance_runner: MaintenanceRunner = run_maintenance_command,
+    task_source_health_runner: TaskSourceHealthRunner = run_task_source_health,
     worktree_disposition_runner: WorktreeDispositionRunner = run_worktree_disposition,
     disk_health_runner: DiskHealthRunner = run_disk_health,
     cycle_summary_runner: CycleSummaryRunner = run_cycle_summary,
@@ -7670,9 +7717,28 @@ def execute_autopilot_cycle(
     min_ready = require_positive_min_ready(min_ready)
     dispatch_min_ready = require_positive_dispatch_min_ready(dispatch_min_ready)
     cycle_started_at = utc_now_iso()
+    actions: list[str] = []
+    task_source_health = task_source_health_runner(
+        config.repo,
+        config.task_source,
+        runtime_context=config.runtime_environment,
+    )
+    if task_source_health.configured:
+        run_store.append_record(
+            task_source_health_cycle_record(
+                task_source_health,
+                repo=config.repo,
+                cycle_id=cycle_id,
+            )
+        )
+        actions.append(
+            f"ran_task_source_health_command:exit={task_source_health.exit_code}"
+        )
+    task_source_health_failed = not task_source_health.succeeded
+    if task_source_health_failed:
+        actions.append("task_source_health_failed")
     status = collect_project_status(config, process_exists=process_exists)
     runnable = status.queue.runnable
-    actions: list[str] = []
     child_pid: int | None = None
     child_log: Path | None = None
     cycle_reason = ""
@@ -7685,14 +7751,18 @@ def execute_autopilot_cycle(
     # Missing worker processes are normal after a runtime-owned terminal report.
     # Cleanup is eligible only when the run itself is durably terminal or its
     # exact runtime supervisor identity is verified gone.
-    cleanup_candidates = tuple(
-        lock
-        for lock in status.stale_locks
-        if lock.run_proven_finished
-        and (
-            lock.stale_reason == "missing_process"
-            or (lock.stale_reason == "result_recorded" and lock.settlement_pending)
+    cleanup_candidates = (
+        tuple(
+            lock
+            for lock in status.stale_locks
+            if lock.run_proven_finished
+            and (
+                lock.stale_reason == "missing_process"
+                or (lock.stale_reason == "result_recorded" and lock.settlement_pending)
+            )
         )
+        if not task_source_health_failed
+        else ()
     )
     if cleanup_candidates:
         lock_manager = build_lock_manager(
@@ -7770,20 +7840,23 @@ def execute_autopilot_cycle(
 
     status = apply_fresh_upstream_sync(status, record_action=True)
 
-    disposition = worktree_disposition_runner(
-        config,
-        cycle_id=cycle_id,
-        run_store=run_store,
-        process_exists=process_exists,
-    )
-    run_store.append_record(disposition.to_record(config.repo))
-    actions.append(f"worktree_disposition_policy:{disposition.policy}")
-    actions.append(f"worktree_disposition_candidates:{disposition.candidates}")
-    actions.append(f"reaped_worktrees:{disposition.reaped}")
-    if disposition.errors:
-        actions.append(f"worktree_reap_errors:{disposition.errors}")
-    if disposition.agent_error:
-        actions.append("worktree_disposition_agent_error")
+    if task_source_health_failed:
+        actions.append("worktree_disposition_withheld:task_source_health_failed")
+    else:
+        disposition = worktree_disposition_runner(
+            config,
+            cycle_id=cycle_id,
+            run_store=run_store,
+            process_exists=process_exists,
+        )
+        run_store.append_record(disposition.to_record(config.repo))
+        actions.append(f"worktree_disposition_policy:{disposition.policy}")
+        actions.append(f"worktree_disposition_candidates:{disposition.candidates}")
+        actions.append(f"reaped_worktrees:{disposition.reaped}")
+        if disposition.errors:
+            actions.append(f"worktree_reap_errors:{disposition.errors}")
+        if disposition.agent_error:
+            actions.append("worktree_disposition_agent_error")
 
     disk_health = disk_health_runner(config, cycle_id=cycle_id)
     status = apply_fresh_upstream_sync(
@@ -7880,9 +7953,6 @@ def execute_autopilot_cycle(
         command_environment = maintenance_command_env(
             config, kind=kind, cycle_id=cycle_id, runnable=runnable
         )
-        if kind == TASK_SOURCE_HEALTH_COMMAND_KIND:
-            for name in WITHHELD_ADAPTER_ENV:
-                command_environment.pop(name, None)
         if runtime_context is not None:
             command_environment.update(runtime_context)
         result = maintenance_runner(
@@ -7900,20 +7970,41 @@ def execute_autopilot_cycle(
         actions.append(f"ran_{kind}_command:exit={result.exit_code}")
         return result
 
-    health = run_maintenance("health")
+    health = None if task_source_health_failed else run_maintenance("health")
+    if task_source_health_failed and config.autopilot.health_command:
+        actions.append("autopilot_health_withheld:task_source_health_failed")
     if health is not None and not health.succeeded:
         blocker_list.append("autopilot_health_failed")
-    task_source_health = run_maintenance(
-        TASK_SOURCE_HEALTH_COMMAND_KIND,
-        command_override=config.task_source.health_command,
-        runtime_context=config.runtime_environment,
-        timeout_override=config.task_source.command_timeout_seconds,
-    )
-    if task_source_health is not None and not task_source_health.succeeded:
+    if task_source_health_failed:
         blocker_list.append("task_source_health_failed")
 
     blockers = tuple(blocker_list)
     blockers_checked_after_planning = False
+    if blockers == ("task_source_health_failed",) and runnable < min_ready:
+        native_planning = native_planning_runner(
+            config,
+            cycle_id=cycle_id,
+            status=status,
+            min_ready=min_ready,
+            run_store=run_store,
+            analysis_only=True,
+        )
+        actions.append("native_planning_analysis_only")
+        if native_planning.decision.provider_limit:
+            planning_provider_limit_pause = (
+                native_planning.decision.provider_limit_pause_seconds
+            )
+            actions.append(
+                f"{NATIVE_PLANNING_PROVIDER_LIMIT_ACTION}:"
+                f"{planning_provider_limit_pause:.0f}s"
+            )
+        elif native_planning.decision.agent_error:
+            actions.append("native_planning_analysis_error")
+        elif native_planning.decision.should_plan:
+            actions.append("native_planning_decision:plan_analysis_only")
+        else:
+            actions.append("native_planning_decision:no_plan_analysis_only")
+        actions.append("native_planning_author_withheld")
     if not blockers and runnable < min_ready:
         active_conflict_workers = active_conflict_worker_count(status.workers)
         planning = run_maintenance("planning")
@@ -8919,6 +9010,7 @@ def run_autopilot(
     sleep: Sleep | None = None,
     launcher: RunUntilDoneLauncher | None = None,
     maintenance_runner: MaintenanceRunner = run_maintenance_command,
+    task_source_health_runner: TaskSourceHealthRunner = run_task_source_health,
     worktree_disposition_runner: WorktreeDispositionRunner = run_worktree_disposition,
     disk_health_runner: DiskHealthRunner = run_disk_health,
     cycle_summary_runner: CycleSummaryRunner = run_cycle_summary,
@@ -9189,6 +9281,7 @@ def run_autopilot(
                 launcher=launch,
                 run_store=run_store,
                 maintenance_runner=maintenance_runner,
+                task_source_health_runner=task_source_health_runner,
                 worktree_disposition_runner=worktree_disposition_runner,
                 disk_health_runner=disk_health_runner,
                 cycle_summary_runner=cycle_summary_runner,

@@ -182,7 +182,9 @@ from vibe_loop.tasks import (
     DELIVERABLE_COLLISION_LIMIT,
     Task,
     TaskSource,
+    TaskSourceHealthError,
     build_task_source,
+    run_task_source_health,
     runnable_tasks_from_snapshot,
     task_deliverable_path_collisions,
     task_source_error_diagnostics,
@@ -1857,6 +1859,15 @@ class VibeRunner:
             config.orchestration.reviewer_concurrency_budget
         )
 
+    def require_task_source_health(self) -> None:
+        result = run_task_source_health(
+            self.config.repo,
+            self.config.task_source,
+            runtime_context=self.config.runtime_environment,
+        )
+        if not result.succeeded:
+            raise TaskSourceHealthError(result)
+
     @property
     def lock_manager(self) -> LockManager:
         if self._lock_manager is None:
@@ -1895,6 +1906,10 @@ class VibeRunner:
         return self.list_candidates_from_snapshot(
             self.source.list_tasks(), exclude=exclude
         )
+
+    def admitted_candidates(self, exclude: set[str] | None = None) -> list[Task]:
+        self.require_task_source_health()
+        return self.list_candidates(exclude=exclude)
 
     def list_candidates_from_snapshot(
         self,
@@ -5014,7 +5029,7 @@ class VibeRunner:
         restart_counts: dict[str, int] | None = None,
     ) -> RunResult | None:
         require_project_binding(self.config)
-        candidates = self.list_candidates(exclude=exclude)
+        candidates = self.admitted_candidates(exclude=exclude)
         if not candidates:
             return None
         self.ensure_spec_execution_gate()
@@ -5064,6 +5079,7 @@ class VibeRunner:
             )
 
     def run_task_id(self, task_id: str) -> RunResult:
+        self.require_task_source_health()
         require_project_binding(self.config)
         tasks = self.source.list_tasks()
         task = next((task for task in tasks if task.task_id == task_id), None)
@@ -5142,6 +5158,7 @@ class VibeRunner:
     ) -> list[RunResult]:
         if jobs < 1:
             raise ValueError("run-until-done --jobs must be at least 1")
+        self.require_task_source_health()
         require_project_binding(self.config)
         supervisor_pid = os.getpid()
         supervisor_identity = read_process_node(supervisor_pid)
@@ -5308,6 +5325,7 @@ class VibeRunner:
         continue_on_failure: bool = False,
         max_tasks: int = 0,
     ) -> list[RunResult]:
+        self.require_task_source_health()
         results: list[RunResult] = []
         skipped: set[str] = set()
         # Completed tasks that remain runnable (multi-slice work). They are
@@ -5444,6 +5462,7 @@ class VibeRunner:
         jobs: int,
         max_tasks: int = 0,
     ) -> list[RunResult]:
+        self.require_task_source_health()
         results: list[RunResult] = []
         skipped: set[str] = set()
         transient_retries: dict[str, int] = {}
@@ -5506,7 +5525,7 @@ class VibeRunner:
                         for task_id, ready_at in retry_ready_at.items()
                         if ready_at > now
                     }
-                    candidates = self.list_candidates(
+                    candidates = self.admitted_candidates(
                         exclude=skipped | set(scheduled) | cooling_down
                     )
                     candidates = filter_scheduled_conflicts(
@@ -5584,7 +5603,7 @@ class VibeRunner:
                             for task_id, ready_at in retry_ready_at.items()
                             if ready_at > now
                         }
-                        candidates = self.list_candidates(
+                        candidates = self.admitted_candidates(
                             exclude=skipped | set(scheduled) | cooling_down
                         )
                         candidates = filter_scheduled_conflicts(
@@ -6013,6 +6032,7 @@ class VibeRunner:
         attempt: int,
         max_attempts: int,
     ) -> RunResult | None:
+        self.require_task_source_health()
         recovery = next(
             (
                 context
@@ -6038,6 +6058,7 @@ class VibeRunner:
         self,
         recovery: RecoveryContext,
     ) -> RunResult | None:
+        self.require_task_source_health()
         try:
             task = self.source.probe(recovery.task_id)
         except (subprocess.SubprocessError, OSError, ValueError) as exc:

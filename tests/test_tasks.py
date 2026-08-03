@@ -25,6 +25,7 @@ from vibe_loop.tasks import (
     build_task_source,
     run_json_command,
     run_reset_command,
+    run_task_source_health,
     runnable_tasks,
     task_deliverable_path_collisions,
     task_from_mapping,
@@ -45,6 +46,101 @@ PLAN = """# Plan
 | DEMO-04 | P0 | Planned | DEMO-01 | Planned task. | Works. | Not started. |
 | DEMO-05 | P0 | Gated | DEMO-01 | Gated task. | Works. | Gated. |
 """
+
+
+class TaskSourceHealthTests(unittest.TestCase):
+    def test_health_is_bounded_and_receives_no_dispatch_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            observed = repo / "observed.json"
+            script = repo / "health.py"
+            script.write_text(
+                "import json, os, pathlib, sys\n"
+                "pathlib.Path(sys.argv[1]).write_text(json.dumps({\n"
+                "  'selector': os.environ.get('PROJECT_SELECTOR'),\n"
+                "  'run': os.environ.get('VIBE_LOOP_RUN_ID'),\n"
+                "  'task': os.environ.get('SELECTED_TASK_ID'),\n"
+                "  'thread': os.environ.get('CODEX_THREAD_ID'),\n"
+                "}))\n",
+                encoding="utf-8",
+            )
+            command = shlex.join([sys.executable, str(script), str(observed)])
+            config = TaskSourceConfig(
+                health_command=command,
+                command_timeout_seconds=1.0,
+            )
+            ambient = {
+                "VIBE_LOOP_RUN_ID": "run-secret",
+                "SELECTED_TASK_ID": "task-secret",
+                "CODEX_THREAD_ID": "thread-secret",
+            }
+            with mock.patch.dict(os.environ, ambient, clear=False):
+                result = run_task_source_health(
+                    repo,
+                    config,
+                    runtime_context={
+                        "PROJECT_SELECTOR": "board-alpha",
+                        "VIBE_LOOP_TASK_ID": "task-runtime-secret",
+                    },
+                )
+            payload = json.loads(observed.read_text(encoding="utf-8"))
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(payload["selector"], "board-alpha")
+        self.assertIsNone(payload["run"])
+        self.assertIsNone(payload["task"])
+        self.assertIsNone(payload["thread"])
+
+    def test_health_failure_exposes_only_a_controlled_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            secret = "private-token-and-host-path"
+            config = TaskSourceConfig(
+                health_command=shlex.join(
+                    [
+                        sys.executable,
+                        "-c",
+                        f"import sys; print({secret!r}); sys.exit(7)",
+                    ]
+                ),
+                command_timeout_seconds=1.0,
+            )
+
+            result = run_task_source_health(Path(directory), config)
+            record = result.to_record()
+
+        self.assertFalse(result.succeeded)
+        self.assertEqual(result.reason, "nonzero_exit")
+        self.assertEqual(result.exit_code, 7)
+        self.assertNotIn(secret, json.dumps(record))
+        self.assertNotIn("command", record)
+
+    def test_health_enforces_timeout_and_output_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            timeout = run_task_source_health(
+                repo,
+                TaskSourceConfig(
+                    health_command=shlex.join(
+                        [sys.executable, "-c", "import time; time.sleep(5)"]
+                    ),
+                    command_timeout_seconds=0.05,
+                ),
+            )
+            overflow = run_task_source_health(
+                repo,
+                TaskSourceConfig(
+                    health_command=shlex.join(
+                        [sys.executable, "-c", "print('x' * 10000)"]
+                    ),
+                    command_timeout_seconds=1.0,
+                ),
+                output_limit=128,
+            )
+
+        self.assertTrue(timeout.timed_out)
+        self.assertEqual(timeout.reason, "command_timeout")
+        self.assertTrue(overflow.output_limit_exceeded)
+        self.assertEqual(overflow.reason, "output_limit_exceeded")
 
 
 def planning_warning(

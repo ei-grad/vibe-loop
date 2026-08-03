@@ -7,6 +7,7 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Iterable, Mapping, Sequence
@@ -37,6 +38,7 @@ TASK_SOURCE_ERROR_TRUNCATION_MARKER = "[truncated] "
 TASK_SOURCE_CAPABILITIES_STREAM_LIMIT = 64 * 1024
 TASK_SOURCE_CAPABILITIES_STRING_LIMIT = 256
 TASK_SOURCE_CAPABILITIES_LIST_LIMIT = 256
+TASK_SOURCE_HEALTH_OUTPUT_LIMIT = 64 * 1024
 TASK_SOURCE_FENCED_RESET_CAPABILITY = "task-source-reset:fenced-owner:v1"
 TASK_SOURCE_FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 # Names whose *absence* from an adapter invocation is an assertion the runtime
@@ -67,6 +69,24 @@ WITHHELD_ADAPTER_ENV = frozenset(
         "VIBE_LOOP_WORKTREE",
     }
 )
+
+
+def _task_source_health_withholds(name: str) -> bool:
+    normalized = name.upper()
+    return normalized.startswith("VIBE_LOOP_") or any(
+        marker in normalized
+        for marker in (
+            "FENCING_TOKEN",
+            "LOCK_OWNER",
+            "RUN_ID",
+            "SELECTED_TASK",
+            "SESSION_ID",
+            "TASK_ID",
+            "THREAD_ID",
+        )
+    )
+
+
 DONE_STATUS = "Done"
 BLOCKED_STATUSES = {"Done", "Gated", "Low"}
 BLOCKED_FAMILY_STATUSES = frozenset({"blocked", "gated", "low"})
@@ -2775,6 +2795,183 @@ def build_adapter_environment(
             environment.pop(name, None)
     environment.update(supplied)
     return environment
+
+
+@dataclasses.dataclass(frozen=True)
+class TaskSourceHealthResult:
+    configured: bool
+    succeeded: bool
+    reason: str
+    exit_code: int | None
+    duration_seconds: float
+    timed_out: bool = False
+    output_limit_exceeded: bool = False
+
+    @property
+    def diagnostic(self) -> str:
+        if self.succeeded:
+            return "task-source health check passed"
+        return {
+            "command_start_failed": "task-source health check could not start",
+            "command_timeout": "task-source health check timed out",
+            "output_limit_exceeded": (
+                "task-source health check exceeded its output limit"
+            ),
+            "nonzero_exit": "task-source health check reported unhealthy",
+        }.get(self.reason, "task-source health check failed")
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "configured": self.configured,
+            "succeeded": self.succeeded,
+            "reason": self.reason,
+            "exit_code": self.exit_code,
+            "duration_seconds": round(self.duration_seconds, 6),
+            "timed_out": self.timed_out,
+            "output_limit_exceeded": self.output_limit_exceeded,
+            "diagnostic": self.diagnostic,
+        }
+
+
+class TaskSourceHealthError(RuntimeError):
+    def __init__(self, result: TaskSourceHealthResult):
+        self.result = result
+        super().__init__(result.diagnostic)
+
+
+def task_source_health_environment(
+    runtime_context: Mapping[str, str] | None,
+) -> dict[str, str]:
+    """Build the identity-free environment used only for admission health.
+
+    Project selectors such as ``LOOPYARD_PROJECT`` remain available, while
+    dispatch identities and capabilities are removed from both the ambient
+    process and the validated runtime context.
+    """
+
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not _task_source_health_withholds(name)
+    }
+    environment.update(
+        {
+            name: value
+            for name, value in dict(runtime_context or {}).items()
+            if not _task_source_health_withholds(name)
+        }
+    )
+    return environment
+
+
+def _stop_task_source_health_process(
+    process: subprocess.Popen[object],
+    *,
+    force: bool,
+) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            pass
+        try:
+            process.kill() if force else process.terminate()
+        except OSError:
+            return
+        return
+    try:
+        signal_number = signal.SIGKILL if force else signal.SIGTERM
+        os.killpg(os.getpgid(process.pid), signal_number)
+    except (ProcessLookupError, OSError):
+        try:
+            process.kill() if force else process.terminate()
+        except OSError:
+            pass
+
+
+def run_task_source_health(
+    repo: Path,
+    config: TaskSourceConfig,
+    *,
+    runtime_context: Mapping[str, str] | None = None,
+    output_limit: int = TASK_SOURCE_HEALTH_OUTPUT_LIMIT,
+) -> TaskSourceHealthResult:
+    """Run one fresh, bounded, identity-free dispatch admission check."""
+
+    if not config.health_command:
+        return TaskSourceHealthResult(
+            configured=False,
+            succeeded=True,
+            reason="not_configured",
+            exit_code=0,
+            duration_seconds=0.0,
+        )
+    start = time.monotonic()
+    popen_kwargs: dict[str, object] = {}
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    with tempfile.TemporaryFile() as output:
+        try:
+            process = subprocess.Popen(
+                config.health_command,
+                cwd=repo,
+                shell=True,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                env=task_source_health_environment(runtime_context),
+                **popen_kwargs,
+            )
+        except (OSError, ValueError):
+            return TaskSourceHealthResult(
+                configured=True,
+                succeeded=False,
+                reason="command_start_failed",
+                exit_code=None,
+                duration_seconds=time.monotonic() - start,
+            )
+
+        deadline = start + config.command_timeout_seconds
+        reason = ""
+        while process.poll() is None:
+            output.seek(0, os.SEEK_END)
+            if output.tell() > output_limit:
+                reason = "output_limit_exceeded"
+                _stop_task_source_health_process(process, force=True)
+                break
+            if time.monotonic() >= deadline:
+                reason = "command_timeout"
+                _stop_task_source_health_process(process, force=True)
+                break
+            time.sleep(0.01)
+        if process.poll() is None:
+            try:
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                _stop_task_source_health_process(process, force=True)
+                process.wait()
+        output.seek(0, os.SEEK_END)
+        if not reason and output.tell() > output_limit:
+            reason = "output_limit_exceeded"
+        if not reason and process.returncode != 0:
+            reason = "nonzero_exit"
+        if not reason:
+            reason = "healthy"
+        return TaskSourceHealthResult(
+            configured=True,
+            succeeded=reason == "healthy",
+            reason=reason,
+            exit_code=(process.returncode if reason != "command_timeout" else None),
+            duration_seconds=time.monotonic() - start,
+            timed_out=reason == "command_timeout",
+            output_limit_exceeded=reason == "output_limit_exceeded",
+        )
 
 
 def task_source_adapter_report(

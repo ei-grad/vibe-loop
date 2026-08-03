@@ -147,7 +147,13 @@ from vibe_loop.runs import (
 )
 from vibe_loop.skill_deployment import SkillDeploymentError
 from vibe_loop.spec_diagnostics import SpecExecutionGateError
-from vibe_loop.tasks import CommandTaskSource, Task, run_json_command
+from vibe_loop.tasks import (
+    CommandTaskSource,
+    Task,
+    TaskSourceHealthError,
+    TaskSourceHealthResult,
+    run_json_command,
+)
 from vibe_loop.workers import (
     ActiveRunState,
     StaleLock,
@@ -263,6 +269,157 @@ class RunnerTests(unittest.TestCase):
             origin="test",
         )
         return runner
+
+    def health_runner(self, repo: Path, events: Path) -> VibeRunner:
+        command = shlex.join(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    f"Path({str(events)!r}).open('a').write('health\\n')"
+                ),
+            ]
+        )
+        task_source = TaskSourceConfig(
+            type="markdown-plan",
+            health_command=command,
+            runnable_statuses=("Next",),
+            explicit_keys=frozenset({"type", "health"}),
+        )
+        runner = VibeRunner(
+            VibeConfig(
+                repo=repo,
+                agent=AgentConfig(command="worker"),
+                task_source=task_source,
+            )
+        )
+
+        class RecordingSource(MutableTaskSource):
+            def list_tasks(self) -> list[Task]:
+                with events.open("a", encoding="utf-8") as stream:
+                    stream.write("list\n")
+                return super().list_tasks()
+
+        runner._source = RecordingSource([Task("TASK-01", "First", "Next")])
+        runner._source_resolution = RuntimeTaskSourceResolution(
+            task_source=task_source,
+            origin="test",
+        )
+        return runner
+
+    def test_write_dispatch_checks_health_before_candidate_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            events = repo / "events.log"
+            runner = self.health_runner(repo, events)
+            with patch.object(runner, "run_task_with_supervision") as supervise:
+                supervise.return_value = RunResult(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / "run.log",
+                    start_main="base",
+                    end_main="head",
+                )
+                runner.run_next()
+            sequence = events.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(sequence[-1], "list")
+        self.assertGreaterEqual(sequence.count("health"), 1)
+        self.assertNotIn("list", sequence[: sequence.index("list")])
+
+    def test_read_only_candidate_listing_does_not_invoke_health(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            events = repo / "events.log"
+            runner = self.health_runner(repo, events)
+
+            candidates = runner.list_candidates()
+            sequence = events.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual([task.task_id for task in candidates], ["TASK-01"])
+        self.assertEqual(sequence, ["list"])
+
+    def test_fresh_dispatch_attempts_do_not_cache_health_success(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            events = repo / "events.log"
+            runner = self.health_runner(repo, events)
+            with patch.object(runner, "run_task_with_supervision") as supervise:
+                supervise.return_value = RunResult(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / "run.log",
+                    start_main="base",
+                    end_main="head",
+                )
+                runner.run_next()
+                first_health_count = (
+                    events.read_text(encoding="utf-8").splitlines().count("health")
+                )
+                runner.run_next()
+            sequence = events.read_text(encoding="utf-8").splitlines()
+
+        self.assertGreater(first_health_count, 0)
+        self.assertGreater(sequence.count("health"), first_health_count)
+
+    def test_health_rejection_precedes_all_dispatch_family_mutations(self) -> None:
+        failed = TaskSourceHealthResult(
+            configured=True,
+            succeeded=False,
+            reason="nonzero_exit",
+            exit_code=9,
+            duration_seconds=0.0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self.explicit_runner(
+                Path(directory),
+                [Task("TASK-01", "First", "Next")],
+            )
+            recovery = RecoveryContext(
+                task_id="TASK-01",
+                prior_run_id="prior-run",
+                prior_classification="unknown",
+                branch="task-branch",
+                worktree=directory,
+                head_commit="head",
+                transcript_path="",
+                wrapper_log="",
+                attempt=1,
+                max_attempts=2,
+                workspace_claimed=True,
+            )
+            with (
+                patch("vibe_loop.runner.run_task_source_health", return_value=failed),
+                patch.object(runner.source, "list_tasks") as list_tasks,
+                patch.object(runner.source, "probe") as probe,
+            ):
+                operations = (
+                    runner.run_next,
+                    lambda: runner.run_task_id("TASK-01"),
+                    lambda: runner.run_until_done(jobs=1),
+                    lambda: runner.run_until_done_serial(max_slices=1),
+                    lambda: runner.run_until_done_parallel(
+                        ask_agent=False,
+                        max_slices=1,
+                        continue_on_failure=False,
+                        jobs=2,
+                    ),
+                    lambda: runner.resume_pending_recovery(recovery),
+                )
+                for operation in operations:
+                    with self.assertRaises(TaskSourceHealthError):
+                        operation()
+
+            records = runner.run_store.read_records()
+
+        list_tasks.assert_not_called()
+        probe.assert_not_called()
+        self.assertEqual(records, [])
 
     def test_run_task_id_dispatches_only_the_named_task_through_supervision(
         self,

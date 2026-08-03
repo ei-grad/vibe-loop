@@ -319,8 +319,10 @@ source. Setting any of them disables generated cache as the active source.
 `runnable_statuses` is a non-source override and can replace generated runnable
 statuses without disabling a generated parser.
 `task_source.health` independently checks an external source backend and does
-not select a source or disable generated discovery; its cycle behavior is
+not select a source or disable generated discovery. Its runtime behavior is
 authoritative in
+[PRD-TSK-009](prd/task-discovery.md#prd-tsk-009-task-source-health-admission);
+autopilot's cycle response is owned by
 [PRD-AUT-005](prd/autopilot.md#prd-aut-005-configured-maintenance-hooks).
 `task_source.capabilities` is an optional, explicit adapter deployment
 diagnostic command. It runs only from `vibe-loop doctor`, does not select a task
@@ -393,7 +395,7 @@ configuration section now lives.
 | `agent.kind`, `model`, `effort`, `command`, `selection_command`, `analysis_command`, `prompt_dialect`, `skill_ref_prefix`, `worker_prompt_extra`, `forward_stderr` | [CLI Runtime PRD](prd/cli-runtime.md). |
 | `agent.profiles.*`; routing `profile`, `match_hazards_any`, `match_paths_glob`, `match_task_id_regex`, `match_title_regex`, `match_priority`; per-task `agent`, `model`, `hazards` | Per-task agent routing above. |
 | `task_source.type`, `plan_path`, `plan_paths`, `profile`, `runnable_statuses`, `list`, `next`, `probe`, `activate`, `complete`, `reset`, `park` | [Generated Task Discovery](generated-task-discovery.md) and [Task Discovery PRD](prd/task-discovery.md). |
-| `task_source.health` | [PRD-AUT-005](prd/autopilot.md#prd-aut-005-configured-maintenance-hooks). |
+| `task_source.health` | [PRD-TSK-009](prd/task-discovery.md#prd-tsk-009-task-source-health-admission) and [PRD-AUT-005](prd/autopilot.md#prd-aut-005-configured-maintenance-hooks). |
 | `task_source.capabilities` | Task-source configuration above and [PRD-TSK-008](prd/task-discovery.md#prd-tsk-008-adapter-capability-diagnostics). |
 | Profile fields `resources`, `paths`, `column`, `none_values`; ralphex conflict surfaces; `spec-kit`, `kiro`, `openspec` | [Generated Task Discovery](generated-task-discovery.md) and the [ralphex example](examples/ralphex-markdown-plan.md). |
 | `completion.commands` | Other configuration groups above and [PRD-CLI-003](prd/cli-runtime.md#prd-cli-003-completion-checks). |

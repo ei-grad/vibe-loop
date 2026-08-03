@@ -579,6 +579,11 @@ declared conflict domain, and falls back to deterministic ready order.
 (`--max-tasks`) counts only completed results; parallel dispatch may not
 overshoot the remaining completion budget.
 
+Every scheduler and direct-run entry is admitted by the authoritative
+[task-source health contract](task-discovery.md#prd-tsk-009-task-source-health-admission)
+before this section's selection, recovery, locking, provenance, or worker
+behavior begins.
+
 An explicit per-task agent route that cannot satisfy the run contract fails
 that task with the route diagnostic and is excluded for the rest of the current
 scheduler invocation. This task-scoped refusal does not activate a worker and

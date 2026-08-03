@@ -106,6 +106,8 @@ and `run_id` conventions as `run-next`.
 
 The explicit-dispatch and selection contract is
 [Task Selection Semantics](prd/task-discovery.md#prd-tsk-007-task-selection-semantics).
+When configured, task-source health admission precedes named-task lookup; see
+[PRD-TSK-009](prd/task-discovery.md#prd-tsk-009-task-source-health-admission).
 
 ### `vibe-loop run-next`
 
@@ -117,6 +119,10 @@ vibe-loop run-next --repo . --ask-agent
 
 - `--repo PATH` selects the repository. It defaults to the current directory.
 - `--ask-agent` requests configured agent-assisted selection.
+
+When configured, task-source health admission precedes candidate lookup or
+selection; see
+[PRD-TSK-009](prd/task-discovery.md#prd-tsk-009-task-source-health-admission).
 
 Result JSON remains on stdout. Progress and mirrored agent output go to stderr,
 and the complete streams are written to `.vibe-loop/runs/<run-id>.log`. The
@@ -144,6 +150,9 @@ conventions as `run-next`.
 
 The scheduler and runtime-owned lifecycle contract is
 [PRD-ORC-009](prd/run-orchestration.md#prd-orc-009-scheduler-and-runtime-separation).
+Every serial, parallel, retry, and recovery dispatch uses the fresh admission
+contract in
+[PRD-TSK-009](prd/task-discovery.md#prd-tsk-009-task-source-health-admission).
 For session linkage, provider usage, and compatibility recovery, see
 [PRD-AUT-013](prd/autopilot.md#prd-aut-013-observed-agent-session-id-and-transcript-linkage),
 [PRD-AUT-016](prd/autopilot.md#prd-aut-016-provider-usage-run-telemetry), and
