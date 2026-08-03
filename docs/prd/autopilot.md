@@ -1071,11 +1071,11 @@ only for tasks that remain nonterminal. A task normalized to `Done`, or absent
 from that complete snapshot because it was superseded or removed, is omitted
 from the current findings. The step does not read the task source again or
 query it per finding. Snapshot absence, source errors, incomplete snapshots,
-and unknown or unresolvable task identities fail open so historical findings
-remain visible; source failures continue through the existing task-source
-diagnostic contract. These task-scoped diagnostics do not become
-project-global dispatch blockers. Run-result and claim-mismatch evidence is
-deduplicated by run ID. Every cycle journals one
+and snapshots whose task identities are blank or duplicated fail open so
+historical findings remain visible; source failures continue through the
+existing task-source diagnostic contract. These task-scoped diagnostics do not
+become project-global dispatch blockers. Run-result and claim-mismatch evidence
+is deduplicated by run ID. Every cycle journals one
 `autopilot_troubleshoot` record containing the bounded findings and appends
 `native_troubleshoot:observations=<COUNT>:blockers=<COUNT>` to its actions.
 Successful task completion clears prior failure and restart-exhaustion evidence

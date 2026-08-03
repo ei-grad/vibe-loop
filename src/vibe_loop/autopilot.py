@@ -6239,9 +6239,7 @@ def _troubleshoot_task_is_current(
     task_id: str,
     nonterminal_task_ids: frozenset[str] | None,
 ) -> bool:
-    if nonterminal_task_ids is None or task_id.casefold() == "unknown":
-        return True
-    return task_id in nonterminal_task_ids
+    return nonterminal_task_ids is None or task_id in nonterminal_task_ids
 
 
 def latest_native_troubleshoot(

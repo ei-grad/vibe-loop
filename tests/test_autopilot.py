@@ -9687,19 +9687,18 @@ class AutopilotMaintenanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             store = RunStore(repo / "runs.jsonl")
-            for task_id in ("TASK-01", "unknown"):
-                for ordinal in range(NATIVE_TROUBLESHOOT_RECURRENCE_THRESHOLD):
-                    store.append_result(
-                        RunResult(
-                            run_id=f"{task_id}-{ordinal}",
-                            task_id=task_id,
-                            classification="failed",
-                            exit_code=1,
-                            log_path=repo / f"{task_id}-{ordinal}.log",
-                            start_main="base",
-                            end_main="base",
-                        )
+            for ordinal in range(NATIVE_TROUBLESHOOT_RECURRENCE_THRESHOLD):
+                store.append_result(
+                    RunResult(
+                        run_id=f"TASK-01-{ordinal}",
+                        task_id="TASK-01",
+                        classification="failed",
+                        exit_code=1,
+                        log_path=repo / f"TASK-01-{ordinal}.log",
+                        start_main="base",
+                        end_main="base",
                     )
+                )
 
             snapshots = (
                 None,
@@ -9707,6 +9706,17 @@ class AutopilotMaintenanceTests(unittest.TestCase):
                 TaskQueueStatus(
                     total=2,
                     source_tasks=({"id": "TASK-01", "status": "Done"},),
+                ),
+                TaskQueueStatus(
+                    total=1,
+                    source_tasks=({"id": "", "status": "Done"},),
+                ),
+                TaskQueueStatus(
+                    total=2,
+                    source_tasks=(
+                        {"id": "TASK-01", "status": "Done"},
+                        {"id": "TASK-01", "status": "Done"},
+                    ),
                 ),
                 TaskQueueStatus(total=0),
             )
@@ -9719,18 +9729,12 @@ class AutopilotMaintenanceTests(unittest.TestCase):
                 for index, snapshot in enumerate(snapshots)
             )
 
-        for result in results[:3]:
+        for result in results[:-1]:
             self.assertEqual(
                 result.observations,
-                (
-                    "recurring_task_failure:TASK-01:failed",
-                    "recurring_task_failure:unknown:failed",
-                ),
+                ("recurring_task_failure:TASK-01:failed",),
             )
-        self.assertEqual(
-            results[3].observations,
-            ("recurring_task_failure:unknown:failed",),
-        )
+        self.assertEqual(results[-1].observations, ())
 
     def test_native_troubleshoot_surfaces_observations_in_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
