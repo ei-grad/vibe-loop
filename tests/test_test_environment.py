@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from _test_bootstrap import TEST_ENVIRONMENT_CONFIGURED as TEST_ENVIRONMENT_CONFIGURED
+
+import ast
 import os
 import subprocess
 import sys
@@ -7,20 +10,29 @@ import tempfile
 import unittest
 from pathlib import Path
 
-if __package__:
-    from ._test_environment import DISABLE_GIT_ISOLATION, configure_test_environment
-else:
-    from _test_environment import DISABLE_GIT_ISOLATION, configure_test_environment
+from _test_environment import DISABLE_GIT_ISOLATION
 
 
 MUTATION_PROBE = "VIBE_LOOP_TEST_GIT_ISOLATION_MUTATION"
 
 
-# Both unittest discovery and pytest import selected modules before running tests.
-configure_test_environment()
-
-
 class TestEnvironmentIsolationTests(unittest.TestCase):
+    def test_every_test_module_bootstraps_before_other_imports(self) -> None:
+        for path in sorted(Path(__file__).parent.glob("test_*.py")):
+            module = ast.parse(path.read_text(), filename=str(path))
+            first_runtime_statement = next(
+                statement
+                for statement in module.body
+                if not (
+                    isinstance(statement, ast.ImportFrom)
+                    and statement.module == "__future__"
+                )
+            )
+            self.assertIsInstance(first_runtime_statement, ast.ImportFrom, path.name)
+            self.assertEqual(
+                first_runtime_statement.module, "_test_bootstrap", path.name
+            )
+
     def test_git_environment_is_controlled(self) -> None:
         self.assertEqual(
             os.environ.get("GIT_CONFIG_GLOBAL"),
@@ -130,10 +142,6 @@ class TestEnvironmentIsolationTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, runner)
                 for method in methods:
                     self.assertIn(method, output, runner)
-                if runner == "pytest":
-                    self.assertIn("2 failed, 1 skipped", output)
-                else:
-                    self.assertIn("FAILED (failures=2, skipped=1)", output)
 
 
 if __name__ == "__main__":

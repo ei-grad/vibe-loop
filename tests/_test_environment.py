@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
 
 
 DISABLE_GIT_ISOLATION = "VIBE_LOOP_TEST_DISABLE_GIT_ISOLATION"
@@ -37,14 +35,3 @@ def isolate_test_environment() -> None:
     isolate_git_environment()
     for name in RUNTIME_ENVIRONMENT_VARIABLES:
         os.environ.pop(name, None)
-
-
-def configure_test_environment() -> None:
-    argv = sys.orig_argv
-    executable = Path(argv[0]).name
-    module_runner = any(
-        argv[index : index + 2] in (["-m", "pytest"], ["-m", "unittest"])
-        for index in range(len(argv) - 1)
-    )
-    if executable in {"pytest", "py.test"} or module_runner:
-        isolate_test_environment()

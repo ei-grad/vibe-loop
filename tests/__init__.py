@@ -1,5 +1,7 @@
-from ._test_environment import isolate_test_environment
+import sys
+
+from . import _test_bootstrap, _test_environment
 
 
-# Test-owned processes must not inherit runtime identity or Git controls.
-isolate_test_environment()
+sys.modules["_test_environment"] = _test_environment
+sys.modules["_test_bootstrap"] = _test_bootstrap

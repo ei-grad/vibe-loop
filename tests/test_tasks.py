@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _test_bootstrap import TEST_ENVIRONMENT_CONFIGURED as TEST_ENVIRONMENT_CONFIGURED
+
 import ast
 import json
 import os
