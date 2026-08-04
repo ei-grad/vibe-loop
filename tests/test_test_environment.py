@@ -7,7 +7,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from _test_environment import DISABLE_GIT_ISOLATION, configure_test_environment
+if __package__:
+    from ._test_environment import DISABLE_GIT_ISOLATION, configure_test_environment
+else:
+    from _test_environment import DISABLE_GIT_ISOLATION, configure_test_environment
 
 
 # Both unittest discovery and pytest import selected modules before running tests.

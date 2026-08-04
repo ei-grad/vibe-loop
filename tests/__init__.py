@@ -1,6 +1,6 @@
 import os
 
-from _test_environment import isolate_git_environment
+from ._test_environment import isolate_git_environment
 
 
 # Test-owned repositories must not inherit Git repository or configuration controls.
