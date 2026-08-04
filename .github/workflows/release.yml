@@ -181,7 +181,7 @@ jobs:
 
       - name: Run tests against built wheel
         shell: bash
-        run: uv run --no-project --with dist/*.whl python -m unittest discover -s tests
+        run: uv run --no-project --with pytest --with dist/*.whl python -m pytest tests/
 
       - name: Smoke test console script
         shell: bash

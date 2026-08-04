@@ -12,15 +12,43 @@ from vibe_loop.eval_examples import materialize_eval_example
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPLETION_SUITE_COMMAND = "uv run -m pytest tests/"
+RELEASE_WHEEL_SUITE_COMMAND = (
+    "uv run --no-project --with pytest --with dist/*.whl python -m pytest tests/"
+)
 
 
 class PytestCollectionTests(unittest.TestCase):
-    def test_ci_uses_completion_suite_command(self) -> None:
-        workflow = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+    def test_repository_workflows_retain_suite_gate_commands(self) -> None:
+        ci_workflow = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+        release_workflow = REPO_ROOT / ".github" / "workflows" / "release.yml"
 
-        self.assertEqual(
-            workflow_job_run_commands(workflow, "test"),
-            [COMPLETION_SUITE_COMMAND],
+        self.assertTrue(
+            workflow_job_runs_command(ci_workflow, "test", COMPLETION_SUITE_COMMAND)
+        )
+        self.assertTrue(
+            workflow_job_runs_command(
+                release_workflow,
+                "test",
+                RELEASE_WHEEL_SUITE_COMMAND,
+            )
+        )
+
+    def test_workflow_command_guard_accepts_other_steps_and_block_scalars(
+        self,
+    ) -> None:
+        workflow = """\
+jobs:
+  test:
+    steps:
+      - run: uv sync --locked
+      - run: |
+          uv run -m pytest tests/
+  other:
+    steps: []
+"""
+
+        self.assertTrue(
+            workflow_job_text_runs_command(workflow, "test", COMPLETION_SUITE_COMMAND)
         )
 
     def test_bare_collection_matches_explicit_project_suite(self) -> None:
@@ -72,19 +100,22 @@ def collect_node_ids(
     return [line for line in completed.stdout.splitlines() if "::" in line]
 
 
-def workflow_job_run_commands(workflow: Path, job: str) -> list[str]:
-    lines = workflow.read_text().splitlines()
+def workflow_job_runs_command(workflow: Path, job: str, command: str) -> bool:
+    return workflow_job_text_runs_command(workflow.read_text(), job, command)
+
+
+def workflow_job_text_runs_command(workflow: str, job: str, command: str) -> bool:
+    lines = workflow.splitlines()
     job_header = f"  {job}:"
     try:
         start = lines.index(job_header) + 1
     except ValueError as error:
         raise AssertionError(f"workflow job not found: {job}") from error
 
-    commands = []
     for line in lines[start:]:
         if line.startswith("  ") and not line.startswith("    "):
             break
         stripped = line.strip()
-        if stripped.startswith("run: "):
-            commands.append(stripped.removeprefix("run: "))
-    return commands
+        if stripped in {command, f"run: {command}"}:
+            return True
+    return False
