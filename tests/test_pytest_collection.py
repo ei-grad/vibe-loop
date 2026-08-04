@@ -14,6 +14,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class PytestCollectionTests(unittest.TestCase):
+    def test_ci_runs_both_supported_suite_targets(self) -> None:
+        workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+
+        self.assertEqual(workflow.count("run: make test"), 1)
+        self.assertEqual(
+            workflow.count("run: uv run python -m unittest discover -s tests"),
+            1,
+        )
+
     def test_bare_collection_matches_explicit_project_suite(self) -> None:
         bare = collect_node_ids(REPO_ROOT)
         explicit_root = collect_node_ids(REPO_ROOT, ".")

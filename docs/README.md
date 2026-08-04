@@ -14,6 +14,7 @@ component contracts.
 - [Skill work modes](skill-work-modes.md)
 - [Recorded skill deployment](skill-deployment.md)
 - [Release checklist](release-checklist.md)
+- [Test-suite gates](test-suite-gates.md)
 - [Planning analytics migration](planning-analytics.md)
 
 ## Evaluation and benchmarks
