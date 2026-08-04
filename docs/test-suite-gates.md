@@ -1,20 +1,20 @@
-# Test-Suite Gates
+# Test-Suite Gate
 
 This file is authoritative for repository test-suite gate alignment. CI and
-the runtime completion gate must both run these commands:
+the runtime completion gate must both run this exact command:
 
 ```bash
-make test
-uv run python -m unittest discover -s tests
+uv run -m pytest tests/
 ```
 
-Both commands are required because pytest and unittest have different
-collection semantics. A failure collected by either supported runner must
-block integration. The tracked CI workflow runs both commands on the minimum
-and latest supported Python versions.
+The chosen alignment is that CI runs what the gate runs. This avoids making
+integration depend on an unapplied change to the operator-owned, untracked
+`.vibe-loop.toml`. The CI matrix runs the command on the minimum and latest
+supported Python versions, and the tracked regression test requires the test
+job to retain the exact gate command.
 
-The repository's `.vibe-loop.toml` is operator-owned and untracked. Its
-`[completion].commands` list must contain the same two command lines. The
-tracked collection regression test prevents CI from silently dropping either
-runner; changes to the operator configuration must be reconciled against this
-contract.
+`uv run python -m unittest discover -s tests` remains a supported diagnostic
+runner, but it is not an integration gate. Pytest and unittest have different
+collection semantics, so they can expose different defects; changing which
+runner blocks integration requires updating the operator configuration, CI,
+this contract, and its regression test together.

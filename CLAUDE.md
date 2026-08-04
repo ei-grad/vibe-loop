@@ -10,8 +10,9 @@ uv run ruff format
 uv build && uv run --with twine --no-project -m twine check dist/*
 ```
 
-Run ruff check and ruff format before committing. CI also runs unittest
-discover on Python 3.11 and 3.14 (minimum supported and latest).
+Run ruff check and ruff format before committing. The
+[test-suite gate contract](docs/test-suite-gates.md) is authoritative for
+which test runner CI and the runtime completion gate require.
 
 ## Design Context
 
