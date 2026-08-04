@@ -1,7 +1,11 @@
 import os
 
 
-# Test-owned repositories must not inherit user or system Git configuration.
+# Test-owned repositories must not inherit Git repository or configuration controls.
+for name in tuple(os.environ):
+    if name.startswith("GIT_"):
+        os.environ.pop(name)
+
 os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
 os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
 
