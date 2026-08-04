@@ -705,7 +705,10 @@ class CrossProjectIsolationTests(unittest.TestCase):
         init_repo(repo)
         quoted_task = f"{sys.executable} {self.task_adapter}"
         quoted_lock = f"{sys.executable} {self.lock_adapter}"
+        quoted_agent = f'{sys.executable} -c "pass" {{prompt}}'
         (repo / ".vibe-loop.toml").write_text(
+            "[agent]\n"
+            f"command = '{quoted_agent}'\n"
             "[orchestration]\n"
             'mode = "worker-owned"\n'
             "[task_source]\n"

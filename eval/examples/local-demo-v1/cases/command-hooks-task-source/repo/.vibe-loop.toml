@@ -1,3 +1,6 @@
+[agent]
+command = "python scripts/agent_stub.py {prompt}"
+
 [task_source]
 type = "command"
 list = "python scripts/task_adapter.py list"

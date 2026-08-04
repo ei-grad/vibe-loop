@@ -11794,8 +11794,9 @@ def init_git_repo(repo: Path) -> None:
     git(repo, "init", "-b", "main")
     git(repo, "config", "user.name", "Tester")
     git(repo, "config", "user.email", "tester@example.com")
+    (repo / ".gitignore").write_text(".vibe-loop/\n", encoding="utf-8")
     (repo / "README.md").write_text("baseline\n", encoding="utf-8")
-    git(repo, "add", "README.md")
+    git(repo, "add", ".gitignore", "README.md")
     git(repo, "commit", "-m", "baseline")
 
 

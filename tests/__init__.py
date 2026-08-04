@@ -1,6 +1,11 @@
 import os
 
 
+# Test-owned repositories must not inherit user or system Git configuration.
+os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
+os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+
+
 for name in (
     "VIBE_LOOP_BRANCH",
     "VIBE_LOOP_FENCING_TOKEN",
