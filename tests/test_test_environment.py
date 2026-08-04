@@ -13,6 +13,9 @@ else:
     from _test_environment import DISABLE_GIT_ISOLATION, configure_test_environment
 
 
+MUTATION_PROBE = "VIBE_LOOP_TEST_GIT_ISOLATION_MUTATION"
+
+
 # Both unittest discovery and pytest import selected modules before running tests.
 configure_test_environment()
 
@@ -46,7 +49,11 @@ class TestEnvironmentIsolationTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, key)
                 self.assertEqual(result.stdout, "", key)
 
-    def test_both_checks_detect_disabled_isolation(self) -> None:
+    @unittest.skipIf(
+        os.environ.get(MUTATION_PROBE) == "1",
+        "mutation probe must not invoke itself",
+    )
+    def test_both_runners_detect_disabled_isolation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             excludes_file = root / "global-ignore"
@@ -65,8 +72,11 @@ class TestEnvironmentIsolationTests(unittest.TestCase):
 
             mutated_environment = os.environ.copy()
             mutated_environment[DISABLE_GIT_ISOLATION] = "1"
+            mutated_environment[MUTATION_PROBE] = "1"
             mutated_environment["GIT_CONFIG_GLOBAL"] = str(global_config)
             mutated_environment.pop("GIT_CONFIG_NOSYSTEM", None)
+            mutated_environment["PYTHON_COLORS"] = "0"
+            mutated_environment["NO_COLOR"] = "1"
 
             expected_configuration = {
                 "user.name": "Host User",
@@ -83,25 +93,47 @@ class TestEnvironmentIsolationTests(unittest.TestCase):
                 )
                 self.assertEqual(result.stdout.strip(), expected, key)
 
-            for method in (
+            methods = (
                 "test_git_environment_is_controlled",
                 "test_git_configuration_is_isolated",
-            ):
+            )
+            runner_commands = {
+                "pytest": [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "--color=no",
+                    "-q",
+                    "tests/test_test_environment.py",
+                ],
+                "unittest discovery": [
+                    sys.executable,
+                    "-m",
+                    "unittest",
+                    "discover",
+                    "-s",
+                    "tests",
+                    "-p",
+                    "test_test_environment.py",
+                ],
+            }
+            for runner, command in runner_commands.items():
                 result = subprocess.run(
-                    [
-                        sys.executable,
-                        "-m",
-                        "unittest",
-                        f"tests.test_test_environment.TestEnvironmentIsolationTests.{method}",
-                    ],
+                    command,
                     cwd=Path(__file__).parent.parent,
                     check=False,
                     capture_output=True,
                     env=mutated_environment,
                     text=True,
                 )
-                self.assertNotEqual(result.returncode, 0, method)
-                self.assertIn(f"FAIL: {method}", result.stderr)
+                output = result.stdout + result.stderr
+                self.assertNotEqual(result.returncode, 0, runner)
+                for method in methods:
+                    self.assertIn(method, output, runner)
+                if runner == "pytest":
+                    self.assertIn("2 failed, 1 skipped", output)
+                else:
+                    self.assertIn("FAILED (failures=2, skipped=1)", output)
 
 
 if __name__ == "__main__":
