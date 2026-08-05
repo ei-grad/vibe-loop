@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 from vibe_loop.cli import main
 from vibe_loop.eval_examples import list_eval_example_cases
+from vibe_loop.eval_runner import skill_id_for_condition
 from vibe_loop.eval_release import (
     build_release_readiness_record,
     load_external_benchmark_evidence,
@@ -432,6 +433,18 @@ class EvalReleaseTests(unittest.TestCase):
                 ),
                 Counter(instance_ids),
             )
+            self.assertEqual(
+                Counter(
+                    instance_id
+                    for phase, instance_id in manifest_calls
+                    if phase == "grader"
+                ),
+                Counter(
+                    instance_id
+                    for instance_id in instance_ids
+                    if instance_id != setup_failure
+                ),
+            )
 
             release_repo = root / "release-repo"
             release_repo.mkdir()
@@ -444,9 +457,17 @@ class EvalReleaseTests(unittest.TestCase):
                 cwd=release_repo,
                 check=True,
             )
-            skill_path = release_repo / "src/vibe_loop/skills/vibe-loop/SKILL.md"
-            skill_path.parent.mkdir(parents=True)
-            skill_path.write_text("contract\n", encoding="utf-8")
+            for skill_id in ("orchestrated-vibe-loop", "vibe-loop"):
+                skill_path = (
+                    release_repo
+                    / "src"
+                    / "vibe_loop"
+                    / "skills"
+                    / skill_id
+                    / "SKILL.md"
+                )
+                skill_path.parent.mkdir(parents=True)
+                skill_path.write_text(f"{skill_id} contract\n", encoding="utf-8")
             (release_repo / ".gitignore").write_text(
                 "/eval-runs/\n/release-without.json\n/release-with.json\n",
                 encoding="utf-8",
@@ -471,11 +492,29 @@ class EvalReleaseTests(unittest.TestCase):
                 text=True,
             ).stdout.strip()
             aggregate_path = release_repo / "eval-runs/local-demo-v1/aggregate.json"
-            aggregate = passing_release_aggregate()
+            aggregate = passing_release_aggregate(trials=1)
+            skill_fingerprints = bundled_skill_fingerprints(release_repo)
             aggregate["release_provenance"] = {
                 "repository_head": head,
-                "bundled_skills": bundled_skill_fingerprints(release_repo),
+                "bundled_skills": skill_fingerprints,
             }
+            for record in aggregate["records"]:
+                skill_id = skill_id_for_condition(record["condition"])
+                skill_sha = skill_fingerprints[
+                    f"src/vibe_loop/skills/{skill_id}/SKILL.md"
+                ]
+                write_json(
+                    aggregate_path.parent / record["artifact_root"] / "run.json",
+                    {
+                        "source_fingerprints": [
+                            {
+                                "path": f"skills/{skill_id}/SKILL.md",
+                                "sha256": skill_sha,
+                            }
+                        ],
+                        "skill_condition": {"skill_sha256": skill_sha},
+                    },
+                )
             write_json(aggregate_path, aggregate)
 
             def run_release(
@@ -512,6 +551,8 @@ class EvalReleaseTests(unittest.TestCase):
                 release_repo / "release-with.json", attach=True
             )
 
+        self.assertEqual(omitted_exit, 0)
+        self.assertEqual(omitted["status"], "passed")
         self.assertEqual(attached_exit, omitted_exit)
         self.assertEqual(attached["status"], omitted["status"])
         self.assertEqual(attached["local_suite"], omitted["local_suite"])

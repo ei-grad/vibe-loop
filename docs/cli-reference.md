@@ -632,19 +632,12 @@ vibe-loop eval benchmark --repo . --output path/to/results \
   `--condition NAME` select execution.
 - `--trials N` and `--timeout SECONDS` set repetition and timeout.
 
-The manifest adapter writes
-`<output>/<manifest-name>-results.json`. For the pinned multilingual manifest,
-the compact result is
-`swe-rebench-v2-multilingual-smoke-results.json`. Attach it explicitly to a
-dry-run readiness record with:
-
-```bash
-vibe-loop eval release-gate --repo . --dry-run \
-  --aggregate path/to/local-demo-v1/aggregate.json \
-  --external-benchmark-json \
-    path/to/swe-rebench-v2-multilingual-smoke-results.json \
-  --record-output path/to/release-readiness.json
-```
+The command writes `<output>/<adapter-name>-results.json`. For the manifest
+adapter, the adapter name is the manifest's `name` field, or `manifest` when the
+field is absent. The pinned multilingual manifest therefore produces
+`swe-rebench-v2-multilingual-smoke-results.json`. The
+[release checklist](release-checklist.md#external-smoke-evidence) owns the
+optional release-attachment procedure.
 
 External-adapter behavior is defined by
 [PRD-EVL-006](prd/evals-release.md#prd-evl-006-external-benchmark-adapters).
