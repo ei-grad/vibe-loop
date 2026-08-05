@@ -3,6 +3,7 @@ from __future__ import annotations
 from _test_bootstrap import TEST_ENVIRONMENT_CONFIGURED as TEST_ENVIRONMENT_CONFIGURED
 
 import json
+import hashlib
 import tempfile
 import unittest
 from collections import Counter
@@ -76,11 +77,36 @@ class BenchmarkEvalTests(unittest.TestCase):
             / "benchmarks"
             / "swe-rebench-v2-smoke.json"
         )
+        manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
+        canonical_manifest = json.dumps(
+            manifest_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
         adapter = ManifestBenchmarkAdapter(manifest)
         instances = adapter.list_instances()
 
+        self.assertEqual(
+            hashlib.sha256(canonical_manifest).hexdigest(),
+            "58b3cdfcfea6f49a8e310f28a06185275e4109783a6be3070367981eef865da3",
+        )
         self.assertEqual(adapter.version, "475dd5e8703bb5fb22dd3c60b5d038b019eba1e0")
+        self.assertEqual(
+            manifest_payload["harness"]["revision"],
+            "c71902a8cf8d2b725f63d51f199f4d3e56f68d2d",
+        )
+        self.assertEqual(adapter.metadata["dataset"], "nebius/SWE-rebench-V2")
+        self.assertEqual(
+            adapter.metadata["dataset_revision"],
+            "475dd5e8703bb5fb22dd3c60b5d038b019eba1e0",
+        )
+        self.assertEqual(adapter.metadata["split"], "train")
         self.assertEqual(len(instances), 24)
+        self.assertEqual(
+            set(adapter.metadata["task_record_sha256"]),
+            {instance.instance_id for instance in instances},
+        )
         self.assertEqual(
             Counter(instance.language for instance in instances),
             Counter(

@@ -621,7 +621,8 @@ Run an explicit external benchmark adapter:
 
 ```bash
 vibe-loop eval benchmark --repo . --output path/to/results \
-  --adapter manifest --manifest path/to/benchmark.json
+  --adapter manifest --manifest path/to/benchmark.json \
+  --agent-command 'smoke=path/to/agent-wrapper'
 ```
 
 - `--repo PATH` selects the repository.
@@ -631,5 +632,22 @@ vibe-loop eval benchmark --repo . --output path/to/results \
   `--condition NAME` select execution.
 - `--trials N` and `--timeout SECONDS` set repetition and timeout.
 
+The manifest adapter writes
+`<output>/<manifest-name>-results.json`. For the pinned multilingual manifest,
+the compact result is
+`swe-rebench-v2-multilingual-smoke-results.json`. Attach it explicitly to a
+dry-run readiness record with:
+
+```bash
+vibe-loop eval release-gate --repo . --dry-run \
+  --aggregate path/to/local-demo-v1/aggregate.json \
+  --external-benchmark-json \
+    path/to/swe-rebench-v2-multilingual-smoke-results.json \
+  --record-output path/to/release-readiness.json
+```
+
 External-adapter behavior is defined by
 [PRD-EVL-006](prd/evals-release.md#prd-evl-006-external-benchmark-adapters).
+That contract also defines the evidentiary limits of the repository's hermetic
+SWE-rebench verification; the local fake-backed check is not external benchmark
+execution or leaderboard evidence.

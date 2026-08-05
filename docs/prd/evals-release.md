@@ -119,6 +119,17 @@ Related implementation IDs: `EVAL-06`,
 External benchmark adapters must be optional smoke or stress checks, not local
 release gates or leaderboard claims.
 
+The repository-owned verification for the pinned SWE-rebench V2 multilingual
+smoke must exercise all 24 manifest identities hermetically through the
+manifest adapter and benchmark CLI, verify the result taxonomy and six
+four-instance language denominators, and prove that the generated compact
+result can be attached intentionally to a dry-run release-readiness record.
+Omitting or attaching that optional record must not change the local-suite
+release decision. This verification covers only the repository's manifest,
+adapter, result-accounting, and release-attachment contract. It does not verify
+the upstream harness, container images, task export, agent quality, an actual
+external smoke execution, or leaderboard comparability.
+
 Acceptance must cover explicit configuration, Docker/storage/network cost
 disclosure, dataset and harness provenance, sample IDs, image identifiers where
 relevant, grader provenance, non-leaderboard caveats, and separation from

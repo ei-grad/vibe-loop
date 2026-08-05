@@ -3,10 +3,14 @@ from __future__ import annotations
 from _test_bootstrap import TEST_ENVIRONMENT_CONFIGURED as TEST_ENVIRONMENT_CONFIGURED
 
 import json
+import hashlib
 import re
+import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
+from collections import Counter
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -251,6 +255,286 @@ class EvalReleaseTests(unittest.TestCase):
         )
         self.assertEqual(evidence["summary"]["summary"]["agent_failed"], 4)
         self.assertEqual(evidence["summary"]["summary"]["infrastructure_failed"], 2)
+
+    def test_pinned_swe_rebench_smoke_crosses_cli_and_release_boundaries(self) -> None:
+        repository_root = Path(__file__).resolve().parents[1]
+        manifest = repository_root / "eval" / "benchmarks" / "swe-rebench-v2-smoke.json"
+        manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
+        instance_ids = [
+            instance["instance_id"] for instance in manifest_payload["instances"]
+        ]
+        setup_failure = instance_ids[0]
+        agent_failure = instance_ids[1]
+        grader_mismatch = instance_ids[2]
+        grader_failure = instance_ids[3]
+        manifest_calls: list[tuple[str, str]] = []
+        real_subprocess_run = subprocess.run
+
+        def fake_manifest_command(
+            command: object, **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            environment = kwargs.get("env")
+            if not isinstance(command, str) or not command.endswith(
+                (" validate", " grade")
+            ):
+                return real_subprocess_run(command, **kwargs)
+            assert isinstance(environment, dict)
+            instance_id = environment["VIBE_LOOP_BENCHMARK_INSTANCE_ID"]
+            phase = "setup" if command.endswith(" validate") else "grader"
+            manifest_calls.append((phase, instance_id))
+            if phase == "setup":
+                return subprocess.CompletedProcess(
+                    command,
+                    2 if instance_id == setup_failure else 0,
+                    "",
+                    "fixture setup failure" if instance_id == setup_failure else "",
+                )
+            if instance_id == grader_failure:
+                return subprocess.CompletedProcess(
+                    command, 2, "", "fixture grader infrastructure failure"
+                )
+            if instance_id == grader_mismatch:
+                return subprocess.CompletedProcess(
+                    command, 1, "", "fixture fail-to-pass mismatch"
+                )
+            return subprocess.CompletedProcess(command, 0, "fixture pass", "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            benchmark_output = root / "benchmark-output"
+            agent = root / "fixture-agent.py"
+            agent.write_text(
+                "import os, sys\n"
+                f"sys.exit(os.environ['VIBE_LOOP_BENCHMARK_INSTANCE_ID'] == "
+                f"{agent_failure!r})\n",
+                encoding="utf-8",
+            )
+            agent_command = (
+                f"smoke={shlex.quote(sys.executable)} {shlex.quote(str(agent))}"
+            )
+            benchmark_stdout = StringIO()
+            benchmark_stderr = StringIO()
+            with (
+                patch(
+                    "vibe_loop.eval_benchmark_manifest.subprocess.run",
+                    side_effect=fake_manifest_command,
+                ),
+                redirect_stdout(benchmark_stdout),
+                redirect_stderr(benchmark_stderr),
+            ):
+                benchmark_exit = main(
+                    [
+                        "eval",
+                        "benchmark",
+                        "--repo",
+                        str(root),
+                        "--output",
+                        str(benchmark_output),
+                        "--adapter",
+                        "manifest",
+                        "--manifest",
+                        str(manifest),
+                        "--agent-command",
+                        agent_command,
+                        "--timeout",
+                        "30",
+                    ]
+                )
+
+            self.assertEqual(benchmark_exit, 0)
+            self.assertEqual(benchmark_stderr.getvalue(), "")
+            result_path = (
+                benchmark_output / "swe-rebench-v2-multilingual-smoke-results.json"
+            )
+            result_bytes = result_path.read_bytes()
+            result = json.loads(result_bytes)
+            result_basename = result_path.name
+            result_size = len(result_bytes)
+            result_sha256 = hashlib.sha256(result_bytes).hexdigest()
+            results_by_id = {
+                item["instance"]["instance_id"]: item for item in result["results"]
+            }
+
+            self.assertEqual(json.loads(benchmark_stdout.getvalue()), result)
+            self.assertEqual(result["benchmark"], "SWE-rebench V2 multilingual smoke")
+            self.assertEqual(result["adapter"], "swe-rebench-v2-multilingual-smoke")
+            self.assertEqual(
+                result["adapter_version"],
+                "475dd5e8703bb5fb22dd3c60b5d038b019eba1e0",
+            )
+            self.assertEqual(result["dataset"], "nebius/SWE-rebench-V2")
+            self.assertEqual(
+                result["dataset_revision"],
+                "475dd5e8703bb5fb22dd3c60b5d038b019eba1e0",
+            )
+            self.assertEqual(result["sample_size"], 24)
+            self.assertEqual(
+                result["languages"], ["go", "java", "js", "python", "rust", "ts"]
+            )
+            self.assertTrue(result["non_leaderboard"])
+            self.assertEqual(result["caveats"], manifest_payload["metadata"]["caveats"])
+            condition_summary = result["conditions"]["smoke"]
+            self.assertEqual(condition_summary["trials"], 24)
+            self.assertEqual(condition_summary["passed"], 20)
+            self.assertEqual(condition_summary["agent_failures"], 2)
+            self.assertEqual(condition_summary["infrastructure_failures"], 2)
+            self.assertEqual(
+                result["summary"],
+                {
+                    "passed": 20,
+                    "agent_failed": 2,
+                    "infrastructure_failed": 2,
+                    "total": 24,
+                },
+            )
+            self.assertEqual(set(results_by_id), set(instance_ids))
+            self.assertEqual(
+                Counter(item["instance"]["language"] for item in result["results"]),
+                Counter({language: 4 for language in result["languages"]}),
+            )
+            self.assertEqual(
+                results_by_id[setup_failure]["status"], "infrastructure_failed"
+            )
+            self.assertEqual(results_by_id[setup_failure]["failure_phase"], "setup")
+            self.assertTrue(
+                results_by_id[setup_failure]["grader_result"]["infrastructure_failure"]
+            )
+            self.assertEqual(results_by_id[agent_failure]["status"], "agent_failed")
+            self.assertEqual(results_by_id[agent_failure]["failure_phase"], "agent")
+            self.assertFalse(
+                results_by_id[agent_failure]["grader_result"]["infrastructure_failure"]
+            )
+            self.assertEqual(results_by_id[grader_mismatch]["status"], "agent_failed")
+            self.assertEqual(results_by_id[grader_mismatch]["failure_phase"], "grader")
+            self.assertFalse(
+                results_by_id[grader_mismatch]["grader_result"][
+                    "infrastructure_failure"
+                ]
+            )
+            self.assertEqual(
+                results_by_id[grader_failure]["status"], "infrastructure_failed"
+            )
+            self.assertEqual(results_by_id[grader_failure]["failure_phase"], "grader")
+            self.assertTrue(
+                results_by_id[grader_failure]["grader_result"]["infrastructure_failure"]
+            )
+            representative_pass = results_by_id[instance_ids[4]]
+            self.assertEqual(representative_pass["status"], "passed")
+            self.assertEqual(representative_pass["failure_phase"], "")
+            self.assertFalse(
+                representative_pass["grader_result"]["infrastructure_failure"]
+            )
+            self.assertEqual(
+                Counter(
+                    instance_id
+                    for phase, instance_id in manifest_calls
+                    if phase == "setup"
+                ),
+                Counter(instance_ids),
+            )
+
+            release_repo = root / "release-repo"
+            release_repo.mkdir()
+            subprocess.run(("git", "init", "-q"), cwd=release_repo, check=True)
+            subprocess.run(
+                ("git", "config", "user.name", "Test"), cwd=release_repo, check=True
+            )
+            subprocess.run(
+                ("git", "config", "user.email", "test@example.com"),
+                cwd=release_repo,
+                check=True,
+            )
+            skill_path = release_repo / "src/vibe_loop/skills/vibe-loop/SKILL.md"
+            skill_path.parent.mkdir(parents=True)
+            skill_path.write_text("contract\n", encoding="utf-8")
+            (release_repo / ".gitignore").write_text(
+                "/eval-runs/\n/release-without.json\n/release-with.json\n",
+                encoding="utf-8",
+            )
+            subprocess.run(("git", "add", "."), cwd=release_repo, check=True)
+            subprocess.run(
+                ("git", "commit", "-q", "-m", "base"), cwd=release_repo, check=True
+            )
+            subprocess.run(("git", "tag", "v0.1.0"), cwd=release_repo, check=True)
+            (release_repo / "README.md").write_text("release\n", encoding="utf-8")
+            subprocess.run(("git", "add", "."), cwd=release_repo, check=True)
+            subprocess.run(
+                ("git", "commit", "-q", "-m", "release"),
+                cwd=release_repo,
+                check=True,
+            )
+            head = subprocess.run(
+                ("git", "rev-parse", "HEAD"),
+                cwd=release_repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            aggregate_path = release_repo / "eval-runs/local-demo-v1/aggregate.json"
+            aggregate = passing_release_aggregate()
+            aggregate["release_provenance"] = {
+                "repository_head": head,
+                "bundled_skills": bundled_skill_fingerprints(release_repo),
+            }
+            write_json(aggregate_path, aggregate)
+
+            def run_release(
+                record_path: Path, *, attach: bool
+            ) -> tuple[int, dict[str, object]]:
+                arguments = [
+                    "--repo",
+                    str(release_repo),
+                    "eval",
+                    "release-gate",
+                    "--aggregate",
+                    str(aggregate_path),
+                    "--record-output",
+                    str(record_path),
+                    "--dry-run",
+                    "--json",
+                ]
+                if attach:
+                    arguments.extend(("--external-benchmark-json", str(result_path)))
+                stdout = StringIO()
+                stderr = StringIO()
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(arguments)
+                self.assertEqual(stderr.getvalue(), "")
+                self.assertEqual(
+                    json.loads(stdout.getvalue()), json.loads(record_path.read_text())
+                )
+                return exit_code, json.loads(record_path.read_text())
+
+            omitted_exit, omitted = run_release(
+                release_repo / "release-without.json", attach=False
+            )
+            attached_exit, attached = run_release(
+                release_repo / "release-with.json", attach=True
+            )
+
+        self.assertEqual(attached_exit, omitted_exit)
+        self.assertEqual(attached["status"], omitted["status"])
+        self.assertEqual(attached["local_suite"], omitted["local_suite"])
+        self.assertEqual(
+            omitted["external_benchmarks"],
+            {"required": False, "status": "optional_not_provided", "records": []},
+        )
+        self.assertFalse(attached["external_benchmarks"]["required"])
+        self.assertEqual(attached["external_benchmarks"]["status"], "recorded")
+        evidence = attached["external_benchmarks"]["records"][0]
+        self.assertEqual(evidence["path"], result_basename)
+        self.assertEqual(evidence["size"], result_size)
+        self.assertEqual(evidence["sha256"], result_sha256)
+        self.assertEqual(evidence["benchmark"], result["benchmark"])
+        self.assertEqual(evidence["status"], result["status"])
+        for key in (
+            "sample_size",
+            "languages",
+            "dataset_revision",
+            "non_leaderboard",
+            "summary",
+        ):
+            self.assertEqual(evidence["summary"][key], result[key])
 
     def test_workflow_regression_blocks_until_parked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
