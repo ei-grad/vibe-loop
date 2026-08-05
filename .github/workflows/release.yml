@@ -250,6 +250,8 @@ jobs:
           from vibe_loop.release_admission import (
               ReleaseAdmissionError,
               build_github_readiness_provenance,
+              mapping_sha256,
+              validate_github_readiness_source,
           )
 
           api_headers = {
@@ -302,7 +304,7 @@ jobs:
               if not isinstance(run, dict):
                   continue
               try:
-                  provenance = build_github_readiness_provenance(
+                  validate_github_readiness_source(
                       expected_repository=repository_name,
                       expected_head=head,
                       repository=repository,
@@ -312,15 +314,10 @@ jobs:
                   )
               except ReleaseAdmissionError:
                   continue
-              candidates.append((artifact, provenance))
+              candidates.append((artifact, run))
           if not candidates:
               raise SystemExit("no validated exact-head readiness artifact was found")
-          artifact, provenance = max(candidates, key=lambda item: item[0]["id"])
-          with open(
-              "release-readiness-provenance.json", "w", encoding="utf-8"
-          ) as output:
-              json.dump(provenance, output, indent=2, sort_keys=True)
-              output.write("\n")
+          artifact, run = max(candidates, key=lambda item: item[0]["id"])
           download = urllib.request.Request(
               artifact["archive_download_url"], headers=api_headers
           )
@@ -351,6 +348,24 @@ jobs:
                   raise SystemExit("readiness artifact must contain only release-readiness.json")
               with open("release-readiness.json", "wb") as output:
                   output.write(archive.read(names[0]))
+          with open("release-readiness.json", encoding="utf-8") as handle:
+              readiness = json.load(handle)
+          if not isinstance(readiness, dict):
+              raise SystemExit("readiness artifact record is malformed")
+          provenance = build_github_readiness_provenance(
+              expected_repository=repository_name,
+              expected_head=head,
+              repository=repository,
+              workflow=workflow,
+              run=run,
+              artifact=artifact,
+              readiness_sha256=mapping_sha256(readiness),
+          )
+          with open(
+              "release-readiness-provenance.json", "w", encoding="utf-8"
+          ) as output:
+              json.dump(provenance, output, indent=2, sort_keys=True)
+              output.write("\n")
           PY
           fi
 

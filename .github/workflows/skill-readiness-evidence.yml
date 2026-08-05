@@ -82,7 +82,10 @@ jobs:
           import json
           from pathlib import Path
 
-          from vibe_loop.release_admission import validate_readiness_record
+          from vibe_loop.release_admission import (
+              release_distribution_paths,
+              validate_readiness_record,
+          )
 
           with open("release-classification.json", encoding="utf-8") as handle:
               classification = json.load(handle)
@@ -91,7 +94,7 @@ jobs:
           diagnostics = validate_readiness_record(
               readiness,
               classification=classification,
-              distributions=tuple(sorted(Path("dist").iterdir())),
+              distributions=release_distribution_paths(Path("dist")),
           )
           if diagnostics:
               raise SystemExit("readiness validation blocked: " + "; ".join(diagnostics))

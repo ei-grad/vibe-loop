@@ -19,6 +19,7 @@ RELEASE_ADMISSION_RECORD_TYPE = "skill_release_admission"
 READINESS_PROVENANCE_SCHEMA_VERSION = 1
 READINESS_PROVENANCE_RECORD_TYPE = "skill_release_readiness_provenance"
 READINESS_WORKFLOW_PATH = ".github/workflows/skill-readiness-evidence.yml"
+RELEASE_DISTRIBUTION_GLOBS = ("*.whl", "*.tar.gz")
 OWNERSHIP_CONTRACT_VERSION = 1
 
 # This is the authoritative ownership boundary for release-readiness classification.
@@ -284,6 +285,20 @@ def distribution_fingerprints(path: Path) -> dict[str, str]:
     return normalized
 
 
+def release_distribution_paths(directory: Path) -> tuple[Path, ...]:
+    paths = tuple(
+        sorted(
+            path
+            for pattern in RELEASE_DISTRIBUTION_GLOBS
+            for path in directory.glob(pattern)
+            if path.is_file()
+        )
+    )
+    if not paths:
+        raise ReleaseAdmissionError("release distributions are missing")
+    return paths
+
+
 def validate_readiness_record(
     record: Mapping[str, object],
     *,
@@ -352,6 +367,7 @@ def validate_readiness_provenance(
         "schema_version",
         "record_type",
         "classification_head",
+        "readiness_sha256",
         "repository",
         "workflow",
         "run",
@@ -378,6 +394,14 @@ def validate_readiness_provenance(
         diagnostics.append(
             "readiness provenance head does not match classification and readiness"
         )
+
+    readiness_sha256 = record.get("readiness_sha256")
+    if not isinstance(readiness_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", readiness_sha256
+    ):
+        diagnostics.append("readiness provenance record hash is malformed")
+    elif readiness_sha256 != mapping_sha256(readiness_record):
+        diagnostics.append("readiness provenance does not match readiness record")
 
     repository = record.get("repository")
     repository_name: str | None = None
@@ -451,7 +475,7 @@ def validate_readiness_provenance(
     return tuple(diagnostics)
 
 
-def build_github_readiness_provenance(
+def validate_github_readiness_source(
     *,
     expected_repository: str,
     expected_head: str,
@@ -459,7 +483,7 @@ def build_github_readiness_provenance(
     workflow: Mapping[str, object],
     run: Mapping[str, object],
     artifact: Mapping[str, object],
-) -> dict[str, object]:
+) -> tuple[str, int, int, int, str]:
     if (
         not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", expected_repository)
         or expected_repository.startswith(".")
@@ -509,10 +533,43 @@ def build_github_readiness_provenance(
     ):
         raise ReleaseAdmissionError("GitHub readiness artifact does not match")
 
+    return (
+        repository_url,
+        int(workflow_id),
+        int(run_id),
+        int(artifact_id),
+        artifact_name,
+    )
+
+
+def build_github_readiness_provenance(
+    *,
+    expected_repository: str,
+    expected_head: str,
+    repository: Mapping[str, object],
+    workflow: Mapping[str, object],
+    run: Mapping[str, object],
+    artifact: Mapping[str, object],
+    readiness_sha256: str,
+) -> dict[str, object]:
+    if not re.fullmatch(r"[0-9a-f]{64}", readiness_sha256):
+        raise ReleaseAdmissionError("GitHub readiness record hash is malformed")
+    repository_url, workflow_id, run_id, artifact_id, artifact_name = (
+        validate_github_readiness_source(
+            expected_repository=expected_repository,
+            expected_head=expected_head,
+            repository=repository,
+            workflow=workflow,
+            run=run,
+            artifact=artifact,
+        )
+    )
+
     return {
         "schema_version": READINESS_PROVENANCE_SCHEMA_VERSION,
         "record_type": READINESS_PROVENANCE_RECORD_TYPE,
         "classification_head": expected_head,
+        "readiness_sha256": readiness_sha256,
         "repository": {
             "full_name": expected_repository,
             "html_url": repository_url,

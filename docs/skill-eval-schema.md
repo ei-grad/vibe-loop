@@ -233,15 +233,17 @@ base/head commits, all Git name-status entries (including both rename paths),
 owned paths, uncertainty, and either `readiness_required` or
 `unrelated_exemption`.
 
+This section is authoritative for the persisted provenance field set.
 `skill_release_readiness_provenance` schema version 1 has exactly these fields:
-`schema_version`; `record_type`; `classification_head`;
-`repository.full_name` and canonical `repository.html_url`; numeric
-`workflow.id` and the fixed repository `workflow.path`; numeric `run.id`, exact
-`run.head`, and successful `run.conclusion`; numeric `artifact.id` and its
-exact-head immutable `artifact.name`; and `evidence_reference`. The reference
-is the canonical GitHub HTTPS artifact page derived from the repository, run
-id, and artifact id. Extra fields are invalid so API/download/redirect URLs,
-signed values, tokens, and local paths cannot enter the record.
+`schema_version`; `record_type`; `classification_head`; `readiness_sha256`, the
+canonical JSON hash of the selected readiness record; `repository.full_name`
+and canonical `repository.html_url`; numeric `workflow.id` and the fixed
+repository `workflow.path`; numeric `run.id`, exact `run.head`, and successful
+`run.conclusion`; numeric `artifact.id` and its exact-head immutable
+`artifact.name`; and `evidence_reference`. The reference is the canonical
+GitHub HTTPS artifact page derived from the repository, run id, and artifact
+id. Extra fields are invalid so API/download/redirect URLs, signed values,
+tokens, and local paths cannot enter the record.
 
 `skill_release_admission` schema version 2 embeds and hashes that provenance in
 `readiness_provenance` and `readiness_provenance_sha256`, hashes the

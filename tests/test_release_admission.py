@@ -21,7 +21,9 @@ from vibe_loop.release_admission import (
     bundled_skill_fingerprints,
     classify_release_changes,
     eval_release_provenance,
+    mapping_sha256,
     parse_name_status,
+    release_distribution_paths,
     render_release_admission_summary,
     verify_release_admission,
 )
@@ -76,9 +78,33 @@ class ReleaseAdmissionTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("skill-release-readiness-${{ github.sha }}", evidence_workflow)
         self.assertIn('record.get("status") != "passed"', evidence_workflow)
+        self.assertIn('release_distribution_paths(Path("dist"))', evidence_workflow)
+        self.assertNotIn('Path("dist").iterdir()', evidence_workflow)
         self.assertNotIn("release-admit", evidence_workflow)
         self.assertNotIn("release-admission.json", evidence_workflow)
         self.assertNotIn("readiness evidence:", evidence_workflow)
+
+    def test_release_distribution_selection_excludes_dist_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            dist = Path(directory)
+            for name in (
+                ".gitignore",
+                "vibe_loop-1-py3-none-any.whl",
+                "vibe_loop-1.tar.gz",
+                "checksums.txt",
+            ):
+                write(dist / name, "fixture\n")
+
+            selected = release_distribution_paths(dist)
+
+        self.assertEqual(
+            [path.name for path in selected],
+            ["vibe_loop-1-py3-none-any.whl", "vibe_loop-1.tar.gz"],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            write(Path(directory) / ".gitignore", "*\n")
+            with self.assertRaisesRegex(ReleaseAdmissionError, "distributions"):
+                release_distribution_paths(Path(directory))
 
     def test_classifier_covers_owned_changes_rename_deletion_and_mixed_paths(
         self,
@@ -198,7 +224,7 @@ class ReleaseAdmissionTests(unittest.TestCase):
             head = "2" * 40
             classification = classification_record(base, head, required=True)
             readiness = readiness_record(base, head, fingerprints)
-            provenance = readiness_provenance(head)
+            provenance = readiness_provenance(head, readiness)
 
             admission = build_release_admission(
                 classification,
@@ -254,6 +280,27 @@ class ReleaseAdmissionTests(unittest.TestCase):
             any("transferred artifacts" in diagnostic for diagnostic in diagnostics)
         )
 
+    def test_provenance_rejects_a_different_same_head_readiness_record(self) -> None:
+        base = "1" * 40
+        head = "2" * 40
+        classification = classification_record(base, head, required=True)
+        admitted_readiness = readiness_record(base, head, {"skill": "a" * 64})
+        substituted_readiness = copy.deepcopy(admitted_readiness)
+        substituted_readiness["evidence_set"] = "different-same-head-run"
+        provenance = readiness_provenance(head, admitted_readiness)
+
+        admission = build_release_admission(
+            classification,
+            readiness_record=substituted_readiness,
+            readiness_provenance=provenance,
+            distributions=(),
+        )
+
+        self.assertIn(
+            "readiness provenance does not match readiness record",
+            admission["diagnostics"],
+        )
+
     def test_cli_builds_and_verifies_readiness_and_exemption_contracts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -273,8 +320,9 @@ class ReleaseAdmissionTests(unittest.TestCase):
             provenance_path = repo / "provenance.json"
             admission_path = repo / "admission.json"
             write_json(classification_path, classification)
-            write_json(readiness_path, readiness_record(base, head, fingerprints))
-            write_json(provenance_path, readiness_provenance(head))
+            readiness = readiness_record(base, head, fingerprints)
+            write_json(readiness_path, readiness)
+            write_json(provenance_path, readiness_provenance(head, readiness))
             arguments = [
                 "eval",
                 "release-admit",
@@ -351,7 +399,7 @@ class ReleaseAdmissionTests(unittest.TestCase):
         admission = build_release_admission(
             classification,
             readiness_record=record,
-            readiness_provenance=readiness_provenance("3" * 40),
+            readiness_provenance=readiness_provenance("3" * 40, record),
             distributions=(),
         )
 
@@ -367,9 +415,13 @@ class ReleaseAdmissionTests(unittest.TestCase):
 
     def test_github_provenance_builder_rejects_substituted_api_identity(self) -> None:
         head = "2" * 40
-        inputs = github_provenance_inputs(head)
+        readiness_sha256 = "a" * 64
+        inputs = github_provenance_inputs(head, readiness_sha256)
         provenance = build_github_readiness_provenance(**inputs)
-        self.assertEqual(provenance, readiness_provenance(head))
+        self.assertEqual(
+            provenance,
+            readiness_provenance(head, readiness_sha256=readiness_sha256),
+        )
 
         substitutions = (
             ("repository", "full_name", "attacker/vibe-loop", "repository"),
@@ -406,6 +458,7 @@ class ReleaseAdmissionTests(unittest.TestCase):
         invalid_records = []
         for path, value in (
             (("classification_head",), "3" * 40),
+            (("readiness_sha256",), "malformed"),
             (("workflow", "id"), 0),
             (("workflow", "path"), ".github/workflows/other.yml"),
             (("run", "id"), 0),
@@ -414,13 +467,13 @@ class ReleaseAdmissionTests(unittest.TestCase):
             (("artifact", "name"), "renamed"),
             (("evidence_reference",), "http://github.com/example/vibe-loop"),
         ):
-            record = copy.deepcopy(readiness_provenance(head))
+            record = copy.deepcopy(readiness_provenance(head, readiness))
             target = record
             for key in path[:-1]:
                 target = target[key]
             target[path[-1]] = value
             invalid_records.append(record)
-        record = copy.deepcopy(readiness_provenance(head))
+        record = copy.deepcopy(readiness_provenance(head, readiness))
         rejected_url = "https://api.github.com/signed-secret-value"
         record["archive_download_url"] = rejected_url
         invalid_records.append(record)
@@ -442,7 +495,7 @@ class ReleaseAdmissionTests(unittest.TestCase):
         admission = build_release_admission(
             classification,
             readiness_record=readiness,
-            readiness_provenance=readiness_provenance(head),
+            readiness_provenance=readiness_provenance(head, readiness),
             distributions=(),
         )
         tampered = copy.deepcopy(admission)
@@ -452,7 +505,7 @@ class ReleaseAdmissionTests(unittest.TestCase):
             tampered,
             classification=classification,
             readiness_record=readiness,
-            readiness_provenance=readiness_provenance(head),
+            readiness_provenance=readiness_provenance(head, readiness),
             distributions=(),
         )
         self.assertIn(
@@ -476,7 +529,7 @@ class ReleaseAdmissionTests(unittest.TestCase):
         admission = build_release_admission(
             classification,
             readiness_record=record,
-            readiness_provenance=readiness_provenance(head),
+            readiness_provenance=readiness_provenance(head, record),
             distributions=(),
         )
 
@@ -606,11 +659,20 @@ def readiness_record(
     }
 
 
-def readiness_provenance(head: str) -> dict[str, object]:
+def readiness_provenance(
+    head: str,
+    readiness: dict[str, object] | None = None,
+    *,
+    readiness_sha256: str | None = None,
+) -> dict[str, object]:
+    digest = readiness_sha256
+    if digest is None:
+        digest = mapping_sha256(readiness) if readiness is not None else "a" * 64
     return {
         "schema_version": 1,
         "record_type": "skill_release_readiness_provenance",
         "classification_head": head,
+        "readiness_sha256": digest,
         "repository": {
             "full_name": "example/vibe-loop",
             "html_url": "https://github.com/example/vibe-loop",
@@ -627,10 +689,13 @@ def readiness_provenance(head: str) -> dict[str, object]:
     }
 
 
-def github_provenance_inputs(head: str) -> dict[str, object]:
+def github_provenance_inputs(
+    head: str, readiness_sha256: str = "a" * 64
+) -> dict[str, object]:
     return {
         "expected_repository": "example/vibe-loop",
         "expected_head": head,
+        "readiness_sha256": readiness_sha256,
         "repository": {
             "full_name": "example/vibe-loop",
             "html_url": "https://github.com/example/vibe-loop",

@@ -76,15 +76,15 @@ Required readiness records bind the base and head commits, each required
 trial's skill source fingerprint, and the complete bundled-skill fingerprint
 set. Admission compares those fingerprints with every built wheel and source
 distribution. For readiness-required admission, GitHub discovery also persists
-the matching classification head, canonical repository identity and HTML URL,
-readiness workflow id and repository path, successful workflow run id and head,
-immutable artifact id and exact-head name, and the canonical
-`https://github.com/<owner>/<repository>/actions/runs/<run>/artifacts/<artifact>`
-evidence reference. This provenance is derived only from mutually consistent
-GitHub repository, workflow, run, and artifact responses. A manual run id may
-narrow discovery but cannot supply or override provenance. API download URLs,
-redirects, signed URLs, tokens, local paths, and operator-supplied links are
-never provenance.
+strict provenance binding the selected GitHub evidence to the exact
+classification and canonical readiness record. The
+[release-evidence schema](../skill-eval-schema.md#release-evidence-records) is
+the sole authority for its persisted field set. The provenance is derived only
+from mutually consistent GitHub repository, workflow, run, and artifact
+responses and exposes their canonical stable GitHub HTTPS evidence reference.
+A manual run id may narrow discovery but cannot supply or override provenance.
+API download URLs, redirects, signed URLs, tokens, local paths, and
+operator-supplied links are never provenance.
 
 The classification, optional readiness record, required readiness provenance,
 admission record, and distributions are hashed and revalidated after transfer
