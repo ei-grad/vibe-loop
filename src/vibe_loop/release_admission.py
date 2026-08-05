@@ -14,8 +14,11 @@ from pathlib import Path, PurePosixPath
 FULL_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 RELEASE_CLASSIFICATION_SCHEMA_VERSION = 1
 RELEASE_CLASSIFICATION_RECORD_TYPE = "skill_release_classification"
-RELEASE_ADMISSION_SCHEMA_VERSION = 1
+RELEASE_ADMISSION_SCHEMA_VERSION = 2
 RELEASE_ADMISSION_RECORD_TYPE = "skill_release_admission"
+READINESS_PROVENANCE_SCHEMA_VERSION = 1
+READINESS_PROVENANCE_RECORD_TYPE = "skill_release_readiness_provenance"
+READINESS_WORKFLOW_PATH = ".github/workflows/skill-readiness-evidence.yml"
 OWNERSHIP_CONTRACT_VERSION = 1
 
 # This is the authoritative ownership boundary for release-readiness classification.
@@ -338,6 +341,195 @@ def validate_readiness_record(
     return tuple(diagnostics)
 
 
+def validate_readiness_provenance(
+    record: Mapping[str, object],
+    *,
+    classification: Mapping[str, object],
+    readiness_record: Mapping[str, object],
+) -> tuple[str, ...]:
+    diagnostics: list[str] = []
+    expected_keys = {
+        "schema_version",
+        "record_type",
+        "classification_head",
+        "repository",
+        "workflow",
+        "run",
+        "artifact",
+        "evidence_reference",
+    }
+    if set(record) != expected_keys:
+        diagnostics.append("readiness provenance fields are missing or unexpected")
+    if record.get("schema_version") != READINESS_PROVENANCE_SCHEMA_VERSION:
+        diagnostics.append("readiness provenance schema version is unsupported")
+    if record.get("record_type") != READINESS_PROVENANCE_RECORD_TYPE:
+        diagnostics.append("readiness provenance record type is invalid")
+
+    head = record.get("classification_head")
+    readiness_revision = readiness_record.get("revision")
+    readiness_head = (
+        readiness_revision.get("head")
+        if isinstance(readiness_revision, Mapping)
+        else None
+    )
+    if not isinstance(head, str) or not FULL_COMMIT_PATTERN.fullmatch(head):
+        diagnostics.append("readiness provenance head is malformed")
+    elif head != classification.get("head") or head != readiness_head:
+        diagnostics.append(
+            "readiness provenance head does not match classification and readiness"
+        )
+
+    repository = record.get("repository")
+    repository_name: str | None = None
+    repository_url: str | None = None
+    if not isinstance(repository, Mapping) or set(repository) != {
+        "full_name",
+        "html_url",
+    }:
+        diagnostics.append("readiness provenance repository is malformed")
+    else:
+        full_name = repository.get("full_name")
+        html_url = repository.get("html_url")
+        if (
+            not isinstance(full_name, str)
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", full_name)
+            or full_name.startswith(".")
+            or "/." in full_name
+        ):
+            diagnostics.append("readiness provenance repository identity is malformed")
+        elif html_url != f"https://github.com/{full_name}":
+            diagnostics.append("readiness provenance repository URL is not canonical")
+        else:
+            repository_name = full_name
+            repository_url = html_url
+
+    workflow = record.get("workflow")
+    if not isinstance(workflow, Mapping) or set(workflow) != {"id", "path"}:
+        diagnostics.append("readiness provenance workflow is malformed")
+    else:
+        if not _is_positive_integer(workflow.get("id")):
+            diagnostics.append("readiness provenance workflow id is malformed")
+        if workflow.get("path") != READINESS_WORKFLOW_PATH:
+            diagnostics.append("readiness provenance workflow path is invalid")
+
+    run = record.get("run")
+    run_id: int | None = None
+    if not isinstance(run, Mapping) or set(run) != {"id", "head", "conclusion"}:
+        diagnostics.append("readiness provenance run is malformed")
+    else:
+        if not _is_positive_integer(run.get("id")):
+            diagnostics.append("readiness provenance run id is malformed")
+        else:
+            run_id = run["id"]
+        if run.get("head") != head:
+            diagnostics.append("readiness provenance run head does not match")
+        if run.get("conclusion") != "success":
+            diagnostics.append("readiness provenance run was not successful")
+
+    artifact = record.get("artifact")
+    artifact_id: int | None = None
+    if not isinstance(artifact, Mapping) or set(artifact) != {"id", "name"}:
+        diagnostics.append("readiness provenance artifact is malformed")
+    else:
+        if not _is_positive_integer(artifact.get("id")):
+            diagnostics.append("readiness provenance artifact id is malformed")
+        else:
+            artifact_id = artifact["id"]
+        if artifact.get("name") != f"skill-release-readiness-{head}":
+            diagnostics.append("readiness provenance artifact name does not match head")
+
+    expected_reference = (
+        f"{repository_url}/actions/runs/{run_id}/artifacts/{artifact_id}"
+        if repository_name is not None
+        and repository_url is not None
+        and run_id is not None
+        and artifact_id is not None
+        else None
+    )
+    if record.get("evidence_reference") != expected_reference:
+        diagnostics.append("readiness provenance evidence reference is not canonical")
+    return tuple(diagnostics)
+
+
+def build_github_readiness_provenance(
+    *,
+    expected_repository: str,
+    expected_head: str,
+    repository: Mapping[str, object],
+    workflow: Mapping[str, object],
+    run: Mapping[str, object],
+    artifact: Mapping[str, object],
+) -> dict[str, object]:
+    if (
+        not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", expected_repository)
+        or expected_repository.startswith(".")
+        or "/." in expected_repository
+    ):
+        raise ReleaseAdmissionError("GitHub repository identity is malformed")
+    if not FULL_COMMIT_PATTERN.fullmatch(expected_head):
+        raise ReleaseAdmissionError("GitHub readiness head is malformed")
+    repository_url = f"https://github.com/{expected_repository}"
+    if (
+        repository.get("full_name") != expected_repository
+        or repository.get("html_url") != repository_url
+    ):
+        raise ReleaseAdmissionError("GitHub repository response does not match")
+
+    workflow_id = workflow.get("id")
+    if not _is_positive_integer(workflow_id):
+        raise ReleaseAdmissionError("GitHub readiness workflow id is malformed")
+    if workflow.get("path") != READINESS_WORKFLOW_PATH:
+        raise ReleaseAdmissionError("GitHub readiness workflow path does not match")
+
+    run_id = run.get("id")
+    run_path = run.get("path")
+    if not _is_positive_integer(run_id):
+        raise ReleaseAdmissionError("GitHub readiness run id is malformed")
+    if (
+        run.get("head_sha") != expected_head
+        or run.get("workflow_id") != workflow_id
+        or not isinstance(run_path, str)
+        or run_path.partition("@")[0] != READINESS_WORKFLOW_PATH
+        or run.get("event") != "workflow_dispatch"
+        or run.get("conclusion") != "success"
+    ):
+        raise ReleaseAdmissionError("GitHub readiness run does not match")
+
+    artifact_id = artifact.get("id")
+    artifact_name = f"skill-release-readiness-{expected_head}"
+    artifact_run = artifact.get("workflow_run")
+    if not _is_positive_integer(artifact_id):
+        raise ReleaseAdmissionError("GitHub readiness artifact id is malformed")
+    if (
+        artifact.get("name") != artifact_name
+        or artifact.get("expired") is not False
+        or not isinstance(artifact_run, Mapping)
+        or artifact_run.get("id") != run_id
+        or artifact_run.get("head_sha") != expected_head
+    ):
+        raise ReleaseAdmissionError("GitHub readiness artifact does not match")
+
+    return {
+        "schema_version": READINESS_PROVENANCE_SCHEMA_VERSION,
+        "record_type": READINESS_PROVENANCE_RECORD_TYPE,
+        "classification_head": expected_head,
+        "repository": {
+            "full_name": expected_repository,
+            "html_url": repository_url,
+        },
+        "workflow": {"id": workflow_id, "path": READINESS_WORKFLOW_PATH},
+        "run": {"id": run_id, "head": expected_head, "conclusion": "success"},
+        "artifact": {"id": artifact_id, "name": artifact_name},
+        "evidence_reference": (
+            f"{repository_url}/actions/runs/{run_id}/artifacts/{artifact_id}"
+        ),
+    }
+
+
+def _is_positive_integer(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def validate_readiness_gate_payload(record: Mapping[str, object]) -> tuple[str, ...]:
     from vibe_loop.eval_release import release_gate_case_conditions
 
@@ -408,10 +600,12 @@ def build_release_admission(
     classification: Mapping[str, object],
     *,
     readiness_record: Mapping[str, object] | None,
+    readiness_provenance: Mapping[str, object] | None,
     distributions: Sequence[Path],
     repo: Path | None = None,
 ) -> dict[str, object]:
     diagnostics: list[str] = []
+    validated_provenance: dict[str, object] | None = None
     if classification.get("record_type") != RELEASE_CLASSIFICATION_RECORD_TYPE:
         diagnostics.append("classification record type is invalid")
     if classification.get("ownership_contract_version") != OWNERSHIP_CONTRACT_VERSION:
@@ -430,9 +624,22 @@ def build_release_admission(
                     distributions=distributions,
                 )
             )
+        if readiness_provenance is None:
+            diagnostics.append("readiness provenance is required but missing")
+        elif readiness_record is not None:
+            provenance_diagnostics = validate_readiness_provenance(
+                readiness_provenance,
+                classification=classification,
+                readiness_record=readiness_record,
+            )
+            diagnostics.extend(provenance_diagnostics)
+            if not provenance_diagnostics:
+                validated_provenance = dict(readiness_provenance)
         decision = "readiness"
     elif status == "unrelated_exemption":
         decision = "exemption"
+        if readiness_record is not None or readiness_provenance is not None:
+            diagnostics.append("unrelated exemption contains readiness evidence")
         if classification.get("owned_paths"):
             diagnostics.append("unrelated exemption contains an owned path")
         if classification.get("uncertainty"):
@@ -467,6 +674,8 @@ def build_release_admission(
         "readiness_sha256": mapping_sha256(readiness_record)
         if readiness_record
         else None,
+        "readiness_provenance": validated_provenance,
+        "readiness_provenance_sha256": mapping_sha256(validated_provenance),
         "distributions": distribution_records,
         "diagnostics": diagnostics,
     }
@@ -477,16 +686,20 @@ def verify_release_admission(
     *,
     classification: Mapping[str, object],
     readiness_record: Mapping[str, object] | None,
+    readiness_provenance: Mapping[str, object] | None,
     distributions: Sequence[Path],
     repo: Path | None = None,
 ) -> tuple[str, ...]:
     expected = build_release_admission(
         classification,
         readiness_record=readiness_record,
+        readiness_provenance=readiness_provenance,
         distributions=distributions,
         repo=repo,
     )
     diagnostics = list(expected["diagnostics"])
+    if set(admission) != set(expected):
+        diagnostics.append("admission fields are missing or unexpected")
     for field in (
         "schema_version",
         "record_type",
@@ -496,7 +709,10 @@ def verify_release_admission(
         "head",
         "classification_sha256",
         "readiness_sha256",
+        "readiness_provenance",
+        "readiness_provenance_sha256",
         "distributions",
+        "diagnostics",
     ):
         if admission.get(field) != expected.get(field):
             diagnostics.append(
@@ -505,6 +721,28 @@ def verify_release_admission(
     if admission.get("status") != "passed":
         diagnostics.append("admission status is not passed")
     return tuple(dict.fromkeys(diagnostics))
+
+
+def render_release_admission_summary(admission: Mapping[str, object]) -> str:
+    if admission.get("status") != "passed":
+        raise ReleaseAdmissionError("cannot summarize a blocked release admission")
+    if admission.get("decision") == "readiness":
+        provenance = admission.get("readiness_provenance")
+        if not isinstance(provenance, Mapping):
+            raise ReleaseAdmissionError("readiness provenance is missing")
+        reference = provenance.get("evidence_reference")
+        if not isinstance(reference, str):
+            raise ReleaseAdmissionError("readiness evidence reference is missing")
+        return (
+            f"release admission: readiness_required head={admission.get('head')}\n"
+            f"readiness evidence: {reference}"
+        )
+    if admission.get("decision") == "exemption":
+        return (
+            f"release admission: unrelated_release_exemption "
+            f"head={admission.get('head')}"
+        )
+    raise ReleaseAdmissionError("release admission decision is invalid")
 
 
 def validate_release_classification(

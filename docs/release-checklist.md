@@ -44,7 +44,8 @@ The release gate requires:
   publishing;
 - the aggregate was produced at the exact clean commit and every required
   trial contains the matching bundled-skill fingerprint;
-- release notes or the task plan reference the release-readiness record.
+- release notes or the task plan will reference the stable evidence URL from
+  validated release-admission output, rather than a copied download URL.
 
 The default release matrix is intentionally smaller than the full paired eval
 suite. It excludes `no_skill`, covers finite `vibe_loop` behavior across the
@@ -143,14 +144,18 @@ After the release-readiness record passes:
    Readiness Evidence` workflow. The immutable artifact name includes the full
    commit. A dry-run is accepted only when it carries the same exact revision
    and trial fingerprint contract.
-2. Include the evidence workflow run or artifact link in release notes. If
-   regressions were parked, include the task ids.
+2. Do not construct the release-note evidence link manually. After admission,
+   copy the stable GitHub evidence reference printed by `release-admit` and the
+   release job summary. If regressions were parked, include the task ids.
 3. Run the release workflow for TestPyPI, optionally supplying the evidence run
    id to select among exact-head artifacts. PyPI remains restricted to a
    matching `v<version>` tag.
 4. The release workflow discovers the prior reachable release tag, classifies
    every changed/renamed/deleted path, validates the record only when an owned
    path changed, compares every distribution's bundled skills, and uploads a
-   hashed admission bundle. Both publishers download and revalidate that bundle
-   and the distributions before trusted publishing begins. Releases with only
-   unrelated paths use the recorded exemption and do not run the 20-case gate.
+   hashed admission bundle containing the validated repository, workflow, run,
+   artifact, exact-head, and stable-reference provenance. Both publishers
+   download and revalidate that bundle and the distributions before trusted
+   publishing begins. A missing or changed provenance file blocks publication.
+   Releases with only unrelated paths emit an explicit exemption summary and
+   do not require provenance or run the 20-case gate.

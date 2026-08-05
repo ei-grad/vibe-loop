@@ -237,14 +237,20 @@ jobs:
           raise SystemExit(classification["status"] != "readiness_required")
           PY
           then
-            python - <<'PY'
+            uv run python - <<'PY'
           import io
           import json
           import os
+          import re
           import urllib.error
           import urllib.parse
           import urllib.request
           import zipfile
+
+          from vibe_loop.release_admission import (
+              ReleaseAdmissionError,
+              build_github_readiness_provenance,
+          )
 
           api_headers = {
               "Accept": "application/vnd.github+json",
@@ -264,36 +270,57 @@ jobs:
           with open("release-classification.json", encoding="utf-8") as handle:
               head = json.load(handle)["head"]
           requested_run_id = os.environ.get("REQUESTED_RUN_ID", "").strip()
+          if requested_run_id and not re.fullmatch(r"[1-9][0-9]*", requested_run_id):
+              raise SystemExit("the requested readiness run id is malformed")
+          repository_name = os.environ["GITHUB_REPOSITORY"]
+          repository_url = f"{os.environ['GITHUB_API_URL']}/repos/{repository_name}"
+          repository = api_json(repository_url)
           workflow_url = f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/actions/workflows/skill-readiness-evidence.yml"
-          expected_workflow_id = api_json(workflow_url)["id"]
+          workflow = api_json(workflow_url)
+          if not isinstance(repository, dict) or not isinstance(workflow, dict):
+              raise SystemExit("the GitHub repository or workflow response is malformed")
           query = f"?name=skill-release-readiness-{head}&per_page=100"
           url = f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/actions/artifacts{query}"
-          artifacts = api_json(url)["artifacts"]
+          artifact_response = api_json(url)
+          if not isinstance(artifact_response, dict) or not isinstance(
+              artifact_response.get("artifacts"), list
+          ):
+              raise SystemExit("the GitHub artifact response is malformed")
+          artifacts = artifact_response["artifacts"]
           candidates = []
           for artifact in artifacts:
+              if not isinstance(artifact, dict):
+                  continue
               workflow_run = artifact.get("workflow_run") or {}
               run_id = str(workflow_run.get("id", ""))
-              if (
-                  artifact["expired"]
-                  or workflow_run.get("head_sha") != head
-                  or (requested_run_id and run_id != requested_run_id)
-              ):
+              if requested_run_id and run_id != requested_run_id:
+                  continue
+              if not re.fullmatch(r"[1-9][0-9]*", run_id):
                   continue
               run_url = f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{run_id}"
               run = api_json(run_url)
-              run_path = str(run.get("path", "")).partition("@")[0]
-              if (
-                  run.get("head_sha") != head
-                  or run.get("workflow_id") != expected_workflow_id
-                  or run_path != ".github/workflows/skill-readiness-evidence.yml"
-                  or run.get("event") != "workflow_dispatch"
-                  or run.get("conclusion") != "success"
-              ):
+              if not isinstance(run, dict):
                   continue
-              candidates.append(artifact)
+              try:
+                  provenance = build_github_readiness_provenance(
+                      expected_repository=repository_name,
+                      expected_head=head,
+                      repository=repository,
+                      workflow=workflow,
+                      run=run,
+                      artifact=artifact,
+                  )
+              except ReleaseAdmissionError:
+                  continue
+              candidates.append((artifact, provenance))
           if not candidates:
               raise SystemExit("no validated exact-head readiness artifact was found")
-          artifact = max(candidates, key=lambda item: item["created_at"])
+          artifact, provenance = max(candidates, key=lambda item: item[0]["id"])
+          with open(
+              "release-readiness-provenance.json", "w", encoding="utf-8"
+          ) as output:
+              json.dump(provenance, output, indent=2, sort_keys=True)
+              output.write("\n")
           download = urllib.request.Request(
               artifact["archive_download_url"], headers=api_headers
           )
@@ -313,8 +340,11 @@ jobs:
               )
               if urllib.parse.urlsplit(signed_url).scheme != "https":
                   raise SystemExit("readiness artifact redirect is not HTTPS")
-              with urllib.request.urlopen(signed_url) as response:
-                  archive_bytes = response.read()
+              try:
+                  with urllib.request.urlopen(signed_url) as response:
+                      archive_bytes = response.read()
+              except urllib.error.URLError:
+                  raise SystemExit("readiness artifact download failed") from None
           with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
               names = archive.namelist()
               if names != ["release-readiness.json"]:
@@ -330,8 +360,9 @@ jobs:
           uv run vibe-loop eval release-admit --repo .
           --classification release-classification.json
           --readiness-record release-readiness.json
+          --readiness-provenance release-readiness-provenance.json
           --distribution dist/*.whl --distribution dist/*.tar.gz
-          --output release-admission.json --json
+          --output release-admission.json
 
       - name: Build unrelated-release exemption admission
         if: hashFiles('release-readiness.json') == ''
@@ -339,7 +370,27 @@ jobs:
           uv run vibe-loop eval release-admit --repo .
           --classification release-classification.json
           --distribution dist/*.whl --distribution dist/*.tar.gz
-          --output release-admission.json --json
+          --output release-admission.json
+
+      - name: Publish deterministic admission summary
+        run: |
+          uv run python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          from vibe_loop.release_admission import render_release_admission_summary
+
+          with open("release-admission.json", encoding="utf-8") as handle:
+              summary = render_release_admission_summary(json.load(handle))
+          print(summary)
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open(
+              "a", encoding="utf-8"
+          ) as output:
+              output.write("### Release admission\n\n")
+              output.write(summary)
+              output.write("\n")
+          PY
 
       - name: Upload immutable publish admission
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -348,6 +399,7 @@ jobs:
           path: |
             release-classification.json
             release-readiness.json
+            release-readiness-provenance.json
             release-admission.json
           if-no-files-found: error
           retention-days: 7
@@ -399,7 +451,12 @@ jobs:
         run: |
           readiness=()
           if [ -f admission/release-readiness.json ]; then
-            readiness=(--readiness-record admission/release-readiness.json)
+            readiness+=(--readiness-record admission/release-readiness.json)
+          fi
+          if [ -f admission/release-readiness-provenance.json ]; then
+            readiness+=(
+              --readiness-provenance admission/release-readiness-provenance.json
+            )
           fi
           uv run --no-project --with dist/*.whl vibe-loop eval release-admit \
             --repo . --classification admission/release-classification.json \
@@ -466,7 +523,12 @@ jobs:
         run: |
           readiness=()
           if [ -f admission/release-readiness.json ]; then
-            readiness=(--readiness-record admission/release-readiness.json)
+            readiness+=(--readiness-record admission/release-readiness.json)
+          fi
+          if [ -f admission/release-readiness-provenance.json ]; then
+            readiness+=(
+              --readiness-provenance admission/release-readiness-provenance.json
+            )
           fi
           uv run --no-project --with dist/*.whl vibe-loop eval release-admit \
             --repo . --classification admission/release-classification.json \

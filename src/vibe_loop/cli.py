@@ -79,6 +79,7 @@ from vibe_loop.release_admission import (
     bundled_skill_fingerprints,
     classify_release_changes,
     eval_release_provenance,
+    render_release_admission_summary,
     verify_release_admission,
 )
 from vibe_loop.generated_profiles import (
@@ -891,6 +892,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_argument(release_admit)
     release_admit.add_argument("--classification", type=Path, required=True)
     release_admit.add_argument("--readiness-record", type=Path)
+    release_admit.add_argument("--readiness-provenance", type=Path)
     release_admit.add_argument(
         "--distribution", type=Path, action="append", required=True
     )
@@ -1682,6 +1684,11 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
                 if args.readiness_record is not None
                 else None
             )
+            readiness_provenance = (
+                load_json_mapping(args.readiness_provenance)
+                if args.readiness_provenance is not None
+                else None
+            )
             distributions = tuple(args.distribution)
             if args.verify:
                 admission = load_json_mapping(args.output)
@@ -1689,6 +1696,7 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
                     admission,
                     classification=classification,
                     readiness_record=readiness,
+                    readiness_provenance=readiness_provenance,
                     distributions=distributions,
                     repo=config.repo,
                 )
@@ -1696,6 +1704,7 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
                 admission = build_release_admission(
                     classification,
                     readiness_record=readiness,
+                    readiness_provenance=readiness_provenance,
                     distributions=distributions,
                     repo=config.repo,
                 )
@@ -1708,14 +1717,16 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
             )
             return 2
         if args.json:
-            print(json.dumps(admission, indent=2, sort_keys=True))
+            report = (
+                {"status": "blocked", "diagnostics": list(diagnostics)}
+                if args.verify and diagnostics
+                else admission
+            )
+            print(json.dumps(report, indent=2, sort_keys=True))
         elif diagnostics:
             print("release admission blocked: " + "; ".join(map(str, diagnostics)))
         else:
-            print(
-                f"release admission: passed base={admission['base']} "
-                f"head={admission['head']}"
-            )
+            print(render_release_admission_summary(admission))
         return 1 if diagnostics else 0
 
     if args.eval_command == "benchmark":

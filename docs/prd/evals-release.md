@@ -75,10 +75,28 @@ unrelated-release exemption.
 Required readiness records bind the base and head commits, each required
 trial's skill source fingerprint, and the complete bundled-skill fingerprint
 set. Admission compares those fingerprints with every built wheel and source
-distribution. The classification, optional readiness record, admission record,
-and distributions are hashed and revalidated after transfer before either
-publisher receives an identity token. Non-publishing build/test runs produce no
-publish approval or exemption.
+distribution. For readiness-required admission, GitHub discovery also persists
+the matching classification head, canonical repository identity and HTML URL,
+readiness workflow id and repository path, successful workflow run id and head,
+immutable artifact id and exact-head name, and the canonical
+`https://github.com/<owner>/<repository>/actions/runs/<run>/artifacts/<artifact>`
+evidence reference. This provenance is derived only from mutually consistent
+GitHub repository, workflow, run, and artifact responses. A manual run id may
+narrow discovery but cannot supply or override provenance. API download URLs,
+redirects, signed URLs, tokens, local paths, and operator-supplied links are
+never provenance.
+
+The classification, optional readiness record, required readiness provenance,
+admission record, and distributions are hashed and revalidated after transfer
+before either publisher exercises trusted publishing. Missing, malformed,
+mismatched, substituted, or tampered readiness provenance blocks publication.
+A complete unrelated-release exemption requires neither readiness record nor
+provenance. Tag-triggered PyPI and manual TestPyPI/PyPI publication share this
+contract. Admission command output and the GitHub job summary expose the stable
+evidence reference, or explicitly identify an unrelated-release exemption,
+without secret-bearing or expiring values. Non-publishing `workflow_run`
+build/test executions produce no admission, exemption, readiness-evidence
+reference, or publish-readiness claim.
 
 Acceptance must cover a curated release matrix distinct from the full paired
 eval suite, no required `no_skill` baseline for release readiness, required

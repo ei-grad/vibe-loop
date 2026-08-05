@@ -594,14 +594,23 @@ Build or verify the final distribution-bound admission record:
 vibe-loop eval release-admit --repo . \
   --classification release-classification.json \
   --readiness-record release-readiness.json \
+  --readiness-provenance release-readiness-provenance.json \
   --distribution dist/vibe_loop.whl \
   --output release-admission.json
 ```
 
 `--classification`, repeatable `--distribution`, and `--output` are required.
-`--readiness-record` is required by the classification, not for a validated
-unrelated exemption. `--verify` re-hashes transferred inputs and rejects any
-admission or distribution substitution.
+`--readiness-record` and `--readiness-provenance` are required by a
+readiness-required classification and omitted for a validated unrelated
+exemption. The provenance input is the strict GitHub-derived record defined by
+the [skill eval schema](skill-eval-schema.md#release-evidence-records).
+`--verify` re-hashes every transferred input and rejects admission,
+classification, readiness, provenance, or distribution substitution.
+
+Successful non-JSON output is deterministic. Readiness-required admission
+prints its exact head and stable GitHub evidence reference on separate lines;
+an exemption prints `unrelated_release_exemption` and its exact head. Blocked
+output contains diagnostics but never emits a publish-readiness claim.
 
 Release-readiness behavior is defined by
 [PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate).

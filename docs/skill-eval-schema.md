@@ -231,8 +231,22 @@ admission.
 `skill_release_classification` records the ownership-contract version, canonical
 base/head commits, all Git name-status entries (including both rename paths),
 owned paths, uncertainty, and either `readiness_required` or
-`unrelated_exemption`. `skill_release_admission` hashes the classification and
-readiness record, records each distribution's name, size, and SHA-256, and has
-status `passed` only when the selected evidence path and packaged skill bytes
-validate. Exact publishing behavior is owned by
+`unrelated_exemption`.
+
+`skill_release_readiness_provenance` schema version 1 has exactly these fields:
+`schema_version`; `record_type`; `classification_head`;
+`repository.full_name` and canonical `repository.html_url`; numeric
+`workflow.id` and the fixed repository `workflow.path`; numeric `run.id`, exact
+`run.head`, and successful `run.conclusion`; numeric `artifact.id` and its
+exact-head immutable `artifact.name`; and `evidence_reference`. The reference
+is the canonical GitHub HTTPS artifact page derived from the repository, run
+id, and artifact id. Extra fields are invalid so API/download/redirect URLs,
+signed values, tokens, and local paths cannot enter the record.
+
+`skill_release_admission` schema version 2 embeds and hashes that provenance in
+`readiness_provenance` and `readiness_provenance_sha256`, hashes the
+classification and readiness record, records each distribution's name, size,
+and SHA-256, and has status `passed` only when the selected evidence path and
+packaged skill bytes validate. Both provenance fields are null for an unrelated
+exemption. Exact publishing behavior is owned by
 [PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate).

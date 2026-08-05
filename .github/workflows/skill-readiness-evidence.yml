@@ -78,11 +78,24 @@ jobs:
           if classification["status"] != "readiness_required":
               raise SystemExit("the exact revision does not require readiness evidence")
           PY
-          uv run vibe-loop eval release-admit --repo . \
-            --classification release-classification.json \
-            --readiness-record release-readiness.json \
-            --distribution dist/*.whl --distribution dist/*.tar.gz \
-            --output release-admission.json
+          uv run python - <<'PY'
+          import json
+          from pathlib import Path
+
+          from vibe_loop.release_admission import validate_readiness_record
+
+          with open("release-classification.json", encoding="utf-8") as handle:
+              classification = json.load(handle)
+          with open("release-readiness.json", encoding="utf-8") as handle:
+              readiness = json.load(handle)
+          diagnostics = validate_readiness_record(
+              readiness,
+              classification=classification,
+              distributions=tuple(sorted(Path("dist").iterdir())),
+          )
+          if diagnostics:
+              raise SystemExit("readiness validation blocked: " + "; ".join(diagnostics))
+          PY
 
       - name: Upload immutable exact-head readiness evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
