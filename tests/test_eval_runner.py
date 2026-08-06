@@ -1637,7 +1637,7 @@ class EvalRunnerCliTests(unittest.TestCase):
                 / "cases/negative-trigger-set/no_skill/trial-1/command-results.json"
             )
             command_results.write_text(
-                json.dumps({"commands": [], "payload": canary}) + "\n",
+                json.dumps({"commands": [], "secret_blob": canary}) + "\n",
                 encoding="utf-8",
             )
             stdout = StringIO()

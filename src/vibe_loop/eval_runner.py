@@ -95,6 +95,136 @@ ROLE_PATHS = {
     "task_source_evidence": "task-source-evidence.json",
     "hook_evidence": "hook-evidence.json",
 }
+STRUCTURED_ARTIFACT_TOP_LEVEL_FIELDS = {
+    "aggregate.json": {
+        "artifact_root",
+        "cases",
+        "conditions",
+        "generated_at",
+        "records",
+        "release_provenance",
+        "schema_version",
+        "skill_quality",
+        "suite_id",
+        "total_trials",
+    },
+    "budget-evidence.json": {"duration_seconds", "output_bytes", "timeout"},
+    "command-results.json": {"commands"},
+    "delegation-evidence.json": {"agents"},
+    "final-repo-state.json": {
+        "branch",
+        "branch_count",
+        "branch_heads",
+        "changed_path_count",
+        "dirty",
+        "head",
+        "worktree_count",
+    },
+    "generated-profile.json": {
+        "confidence",
+        "profile_kind",
+        "prompt_version",
+        "schema_version",
+        "stable_ids",
+        "status",
+    },
+    "git-state-after.json": {
+        "branch",
+        "branch_count",
+        "branch_heads",
+        "changed_path_count",
+        "dirty",
+        "head",
+        "worktree_count",
+    },
+    "git-state-before.json": {
+        "branch",
+        "branch_count",
+        "branch_heads",
+        "changed_path_count",
+        "dirty",
+        "head",
+        "worktree_count",
+    },
+    "grader-outputs.json": {"graders"},
+    "hook-evidence.json": {
+        "completion_commands_configured",
+        "events",
+        "planning_command_configured",
+        "results",
+        "runtime",
+    },
+    "lock-evidence.json": {
+        "acquire",
+        "after",
+        "before",
+        "final_status",
+        "main_integration_status",
+        "release",
+    },
+    "manifest.json": {
+        "cases",
+        "conditions",
+        "generated_at",
+        "suite_id",
+        "trials",
+    },
+    "negative-prompt-results.json": {"results"},
+    "report-evidence.json": {"latest"},
+    "review-evidence.json": {"initial", "rereview"},
+    "run-result.json": {
+        "command_count",
+        "duration_seconds",
+        "exit_code",
+        "latency_seconds",
+        "output_bytes",
+        "run_id",
+        "schema_diagnostics",
+        "task_completed",
+        "task_id",
+        "task_status",
+        "timeout",
+        "usage",
+        "workflow_contract_completed",
+    },
+    "run.json": {
+        "agent",
+        "artifacts",
+        "budget",
+        "case_id",
+        "condition",
+        "failure_taxonomy",
+        "final_repo_state",
+        "finished_at",
+        "graders",
+        "harness",
+        "model",
+        "record_type",
+        "reproducibility",
+        "run_id",
+        "schema_version",
+        "scoring",
+        "skill_condition",
+        "source_fingerprints",
+        "started_at",
+        "status",
+        "structured_result",
+        "suite_id",
+        "task",
+        "trial",
+    },
+    "task-source-evidence.json": {
+        "backend_type",
+        "origin",
+        "runnable_task_ids",
+        "selected_task",
+        "task_ids",
+        "tasks",
+    },
+    "test-results.json": {"deterministic"},
+    "workflow-events.json": {"events"},
+    "workspace-evidence.json": {"by_task", "schema_version"},
+}
 UNSAFE_COMMAND_FRAGMENTS = (
     "git reset --hard",
     "git checkout --",
@@ -297,7 +427,9 @@ def archive_previous_aggregate_artifacts(
         if source.exists():
             validate_archive_source(source)
             roots_to_archive.append((relative_root, source))
-    validate_structured_value(previous_aggregate, category="aggregate")
+    validate_structured_artifact(
+        "aggregate.json", previous_aggregate, category="aggregate"
+    )
     snapshot_root.mkdir(parents=True, exist_ok=True)
     write_json(snapshot_root / "aggregate.json", previous_aggregate)
 
@@ -356,7 +488,20 @@ def validate_archive_source(source: Path) -> None:
                 raise EvalSafeEnvelopeError(
                     "archive rejected: malformed JSON"
                 ) from None
-            validate_structured_value(payload, category="archive")
+            validate_structured_artifact(path.name, payload, category="archive")
+
+
+def validate_structured_artifact(
+    filename: str, value: object, *, category: str
+) -> None:
+    allowed_fields = STRUCTURED_ARTIFACT_TOP_LEVEL_FIELDS.get(filename)
+    if allowed_fields is None:
+        raise EvalSafeEnvelopeError(f"{category} rejected: unknown artifact schema")
+    if not isinstance(value, Mapping):
+        raise EvalSafeEnvelopeError(f"{category} rejected: expected object")
+    if set(value) - allowed_fields:
+        raise EvalSafeEnvelopeError(f"{category} rejected: unknown field")
+    validate_structured_value(value, category=category)
 
 
 def validate_structured_value(
