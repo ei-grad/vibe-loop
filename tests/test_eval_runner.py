@@ -1814,6 +1814,81 @@ class EvalRunnerCliTests(unittest.TestCase):
         self.assertIn("skill_activated", events)
         self.assertIn("integration_lock_busy_observed", events)
 
+    def test_codex_json_worktree_command_preserves_event_after_cleanup(self) -> None:
+        stream = json.dumps(
+            {
+                "type": "item.started",
+                "item": {
+                    "type": "command_execution",
+                    "command": (
+                        "/bin/zsh -lc 'git worktree add -b vibe-loop/task-1 "
+                        "../task-1 HEAD'"
+                    ),
+                },
+            }
+        )
+        execution = CommandExecution(
+            command="agent",
+            exit_code=0,
+            stdout=stream,
+            stderr="",
+            started_at="2026-05-09T00:00:00+00:00",
+            finished_at="2026-05-09T00:00:01+00:00",
+            duration_seconds=1.0,
+        )
+        git_before = {
+            "head": "a" * 40,
+            "branch": "main",
+            "branch_heads": {"main": "a" * 40},
+            "worktrees": ["worktree /repo", "HEAD " + "a" * 40],
+        }
+        git_after = {
+            "head": "b" * 40,
+            "branch": "main",
+            "branch_heads": {"main": "b" * 40},
+            "worktrees": ["worktree /repo", "HEAD " + "b" * 40],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            events = workflow_events_for_trial(
+                Path(directory),
+                execution,
+                (),
+                allow_artifact_events=False,
+                git_before=git_before,
+                git_after=git_after,
+                condition="vibe_loop",
+            )
+
+        self.assertIn("branch_or_worktree_created", events)
+
+    def test_codex_json_search_for_worktree_command_does_not_emit_event(self) -> None:
+        stream = json.dumps(
+            {
+                "type": "item.started",
+                "item": {
+                    "type": "command_execution",
+                    "command": ("/bin/zsh -lc \"rg -n 'git worktree add' README.md\""),
+                },
+            }
+        )
+        execution = CommandExecution(
+            command="agent",
+            exit_code=0,
+            stdout=stream,
+            stderr="",
+            started_at="2026-05-09T00:00:00+00:00",
+            finished_at="2026-05-09T00:00:01+00:00",
+            duration_seconds=1.0,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            events = workflow_events_for_trial(
+                Path(directory), execution, (), allow_artifact_events=False
+            )
+
+        self.assertNotIn("branch_or_worktree_created", events)
+
     def test_state_projection_emits_created_worktree_event(self) -> None:
         execution = CommandExecution(
             command="agent",

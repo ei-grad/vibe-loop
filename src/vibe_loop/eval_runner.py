@@ -1939,9 +1939,15 @@ def git_worktree_count(value: object) -> int:
 ANSI_ESCAPE_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 RENDERED_SHELL_COMMAND = re.compile(r"^/bin/(?:ba|z)?sh\s+-lc\s+")
 WORKTREE_CREATION_COMMAND = re.compile(
-    r"(?:-lc\s+['\"]?|&&\s*|\|\|\s*|;\s*)"
+    r"(?:^|&&\s*|\|\|\s*|;\s*)['\"]?"
     r"git\s+(?:worktree\s+add|checkout\s+-b)\b"
 )
+
+
+def shell_command_creates_worktree(command: str) -> bool:
+    normalized = ANSI_ESCAPE_SEQUENCE.sub("", command).strip()
+    normalized = RENDERED_SHELL_COMMAND.sub("", normalized, count=1)
+    return WORKTREE_CREATION_COMMAND.search(normalized) is not None
 
 
 def transient_worktree_events_from_output(text: str) -> list[str]:
@@ -1949,7 +1955,7 @@ def transient_worktree_events_from_output(text: str) -> list[str]:
         line = ANSI_ESCAPE_SEQUENCE.sub("", raw_line).strip()
         if not RENDERED_SHELL_COMMAND.match(line):
             continue
-        if WORKTREE_CREATION_COMMAND.search(line):
+        if shell_command_creates_worktree(line):
             return ["branch_or_worktree_created"]
     return []
 
@@ -2049,7 +2055,7 @@ def _events_for_tool_use(
             or cmd.startswith("ls")
         ):
             events.append("worktree_state_inspected")
-        if "git worktree add" in cmd or "git checkout -b" in cmd:
+        if shell_command_creates_worktree(cmd):
             events.append("branch_or_worktree_created")
         if (
             "pytest" in cmd
@@ -2110,6 +2116,22 @@ def parse_stream_json(text: str) -> tuple[str, list[str]]:
 
         if obj_type == "result":
             result_text = obj.get("result", "") or ""
+            continue
+
+        if obj_type == "item.started":
+            item = obj.get("item")
+            if not isinstance(item, dict) or item.get("type") != "command_execution":
+                continue
+            command = item.get("command")
+            if not isinstance(command, str):
+                continue
+            has_tools = True
+            tool_events, _, is_merge = _events_for_tool_use(
+                "Bash", {"command": command}, saw_merge
+            )
+            events.extend(tool_events)
+            if is_merge:
+                saw_merge = True
             continue
 
         if obj_type != "assistant":
