@@ -50,12 +50,11 @@ no skill activation and no finite-slice workflow. Future suites can add
 `candidate_skill` and `infinite_vibe_loop` conditions without changing these
 case IDs.
 
-The release gate uses a smaller required matrix than the full suite. It runs
-representative finite cases under `vibe_loop`, protocol-heavy worker cases under
-`vibe_loop_cli`, only delegation-specific cases under
-`orchestrated_vibe_loop`, and the negative trigger set under `vibe_loop`. It
-does not require `no_skill` baseline trials; those remain part of full paired
-eval analysis.
+The release-readiness matrix contract is authoritative in
+[PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate). Its
+concrete case/condition mapping is implementation data in
+[`RELEASE_GATE_CASE_CONDITIONS`](../src/vibe_loop/eval_release.py); this fixture
+specification does not redefine either.
 
 Each trial starts from a fresh fixture checkout and a fresh eval state directory.
 The harness records the run artifacts required by

@@ -238,9 +238,9 @@ Install repository hooks with:
 make install-hooks
 ```
 
-Release procedures are in the [release checklist](docs/release-checklist.md);
-policy is authoritative in the
-[evals and release PRD](docs/prd/evals-release.md).
+The [checklist](docs/release-checklist.md) owns versions, tags, and installed
+hooks; the [evals PRD](docs/prd/evals-release.md) owns readiness, admission, and
+publishing policy.
 
 ## License
 
