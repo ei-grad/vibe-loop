@@ -22,13 +22,14 @@ EVAL_TRANSCRIPT_RECORD_TYPE = "skill_eval_transcript_event"
 EVAL_MAX_TRANSCRIPT_RECORDS = 4096
 EVAL_MAX_WORKFLOW_EVENTS = 128
 EVAL_MAX_IDENTIFIER_LENGTH = 128
-EVAL_MAX_STRUCTURED_BYTES = 1_048_576
+EVAL_MAX_STRUCTURED_BYTES = 10_485_760
 EVAL_WORKFLOW_EVENTS = frozenset(
     {
         "branch_or_worktree_created",
         "commit_created",
         "exploration_delegated",
         "implementation_delegated",
+        "implementation_edit_started",
         "instructions_inspected",
         "integration_lock_busy_observed",
         "main_advanced_detected",
@@ -43,6 +44,8 @@ EVAL_WORKFLOW_EVENTS = frozenset(
         "review_finding_received",
         "review_requested",
         "skill_activated",
+        "destructive_workspace_cleanup",
+        "unnecessary_user_prompt",
         "unsafe_git_command",
         "verification_ran",
         "task_lock_acquired",
@@ -272,13 +275,30 @@ def _project_transcript_record(
             else:
                 record[key] = bounded_number(item)
         return [record]
+    if set(value) == {"stream", "text"}:
+        stream = value.get("stream")
+        text = value.get("text")
+        if stream not in {"stdout", "stderr"} or not isinstance(text, str):
+            raise EvalSafeEnvelopeError(
+                f"transcript rejected: wrong field type at index {index}"
+            )
+        record = _transcript_record("result")
+        record[f"{stream}_bytes"] = len(text.encode("utf-8"))
+        return [record]
     raw_kind = value.get("kind", value.get("type", value.get("event")))
     if not isinstance(raw_kind, str):
         raise EvalSafeEnvelopeError(
             f"transcript rejected: missing kind at index {index}"
         )
     raw_allowed = {
-        "assistant": {"type", "message", "session_id", "uuid", "parent_tool_use_id"},
+        "assistant": {
+            "type",
+            "message",
+            "session_id",
+            "uuid",
+            "parent_tool_use_id",
+            "timestamp",
+        },
         "command": {"type", "command", "exit_code", "duration_seconds", "timeout"},
         "result": {
             "type",
@@ -292,9 +312,17 @@ def _project_transcript_record(
             "total_cost_usd",
             "usage",
             "uuid",
+            "timestamp",
         },
         "shell_command": {"type", "command", "exit_code", "duration_seconds"},
-        "system": {"type", "subtype", "session_id", "tools", "model"},
+        "system": {
+            "type",
+            "subtype",
+            "session_id",
+            "tools",
+            "model",
+            "timestamp",
+        },
         "tool_call": {"type", "name", "input", "exit_code", "duration_seconds"},
         "tool_result": {"type", "content", "output", "is_error", "duration_seconds"},
         "tool_use": {"type", "name", "input"},
@@ -305,7 +333,19 @@ def _project_transcript_record(
             "output_tokens",
             "duration_seconds",
         },
-        "user": {"type", "message", "session_id", "uuid", "parent_tool_use_id"},
+        "user": {
+            "type",
+            "message",
+            "session_id",
+            "uuid",
+            "parent_tool_use_id",
+            "timestamp",
+        },
+        "thread.started": {"type", "thread_id", "timestamp"},
+        "turn.started": {"type", "turn_id", "timestamp"},
+        "item.started": {"type", "timestamp", "item"},
+        "item.completed": {"type", "timestamp", "item"},
+        "turn.completed": {"type", "turn_id", "timestamp", "usage", "message"},
     }
     allowed = raw_allowed.get(raw_kind)
     if allowed is None or set(value) - allowed:
@@ -327,10 +367,32 @@ def _project_transcript_record(
             if block_type == "tool_use":
                 projected.append(_transcript_record("tool_call"))
         return projected or [_transcript_record("assistant")]
+    if raw_kind in {"item.started", "item.completed"}:
+        item = value.get("item")
+        if not isinstance(item, Mapping):
+            raise EvalSafeEnvelopeError(
+                f"transcript rejected: wrong field type at index {index}"
+            )
+        allowed_item_fields = {
+            "item.started": {"id", "type", "command", "arguments"},
+            "item.completed": {"id", "type", "aggregated_output", "exit_code"},
+        }
+        if set(item) - allowed_item_fields[raw_kind]:
+            raise EvalSafeEnvelopeError(
+                f"transcript rejected: unknown field at index {index}"
+            )
+        kind = "command" if raw_kind == "item.started" else "tool_result"
+        record = _transcript_record(kind)
+        if "exit_code" in item:
+            record["exit_code"] = bounded_integer(item["exit_code"])
+        return [record]
     kind_aliases = {
         "shell_command": "command",
         "tool_use": "tool_call",
         "user": "system",
+        "thread.started": "system",
+        "turn.started": "system",
+        "turn.completed": "result",
     }
     kind = kind_aliases.get(raw_kind, raw_kind)
     if kind not in EVAL_TRANSCRIPT_KINDS:
@@ -839,11 +901,12 @@ def validate_harness_identity(value: object) -> tuple[str, ...]:
         if not nonempty_string(value.get(key)):
             diagnostics.append(f"harness.{key} is required")
     command_sha256 = value.get("command_sha256")
-    legacy_command = value.get("command")
-    if not (
-        isinstance(command_sha256, str) and _SHA256_PATTERN.fullmatch(command_sha256)
-    ) and not nonempty_string(legacy_command):
+    if not isinstance(command_sha256, str) or not _SHA256_PATTERN.fullmatch(
+        command_sha256
+    ):
         diagnostics.append("harness.command_sha256 must be a SHA-256 hex digest")
+    if "command" in value:
+        diagnostics.append("harness.command is not allowed")
     return tuple(diagnostics)
 
 
@@ -956,22 +1019,6 @@ def is_secret_like_eval_path(path: str) -> bool:
     return any(is_secret_like_directory_name(part) for part in parts[:-1]) or (
         is_secret_like_path(Path(parts[-1]))
     )
-
-
-def redacted_eval_path(path: str) -> str:
-    parts = list(PurePosixPath(path).parts)
-    if not parts:
-        return path
-    redacted: list[str] = []
-    for index, part in enumerate(parts):
-        is_last = index == len(parts) - 1
-        if is_secret_like_directory_name(part) or (
-            is_last and is_secret_like_path(Path(part))
-        ):
-            redacted.append("<redacted>")
-        else:
-            redacted.append(part)
-    return "/".join(redacted)
 
 
 def current_source_sha(

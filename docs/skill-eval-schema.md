@@ -78,6 +78,56 @@ Required artifact roles for a completed trial record:
 | `structured_result` | Machine-readable run outcome emitted by the harness or worker. |
 | `grader_outputs` | Deterministic, trajectory, model, and human grader outputs. |
 
+Optional structured roles use these closed envelopes:
+
+| Role | Admitted fields |
+| --- | --- |
+| `workflow_events` | `events`, containing only labels from the workflow vocabulary below. |
+| `git_state_before`, `git_state_after` | HEAD and branch identifiers, dirty boolean, branch/worktree/changed-path counts, and branch-to-HEAD digests. |
+| `test_results` | Projected grader id/type/pass state, check id/pass states, and exit code. |
+| `review_evidence` | Initial and re-review material-finding counts. |
+| `lock_evidence` | Task/run ids, lock state, process ids/state, timestamps, and the normalized acquire/release/final-status evidence used by case graders. Commands, logs, host paths, and fencing tokens are excluded. |
+| `workspace_evidence` | Per-task lifecycle/workspace statuses, booleans, diagnostic codes, counts, merged branch ids, and explicit dirty-file relative paths with size and SHA-256. |
+| `report_evidence` | Worker-report schema/type, task/run ids, status, commit, timestamp, and normalized reason label. |
+| `delegation_evidence` | Role and agent ids, prompt/result presence booleans, and changed-path count. |
+| `generated_profile` | Schema/status, prompt version, confidence, profile kind, and bounded stable ids. |
+| `budget_evidence` | Timeout/truncation booleans and bounded duration, command, and byte counts. |
+| `negative_prompt_results` | Prompt id plus skill-activation, repository-change, and response-term-match booleans. |
+| `command_results` | Command kind/id, exit/timeout/truncation/refusal booleans, bounded timing/byte/count/usage values, and timestamps. |
+| `task_source_evidence` | Source kind, task ids/statuses, requirement ids, and title/acceptance presence booleans. |
+| `hook_evidence` | Hook kind/index, exit/timeout/truncation values, normalized runtime status/actions, and event kind/task id. |
+
+The workflow-event vocabulary is closed to:
+
+- `branch_or_worktree_created`
+- `commit_created`
+- `destructive_workspace_cleanup`
+- `exploration_delegated`
+- `implementation_delegated`
+- `implementation_edit_started`
+- `instructions_inspected`
+- `integration_lock_busy_observed`
+- `main_advanced_detected`
+- `main_fast_forwarded`
+- `main_integration_lock_acquired`
+- `main_integration_lock_released`
+- `main_verification_ran`
+- `remediation_delegated`
+- `rereview_requested`
+- `review_delegated`
+- `review_finding_addressed`
+- `review_finding_received`
+- `review_requested`
+- `skill_activated`
+- `task_lock_acquired`
+- `task_source_inspected`
+- `unnecessary_user_prompt`
+- `unsafe_git_command`
+- `verification_ran`
+- `worker_report_emitted`
+- `workspace_preflight_blocked`
+- `worktree_state_inspected`
+
 Additional artifacts are allowed only when their role and closed structured
 schema are defined here and they are referenced by relative path.
 Artifact paths are validated as safe relative paths. Absolute paths,
@@ -99,7 +149,7 @@ values, parser exception text, command output, prompts, or model responses.
 `tool_call`, `tool_result`, or `usage`. A record may additionally contain only
 bounded numeric `command_count`, `cost_usd`, `duration_ms`, `duration_seconds`,
 `exit_code`, `input_tokens`, `output_tokens`, `tokens`, `stdout_bytes`, or
-`stderr_bytes`, and boolean `error` or `timeout`. A transcript is limited to 1
+`stderr_bytes`, and boolean `error` or `timeout`. A transcript is limited to 10
 MiB of input and 4,096 projected records. Tool names, command strings and
 arguments, tool input and output, stdout/stderr text, prompts, assistant prose,
 paths, exception or database messages, and arbitrary nested payloads are not
@@ -127,9 +177,12 @@ from those admitted values. The harness command is represented by
 Before overwrite archival, every preexisting structured source below an active
 artifact root is parsed and checked against the same bounds. Malformed, unsafe,
 unknown, over-budget, or symlinked sources reject the archive before any history
-destination is created. Safe structured sources are copied without widening
-their schema. This applies equally to root trials, nested `prompt-runs/**`, and
-structured copies under `history/**`.
+destination is created. Current safe transcript records are re-projected into
+the same envelope before copying. The legacy transcript shape containing
+exactly `stream` (`stdout` or `stderr`) and `text` is admitted only for archival
+projection: its text is discarded and only the encoded byte count is retained.
+Other legacy or unknown shapes remain rejected. This applies equally to root
+trials, nested `prompt-runs/**`, and structured copies under `history/**`.
 
 `logs/run.log` is the deliberate exception. It is an intentionally
 content-bearing audit artifact and may retain the harness command and captured

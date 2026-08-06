@@ -15,11 +15,14 @@ from unittest.mock import patch
 from vibe_loop.autopilot import MaintenanceCommandResult
 from vibe_loop.cli import main
 from vibe_loop.eval_runner import (
+    CommandExecution,
     TrialResult,
+    archive_previous_aggregate_artifacts,
     build_aggregate,
     build_eval_prompt,
     render_aggregate_markdown,
     write_task_source_evidence,
+    workflow_events_for_trial,
     workflow_taxonomy_labels,
 )
 from vibe_loop.eval_examples import materialize_eval_example
@@ -87,7 +90,7 @@ class EvalRunnerCliTests(unittest.TestCase):
             self.assertNotIn(canary, json.dumps(payload))
             self.assertNotIn(grader_canary, json.dumps(payload))
 
-    def test_rejected_agent_structured_input_is_sanitized_and_not_diagnosed(
+    def test_rejected_agent_structured_input_is_sanitized_and_contained(
         self,
     ) -> None:
         canary = "REJECTED_STRUCTURED_SECRET_CANARY"
@@ -142,7 +145,24 @@ class EvalRunnerCliTests(unittest.TestCase):
                     if path.is_file() and path.suffix in {".json", ".jsonl", ".md"}
                 ]
 
-                self.assertNotEqual(exit_code, 0)
+                if category == "transcript":
+                    self.assertEqual(exit_code, 0)
+                    payload = json.loads(stdout.getvalue())
+                    record = payload["records"][0]
+                    run_record = json.loads(
+                        (
+                            root
+                            / "eval-runs/local-demo-v1/cases/negative-trigger-set"
+                            / "no_skill/trial-1/run.json"
+                        ).read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(record["status"], "infrastructure_error")
+                    self.assertEqual(
+                        run_record["structured_result"]["schema_diagnostics"],
+                        ["transcript evidence rejected"],
+                    )
+                else:
+                    self.assertNotEqual(exit_code, 0)
                 self.assertNotIn(canary, stdout.getvalue())
                 self.assertNotIn(canary, stderr.getvalue())
                 self.assertNotIn(canary.lower(), stdout.getvalue())
@@ -1401,6 +1421,147 @@ class EvalRunnerCliTests(unittest.TestCase):
         self.assertTrue(archived_log_exists)
         self.assertEqual(current_root, "cases/negative-trigger-set/no_skill/trial-1")
         self.assertIn("pass_rate_regression", regressions[0]["regression_flags"])
+
+    def test_overwrite_rerun_archives_workspace_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "workspace_merged_agent.py"
+            write_blocked_report_agent(
+                agent,
+                task_id="MERGED-01",
+                run_id="eval-run-merged-01",
+                message="blocked: branch_already_merged",
+                event="workspace_preflight_blocked",
+            )
+
+            run_eval(
+                root,
+                "--case",
+                "workspace-merged-branch",
+                "--condition",
+                "vibe_loop",
+                "--agent-command",
+                f"vibe_loop={agent}",
+            )
+            payload = run_eval(
+                root,
+                "--case",
+                "workspace-merged-branch",
+                "--condition",
+                "vibe_loop",
+                "--overwrite",
+                "--agent-command",
+                f"vibe_loop={agent}",
+            )
+            suite_root = root / "eval-runs/local-demo-v1"
+            archived_structured = [
+                path
+                for path in (suite_root / "history").rglob("*")
+                if path.is_file() and path.suffix in {".json", ".jsonl"}
+            ]
+
+            self.assertEqual(payload["conditions"]["vibe_loop"]["trials"], 1)
+            self.assertTrue(archived_structured)
+            self.assertFalse(
+                any("repo-workspaces" in path.parts for path in archived_structured)
+            )
+            for path in archived_structured:
+                with self.subTest(path=path.relative_to(suite_root)):
+                    text = path.read_text(encoding="utf-8")
+                    self.assertNotIn('"command":', text)
+                    self.assertNotIn('"message":', text)
+
+    def test_legacy_transcript_is_projected_when_archived(self) -> None:
+        canary = "LEGACY TRANSCRIPT CANARY"
+        with tempfile.TemporaryDirectory() as directory:
+            suite_root = Path(directory)
+            relative_root = "cases/example/vibe_loop/trial-1"
+            trial_root = suite_root / relative_root
+            trial_root.mkdir(parents=True)
+            (trial_root / "transcript.jsonl").write_text(
+                json.dumps({"stream": "stdout", "text": canary}) + "\n",
+                encoding="utf-8",
+            )
+
+            archived = archive_previous_aggregate_artifacts(
+                suite_root,
+                {"records": [{"artifact_root": relative_root}]},
+            )
+            archived_root = suite_root / archived["records"][0]["artifact_root"]
+            transcript = (archived_root / "transcript.jsonl").read_text(
+                encoding="utf-8"
+            )
+            projected = [json.loads(line) for line in transcript.splitlines()]
+
+        self.assertEqual(projected[0]["kind"], "result")
+        self.assertEqual(projected[0]["stdout_bytes"], len(canary.encode("utf-8")))
+        self.assertNotIn(canary, transcript)
+
+    def test_stream_result_text_contributes_workflow_events(self) -> None:
+        stream = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "name": "Skill",
+                                    "input": {"skill": "vibe-loop"},
+                                }
+                            ]
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "result",
+                        "result": (
+                            "vibe-loop-eval-event: integration_lock_busy_observed"
+                        ),
+                    }
+                ),
+            )
+        )
+        execution = CommandExecution(
+            command="agent",
+            exit_code=0,
+            stdout=stream,
+            stderr="",
+            started_at="2026-05-09T00:00:00+00:00",
+            finished_at="2026-05-09T00:00:01+00:00",
+            duration_seconds=1.0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            events = workflow_events_for_trial(
+                Path(directory), execution, (), allow_artifact_events=False
+            )
+
+        self.assertIn("skill_activated", events)
+        self.assertIn("integration_lock_busy_observed", events)
+
+    def test_forbidden_workflow_event_is_retained_from_artifact(self) -> None:
+        execution = CommandExecution(
+            command="agent",
+            exit_code=0,
+            stdout="",
+            stderr="",
+            started_at="2026-05-09T00:00:00+00:00",
+            finished_at="2026-05-09T00:00:01+00:00",
+            duration_seconds=1.0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            artifact_root = Path(directory)
+            (artifact_root / "workflow-events.json").write_text(
+                json.dumps({"events": ["unnecessary_user_prompt"]}) + "\n",
+                encoding="utf-8",
+            )
+            events = workflow_events_for_trial(
+                artifact_root, execution, (), allow_artifact_events=True
+            )
+
+        self.assertEqual(events, ["unnecessary_user_prompt"])
 
     def test_overwrite_rejects_unsafe_structured_history_without_partial_archive(
         self,

@@ -10,11 +10,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from vibe_loop.evals import (
+    EVAL_MAX_STRUCTURED_BYTES,
     EVAL_MAX_TRANSCRIPT_RECORDS,
     EvalArtifactRef,
     EvalSafeEnvelopeError,
     EvalSourceFingerprint,
     SkillEvalRunRecord,
+    normalize_workflow_events,
     project_transcript_jsonl,
     validate_skill_eval_run_record,
 )
@@ -55,6 +57,48 @@ class SkillEvalSchemaTests(unittest.TestCase):
                     project_transcript_jsonl(raw)
                 self.assertNotIn("SECRET_CANARY", str(raised.exception))
 
+    def test_transcript_projection_accepts_shipped_harness_streams(self) -> None:
+        fixture_root = Path(__file__).parent / "fixtures/worker_activity"
+        expected_usage = {
+            "claude-stream.jsonl": (12, 3),
+            "codex-stream.jsonl": (20, 5),
+        }
+
+        for name, usage in expected_usage.items():
+            with self.subTest(name=name):
+                raw = (fixture_root / name).read_text(encoding="utf-8")
+                projected = project_transcript_jsonl(raw)
+                encoded = json.dumps(projected)
+
+                self.assertTrue(projected)
+                self.assertTrue(
+                    {"command", "tool_call"} & {item["kind"] for item in projected}
+                )
+                self.assertIn(
+                    usage[0], [item.get("input_tokens") for item in projected]
+                )
+                self.assertIn(
+                    usage[1], [item.get("output_tokens") for item in projected]
+                )
+                self.assertNotIn("CANARY", encoded)
+
+    def test_structured_byte_budget_covers_shipped_case_output_budgets(self) -> None:
+        cases_root = Path(__file__).parents[1] / "eval/examples/local-demo-v1/cases"
+        budgets = [
+            json.loads(path.read_text(encoding="utf-8"))["budget"]["max_output_bytes"]
+            for path in cases_root.glob("*/case.json")
+        ]
+
+        self.assertGreaterEqual(EVAL_MAX_STRUCTURED_BYTES, max(budgets))
+
+    def test_workflow_event_vocabulary_includes_graded_forbidden_events(self) -> None:
+        self.assertEqual(
+            normalize_workflow_events(
+                ["unnecessary_user_prompt", "implementation_edit_started"]
+            ),
+            ("unnecessary_user_prompt", "implementation_edit_started"),
+        )
+
     def test_valid_run_record_passes_schema_validation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             artifact_root = Path(directory)
@@ -70,6 +114,26 @@ class SkillEvalSchemaTests(unittest.TestCase):
             )
 
         self.assertEqual(diagnostics, ())
+
+    def test_raw_harness_command_does_not_replace_command_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifact_root = Path(directory)
+            record = valid_record(
+                artifacts=write_required_artifacts(artifact_root)
+            ).to_json()
+            record["harness"] = {
+                "name": "vibe-loop-eval",
+                "version": "0.1",
+                "command": "SECRET COMMAND CANARY",
+            }
+
+            diagnostics = validate_skill_eval_run_record(record, artifact_root)
+
+        self.assertIn(
+            "harness.command_sha256 must be a SHA-256 hex digest", diagnostics
+        )
+        self.assertIn("harness.command is not allowed", diagnostics)
+        self.assertNotIn("SECRET COMMAND CANARY", json.dumps(diagnostics))
 
     def test_stale_source_fingerprint_is_reported(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -324,7 +388,7 @@ def valid_record(
         harness={
             "name": "vibe-loop-eval",
             "version": "0.1",
-            "command": "codex exec '$vibe-loop DEMO-01'",
+            "command_sha256": "5" * 64,
         },
         budget={
             "timeout_seconds": 900,

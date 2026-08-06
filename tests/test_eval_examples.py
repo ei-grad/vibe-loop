@@ -909,7 +909,7 @@ def write_artifact_bundle(
         harness={
             "name": "vibe-loop-eval",
             "version": "0.1",
-            "command": "codex exec",
+            "command_sha256": "5" * 64,
         },
         budget={
             "timeout_seconds": case.budget["timeout_seconds"],

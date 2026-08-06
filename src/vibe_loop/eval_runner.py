@@ -196,6 +196,7 @@ class AgentCommandBatch:
     execution: CommandExecution
     command_results: tuple[dict[str, object], ...]
     workflow_events: tuple[str, ...] = ()
+    transcript_rejected: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -319,30 +320,36 @@ def copy_archive_path(source: Path, destination: Path) -> None:
     if source.is_dir():
         destination.mkdir(parents=True, exist_ok=True)
         for child in source.iterdir():
-            if child.name == "repo":
+            if child.name in {"repo", "repo-workspaces"}:
                 continue
             copy_archive_path(child, destination / child.name)
         return
     if source.is_file():
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination, follow_symlinks=False)
+        if source.suffix == ".jsonl":
+            records = project_transcript_jsonl(source.read_text(encoding="utf-8"))
+            write_safe_transcript(destination, records)
+        else:
+            shutil.copy2(source, destination, follow_symlinks=False)
 
 
 def validate_archive_source(source: Path) -> None:
     paths = [source] if source.is_file() else sorted(source.rglob("*"))
     for path in paths:
         relative = path.relative_to(source) if path != source else Path(path.name)
-        if "repo" in relative.parts:
+        if {"repo", "repo-workspaces"}.intersection(relative.parts):
             continue
         if path.is_symlink():
             raise EvalSafeEnvelopeError("archive rejected: symlink source")
         if not path.is_file() or path.name == "run.log":
             continue
-        if path.stat().st_size > EVAL_MAX_STRUCTURED_BYTES:
-            raise EvalSafeEnvelopeError("archive rejected: byte budget exceeded")
         if path.suffix == ".jsonl":
+            if path.stat().st_size > EVAL_MAX_STRUCTURED_BYTES:
+                raise EvalSafeEnvelopeError("archive rejected: byte budget exceeded")
             project_transcript_jsonl(path.read_text(encoding="utf-8"))
         elif path.suffix == ".json":
+            if path.stat().st_size > EVAL_MAX_STRUCTURED_BYTES:
+                raise EvalSafeEnvelopeError("archive rejected: byte budget exceeded")
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError, ValueError):
@@ -537,7 +544,7 @@ def run_trial(
     prompt_text = combined_prompt(repo, case)
     write_text_artifact(trial_root, "prompt", prompt_text)
     git_before = collect_git_state(repo)
-    write_json_artifact(trial_root, "git_state_before", git_before)
+    write_json_artifact(trial_root, "git_state_before", safe_git_state(git_before))
     repo_config = load_config(repo)
     lock_manager = build_lock_manager(
         repo,
@@ -576,9 +583,15 @@ def run_trial(
             run_id=run_id,
         )
     write_run_log(trial_root, case, condition, run_id, execution)
-    write_transcript_if_missing(trial_root, execution)
+    transcript_rejected = (
+        agent_batch.transcript_rejected
+        or write_transcript_if_missing(trial_root, execution)
+    )
+    evidence_diagnostics = (
+        ("transcript evidence rejected",) if transcript_rejected else ()
+    )
     git_after = collect_git_state(repo)
-    write_json_artifact(trial_root, "git_state_after", git_after)
+    write_json_artifact(trial_root, "git_state_after", safe_git_state(git_after))
     write_text_artifact(trial_root, "diff", fixture_diff(repo, git_before))
     deterministic = deterministic_grader_output(repo, grader_repo=case.repo_path)
     if "hook_evidence" in case.expected_artifact_roles:
@@ -635,6 +648,7 @@ def run_trial(
     write_workspace_evidence(trial_root, repo, lock_manager=lock_manager)
     write_generated_profile_artifact(trial_root, repo)
     sanitize_delegation_evidence(trial_root)
+    sanitize_review_evidence(trial_root)
     write_missing_case_role_artifacts(trial_root, case, deterministic, execution)
     command_results = list(agent_batch.command_results) + [
         {
@@ -658,7 +672,7 @@ def run_trial(
         deterministic,
         transcript_graders,
         artifact_result=None,
-        schema_diagnostics=(),
+        schema_diagnostics=evidence_diagnostics,
         command_count=budgeted_command_count(
             command_results,
             transcript_graders,
@@ -678,6 +692,7 @@ def run_trial(
         ),
         reported_status=worker_report_status(latest_report),
         usage=usage,
+        schema_diagnostics=evidence_diagnostics,
     )
     write_json_artifact(trial_root, "structured_result", structured_result)
     safe_git_after = safe_git_state(git_after)
@@ -711,7 +726,10 @@ def run_trial(
         *[result.to_json() for result in transcript_graders],
         artifact_grader_record(artifact_result),
     ]
-    schema_diagnostics = validate_skill_eval_run_record(record, trial_root)
+    schema_diagnostics = (
+        *evidence_diagnostics,
+        *validate_skill_eval_run_record(record, trial_root),
+    )
     final_scoring = score_trial(
         case,
         condition,
@@ -887,16 +905,23 @@ def execute_trial_agent_commands(
         budgets=budgets,
     )
     stream_events: tuple[str, ...] = ()
+    transcript_rejected = False
     if is_stream_json(execution.stdout):
         raw_stream = execution.stdout
         _, parsed_events = parse_stream_json(raw_stream)
         stream_events = tuple(parsed_events)
         transcript_path = artifact_path(trial_root, "transcript")
-        write_safe_transcript(transcript_path, project_transcript_jsonl(raw_stream))
+        try:
+            records = project_transcript_jsonl(raw_stream)
+        except EvalSafeEnvelopeError:
+            records = ()
+            transcript_rejected = True
+        write_safe_transcript(transcript_path, records)
     return AgentCommandBatch(
         execution=execution,
         command_results=({"type": "agent", **execution.to_json()},),
         workflow_events=stream_events,
+        transcript_rejected=transcript_rejected,
     )
 
 
@@ -921,6 +946,7 @@ def execute_negative_prompt_set(
     command_results: list[dict[str, object]] = []
     prompt_results: list[dict[str, object]] = []
     workflow_events: list[str] = []
+    transcript_rejected = False
     spec = load_json(case.repo_path / "eval" / "expected-artifacts.json")
     negative_specs = spec.get("negative_prompts") if isinstance(spec, Mapping) else ()
     response_terms_by_id = {
@@ -968,7 +994,10 @@ def execute_negative_prompt_set(
             budgets=budgets,
         )
         write_run_log(prompt_artifact_root, case, condition, run_id, execution)
-        write_transcript_if_missing(prompt_artifact_root, execution)
+        transcript_rejected = (
+            write_transcript_if_missing(prompt_artifact_root, execution)
+            or transcript_rejected
+        )
         prompt_command_count = (
             command_count_from_transcript(
                 artifact_path(prompt_artifact_root, "transcript")
@@ -1019,6 +1048,7 @@ def execute_negative_prompt_set(
         ),
         command_results=tuple(command_results),
         workflow_events=tuple(unique_preserving_order(workflow_events)),
+        transcript_rejected=transcript_rejected,
     )
 
 
@@ -1314,7 +1344,7 @@ def write_run_log(
 def write_transcript_if_missing(
     artifact_root: Path,
     execution: CommandExecution,
-) -> None:
+) -> bool:
     path = artifact_path(artifact_root, "transcript")
     if path.exists():
         raw = path.read_text(encoding="utf-8")
@@ -1322,9 +1352,9 @@ def write_transcript_if_missing(
             records = project_transcript_jsonl(raw)
         except EvalSafeEnvelopeError:
             write_safe_transcript(path, ())
-            raise
+            return True
         write_safe_transcript(path, records)
-        return
+        return False
     write_safe_transcript(
         path,
         (
@@ -1336,6 +1366,7 @@ def write_transcript_if_missing(
             ),
         ),
     )
+    return False
 
 
 def write_safe_transcript(path: Path, records: Sequence[Mapping[str, object]]) -> None:
@@ -1610,8 +1641,9 @@ def workflow_events_for_trial(
     for result in transcript_graders:
         events.extend(result.workflow_events)
     if is_stream_json(execution.stdout):
-        _, stream_events = parse_stream_json(execution.stdout)
+        result_text, stream_events = parse_stream_json(execution.stdout)
         events.extend(stream_events)
+        events.extend(events_from_text(result_text))
     else:
         events.extend(events_from_text(execution.stdout))
     events.extend(events_from_text(execution.stderr))
@@ -1982,6 +2014,25 @@ def sanitize_delegation_evidence(artifact_root: Path) -> None:
     write_json(path, {"agents": safe_agents})
 
 
+def sanitize_review_evidence(artifact_root: Path) -> None:
+    path = artifact_path(artifact_root, "review_evidence")
+    if not path.exists():
+        return
+    payload = load_json(path)
+    if not isinstance(payload, Mapping):
+        write_json(path, {})
+        raise EvalSafeEnvelopeError("review evidence rejected: invalid object")
+    projected: dict[str, object] = {}
+    for phase in ("initial", "rereview"):
+        value = payload.get(phase)
+        if not isinstance(value, Mapping):
+            continue
+        count = value.get("material_findings_count")
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            projected[phase] = {"material_findings_count": count}
+    write_json(path, projected)
+
+
 def default_negative_prompt_results(
     artifact_root: Path,
     execution: CommandExecution,
@@ -2018,11 +2069,28 @@ def default_negative_prompt_results(
 
 def write_generated_profile_artifact(artifact_root: Path, repo: Path) -> None:
     source = repo / ".vibe-loop" / "generated-task-source.json"
-    if source.is_file():
-        artifact_path(artifact_root, "generated_profile").write_text(
-            source.read_text(encoding="utf-8"),
-            encoding="utf-8",
-        )
+    if not source.is_file():
+        return
+    payload = load_json(source)
+    if not isinstance(payload, Mapping):
+        raise EvalSafeEnvelopeError("generated profile rejected: invalid object")
+    profile = payload.get("profile")
+    projected: dict[str, object] = {
+        "schema_version": payload.get("schema_version"),
+        "status": payload.get("status"),
+        "prompt_version": payload.get("prompt_version"),
+        "confidence": payload.get("confidence"),
+    }
+    if isinstance(profile, Mapping):
+        projected["profile_kind"] = profile.get("kind")
+        stable_ids = profile.get("stable_ids")
+        if isinstance(stable_ids, Sequence) and not isinstance(
+            stable_ids, (str, bytes)
+        ):
+            projected["stable_ids"] = [
+                item for item in stable_ids if isinstance(item, str)
+            ][:128]
+    write_json_artifact(artifact_root, "generated_profile", projected)
 
 
 def score_trial(
@@ -2847,11 +2915,75 @@ def write_lock_evidence(
     lock_manager: LockManager,
 ) -> None:
     existing = load_json(artifact_path(artifact_root, "lock_evidence"))
-    evidence = dict(existing) if isinstance(existing, Mapping) else {}
-    evidence["before"] = dict(before)
-    evidence["after"] = dict(after)
-    evidence["main_integration_status"] = main_integration_status(lock_manager)
+    evidence: dict[str, object] = {}
+    if isinstance(existing, Mapping):
+        for key, fields in (
+            ("acquire", ("owner_task_id", "run_id", "pid_source")),
+            ("release", ("released",)),
+            ("final_status", ("locked",)),
+        ):
+            value = existing.get(key)
+            if isinstance(value, Mapping):
+                evidence[key] = safe_scalar_mapping(value, fields)
+    evidence["before"] = safe_scalar_mapping(
+        before,
+        (
+            "schema_version",
+            "record_type",
+            "run_id",
+            "task_id",
+            "pid",
+            "worker_pid",
+            "pid_source",
+            "started_at",
+        ),
+    )
+    evidence["after"] = safe_scalar_mapping(
+        after,
+        (
+            "schema_version",
+            "record_type",
+            "run_id",
+            "task_id",
+            "pid",
+            "worker_pid",
+            "pid_source",
+            "started_at",
+        ),
+    )
+    evidence["main_integration_status"] = safe_scalar_mapping(
+        main_integration_status(lock_manager),
+        (
+            "locked",
+            "state",
+            "owner_task_id",
+            "run_id",
+            "pid",
+            "pid_source",
+            "process_state",
+            "resource",
+            "lease_seconds",
+            "started_at",
+            "heartbeat_at",
+        ),
+    )
     write_json_artifact(artifact_root, "lock_evidence", evidence)
+
+
+def safe_scalar_mapping(
+    value: Mapping[str, object], fields: Sequence[str]
+) -> dict[str, object]:
+    projected: dict[str, object] = {}
+    for field in fields:
+        item = value.get(field)
+        if item is None or isinstance(item, bool | int | float):
+            projected[field] = item
+        elif isinstance(item, str):
+            try:
+                projected[field] = safe_identifier(item, category=field)
+            except EvalSafeEnvelopeError:
+                continue
+    return projected
 
 
 def write_report_evidence(
@@ -2966,7 +3098,7 @@ def write_workspace_evidence(
                 "worktree_exists": workspace_state.get("worktree_exists"),
                 "worktree_listed": workspace_state.get("worktree_listed"),
                 "dirty": workspace_state.get("dirty"),
-                "dirty_summary": workspace_state.get("dirty_summary"),
+                "dirty_summary": safe_workspace_dirty_summary(workspace_state),
                 "dirty_files": workspace_dirty_files(worker, workspace_state),
                 "duplicate_worktree_count": duplicate_count,
                 "merged_into": workspace_state.get("merged_into"),
@@ -2985,7 +3117,6 @@ def write_workspace_evidence(
         "workspace_evidence",
         {
             "schema_version": 1,
-            "workers": workers,
             "by_task": by_task,
         },
     )
@@ -3027,6 +3158,36 @@ def workspace_dirty_files(
             }
         )
     return files
+
+
+def safe_workspace_dirty_summary(
+    workspace_state: Mapping[str, object],
+) -> list[str]:
+    dirty_summary = workspace_state.get("dirty_summary")
+    if not isinstance(dirty_summary, Sequence) or isinstance(
+        dirty_summary,
+        (str, bytes),
+    ):
+        return []
+    projected: list[str] = []
+    for line in dirty_summary:
+        if not isinstance(line, str):
+            continue
+        stripped = line.strip()
+        parts = stripped.split(maxsplit=1)
+        relative_path = git_status_relative_path(stripped)
+        if (
+            len(parts) != 2
+            or relative_path is None
+            or path_diagnostics("workspace dirty file", relative_path)
+        ):
+            continue
+        try:
+            status = safe_identifier(parts[0], category="workspace file status")
+        except EvalSafeEnvelopeError:
+            continue
+        projected.append(f"{status} {relative_path}")
+    return projected
 
 
 def git_status_relative_path(line: str) -> str | None:
