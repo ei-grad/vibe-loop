@@ -759,7 +759,9 @@ def validate_grader_records(value: object) -> tuple[str, ...]:
             diagnostics.append(f"grader entry {index} has unknown field")
         for key in ("id", "type"):
             item = grader.get(key)
-            if not isinstance(item, str) or len(item) > EVAL_MAX_IDENTIFIER_LENGTH:
+            try:
+                safe_identifier(item, category=f"grader {key}")
+            except EvalSafeEnvelopeError:
                 diagnostics.append(f"grader entry {index} has invalid {key}")
     return tuple(diagnostics)
 

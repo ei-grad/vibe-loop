@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from _test_bootstrap import TEST_ENVIRONMENT_CONFIGURED as TEST_ENVIRONMENT_CONFIGURED
 
+import hashlib
 import json
 import os
 import sys
@@ -221,6 +222,177 @@ class EvalRunnerCliTests(unittest.TestCase):
         )
         self.assertNotIn(canary, json.dumps(payload))
         self.assertNotIn(canary, json.dumps(run_record))
+
+    def test_transcript_grader_id_is_rejected_and_contained_per_trial(self) -> None:
+        canary = "UNSAFE GRADER ID CANARY /home/user/.ssh/id_rsa"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "negative_agent.py"
+            grader = root / "unsafe_id_grader.py"
+            write_negative_agent(agent)
+            write_python_executable(
+                grader,
+                "import json\n"
+                f"print(json.dumps({{'id': {canary!r}, 'passed': True}}))\n",
+            )
+
+            payload = run_eval(
+                root,
+                "--case",
+                "negative-trigger-set",
+                "--condition",
+                "no_skill",
+                "--agent-command",
+                f"no_skill={agent}",
+                "--transcript-grader",
+                str(grader),
+            )
+            trial_root = (
+                root
+                / "eval-runs/local-demo-v1/cases/negative-trigger-set"
+                / "no_skill/trial-1"
+            )
+            run_record = json.loads(
+                (trial_root / "run.json").read_text(encoding="utf-8")
+            )
+            structured_texts = [
+                path.read_text(encoding="utf-8")
+                for path in (root / "eval-runs").rglob("*")
+                if path.is_file()
+                and path.suffix in {".json", ".jsonl", ".md"}
+                and "repo" not in path.relative_to(root / "eval-runs").parts
+            ]
+
+        self.assertEqual(payload["records"][0]["status"], "infrastructure_error")
+        self.assertEqual(
+            run_record["structured_result"]["schema_diagnostics"],
+            ["grader evidence rejected"],
+        )
+        self.assertNotIn(canary, json.dumps(payload))
+        for text in structured_texts:
+            self.assertNotIn(canary, text)
+
+    def test_legal_non_identifier_branch_is_hashed_in_safe_git_state(self) -> None:
+        branch = "vibe-loop/task-#12"
+        expected = "sha256:" + hashlib.sha256(branch.encode()).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "branch_agent.py"
+            write_python_executable(
+                agent,
+                "import os\n"
+                "import subprocess\n"
+                "from pathlib import Path\n"
+                "repo = Path(os.environ['VIBE_LOOP_EVAL_REPO'])\n"
+                f"subprocess.run(['git', 'checkout', '-b', {branch!r}], "
+                "cwd=repo, check=True, capture_output=True, text=True)\n"
+                "print('negative prompt handled without repository changes')\n",
+            )
+
+            payload = run_eval(
+                root,
+                "--case",
+                "finite-py-plan-table",
+                "--condition",
+                "no_skill",
+                "--agent-command",
+                f"no_skill={agent}",
+            )
+            trial_root = (
+                root
+                / "eval-runs/local-demo-v1/cases/finite-py-plan-table"
+                / "no_skill/trial-1"
+            )
+            final_state = json.loads(
+                (trial_root / "final-repo-state.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(len(payload["records"]), 1)
+        self.assertEqual(final_state["branch"], expected)
+        self.assertIn(expected, final_state["branch_heads"])
+        self.assertNotIn(branch, json.dumps(final_state))
+
+    def test_rejected_post_run_evidence_is_contained_per_trial(self) -> None:
+        canary = "REJECTED POST RUN EVIDENCE CANARY"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "rejected_evidence_agent.py"
+            write_orchestrated_agent(
+                agent,
+                invalid_structured_evidence=canary,
+            )
+
+            payload = run_eval(
+                root,
+                "--case",
+                "finite-py-plan-table",
+                "--condition",
+                "orchestrated_vibe_loop",
+                "--agent-command",
+                f"orchestrated_vibe_loop={agent}",
+            )
+            trial_root = (
+                root
+                / "eval-runs/local-demo-v1/cases/finite-py-plan-table"
+                / "orchestrated_vibe_loop/trial-1"
+            )
+            run_record = json.loads(
+                (trial_root / "run.json").read_text(encoding="utf-8")
+            )
+            structured_texts = [
+                path.read_text(encoding="utf-8")
+                for path in (root / "eval-runs").rglob("*")
+                if path.is_file()
+                and path.suffix in {".json", ".jsonl", ".md"}
+                and "repo" not in path.relative_to(root / "eval-runs").parts
+            ]
+
+        self.assertEqual(payload["records"][0]["status"], "infrastructure_error")
+        self.assertEqual(
+            run_record["structured_result"]["schema_diagnostics"],
+            [
+                "generated profile evidence rejected",
+                "delegation evidence rejected",
+                "review evidence rejected",
+            ],
+        )
+        for text in structured_texts:
+            self.assertNotIn(canary, text)
+
+    def test_rejected_default_negative_prompt_evidence_is_contained(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "negative_agent.py"
+            write_negative_agent(agent)
+            with patch(
+                "vibe_loop.eval_runner.default_negative_prompt_results",
+                side_effect=EvalSafeEnvelopeError(
+                    "workflow events rejected: unknown event at index 0"
+                ),
+            ):
+                payload = run_eval(
+                    root,
+                    "--case",
+                    "negative-trigger-set",
+                    "--condition",
+                    "no_skill",
+                    "--agent-command",
+                    f"no_skill={agent}",
+                )
+            trial_root = (
+                root
+                / "eval-runs/local-demo-v1/cases/negative-trigger-set"
+                / "no_skill/trial-1"
+            )
+            run_record = json.loads(
+                (trial_root / "run.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(payload["records"][0]["status"], "infrastructure_error")
+        self.assertEqual(
+            run_record["structured_result"]["schema_diagnostics"],
+            ["negative prompt evidence rejected"],
+        )
 
     def test_task_source_evidence_uses_default_and_generated_runtime_resolution(
         self,
@@ -1829,6 +2001,29 @@ class EvalRunnerCliTests(unittest.TestCase):
 
             self.assertFalse((suite_root / "history").exists())
 
+    def test_archive_rejects_symlink_outside_excluded_fixture_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            suite_root = Path(directory)
+            relative_root = "cases/example/vibe_loop/trial-1"
+            trial_root = suite_root / relative_root
+            (trial_root / "logs").mkdir(parents=True)
+            (trial_root / "logs" / "run.log").write_text(
+                "content-bearing audit log\n",
+                encoding="utf-8",
+            )
+            (trial_root / "unsafe-link").symlink_to("logs/run.log")
+
+            with self.assertRaisesRegex(
+                EvalSafeEnvelopeError,
+                "archive rejected: symlink source",
+            ):
+                archive_previous_aggregate_artifacts(
+                    suite_root,
+                    {"records": [{"artifact_root": relative_root}]},
+                )
+
+            self.assertFalse((suite_root / "history").exists())
+
     def test_legacy_prior_aggregate_metrics_and_records_are_normalized(self) -> None:
         records = load_skill_quality_records()
         legacy_previous = {
@@ -2617,6 +2812,7 @@ def write_orchestrated_agent(
     *,
     include_evidence: bool = True,
     wrong_order: bool = False,
+    invalid_structured_evidence: str | None = None,
 ) -> None:
     events = [
         "skill_activated",
@@ -2673,6 +2869,19 @@ def write_orchestrated_agent(
             },
         ]
     }
+    extra_evidence_writes = ""
+    if invalid_structured_evidence is not None:
+        evidence["agents"][0]["role"] = invalid_structured_evidence
+        extra_evidence_writes = (
+            "(artifact / 'review-evidence.json').write_text("
+            f"{(json.dumps([invalid_structured_evidence]) + chr(10))!r}, "
+            "encoding='utf-8')\n"
+            "generated = repo / '.vibe-loop' / 'generated-task-source.json'\n"
+            "generated.parent.mkdir(parents=True, exist_ok=True)\n"
+            "generated.write_text("
+            f"{(json.dumps([invalid_structured_evidence]) + chr(10))!r}, "
+            "encoding='utf-8')\n"
+        )
     evidence_write = ""
     if include_evidence:
         evidence_write = (
@@ -2709,6 +2918,7 @@ def write_orchestrated_agent(
         "    json.dumps({'events': events}) + '\\n', encoding='utf-8'\n"
         ")\n"
         f"{evidence_write}"
+        f"{extra_evidence_writes}"
         "print('orchestrated agent finished')\n",
     )
 

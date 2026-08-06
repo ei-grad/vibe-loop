@@ -187,6 +187,14 @@ count is retained. Malformed records and unrecognized event types or fields
 remain rejected. This applies equally to root trials, nested `prompt-runs/**`,
 and structured copies under `history/**`.
 
+History snapshots exclude materialized `repo/` and `repo-workspaces/` fixture
+working trees. Those trees are execution inputs rather than artifact roles and
+may contain arbitrary repository content; the run record retains their admitted
+source fingerprints, diff, and final repository-state evidence instead. Branch
+names outside the stable-identifier alphabet are retained only as
+`sha256:<digest>` values. Symlinks anywhere else in an archived artifact root
+remain rejected before the history destination is created.
+
 `logs/run.log` is the deliberate exception. It is an intentionally
 content-bearing audit artifact and may retain the harness command and captured
 stdout/stderr under the existing safe artifact-path and SHA-256 contract,

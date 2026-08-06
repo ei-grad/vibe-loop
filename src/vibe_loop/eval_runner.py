@@ -820,10 +820,26 @@ def run_trial(
     latest_report = latest_worker_report(repo, case.task_id)
     write_report_evidence(trial_root, latest_report)
     write_workspace_evidence(trial_root, repo, lock_manager=lock_manager)
-    write_generated_profile_artifact(trial_root, repo)
-    sanitize_delegation_evidence(trial_root)
-    sanitize_review_evidence(trial_root)
-    write_missing_case_role_artifacts(trial_root, case, deterministic, execution)
+    try:
+        write_generated_profile_artifact(trial_root, repo)
+    except EvalSafeEnvelopeError:
+        evidence_diagnostics.append("generated profile evidence rejected")
+    try:
+        sanitize_delegation_evidence(trial_root)
+    except EvalSafeEnvelopeError:
+        evidence_diagnostics.append("delegation evidence rejected")
+    try:
+        sanitize_review_evidence(trial_root)
+    except EvalSafeEnvelopeError:
+        evidence_diagnostics.append("review evidence rejected")
+    evidence_diagnostics.extend(
+        write_missing_case_role_artifacts(
+            trial_root,
+            case,
+            deterministic,
+            execution,
+        )
+    )
     command_results = list(agent_batch.command_results) + [
         {
             "exit_code": result.exit_code,
@@ -1703,7 +1719,10 @@ def run_transcript_graders(
             budgets=budgets,
         )
         payload = parse_grader_payload(execution.stdout)
-        grader_id = str(payload.get("id") or f"transcript-grader-{index}")
+        grader_id = safe_identifier(
+            payload.get("id") or f"transcript-grader-{index}",
+            category="grader id",
+        )
         passed = payload.get("passed") is True and execution.exit_code == 0
         raw_taxonomy = string_list(payload.get("failure_taxonomy"))
         if any(item not in EVAL_FAILURE_TAXONOMY for item in raw_taxonomy):
@@ -2113,7 +2132,8 @@ def write_missing_case_role_artifacts(
     case: EvalExampleCase,
     deterministic: Mapping[str, object],
     execution: CommandExecution,
-) -> None:
+) -> tuple[str, ...]:
+    diagnostics: list[str] = []
     write_json_artifact(
         artifact_root,
         "test_results",
@@ -2138,59 +2158,74 @@ def write_missing_case_role_artifacts(
         overwrite=False,
     )
     if "negative_prompt_results" in case.expected_artifact_roles:
+        try:
+            negative_prompt_results = default_negative_prompt_results(
+                artifact_root,
+                execution,
+                case,
+            )
+        except EvalSafeEnvelopeError:
+            negative_prompt_results = {"results": []}
+            diagnostics.append("negative prompt evidence rejected")
         write_json_artifact(
             artifact_root,
             "negative_prompt_results",
-            default_negative_prompt_results(artifact_root, execution, case),
+            negative_prompt_results,
             overwrite=False,
         )
     for role in case.expected_artifact_roles:
         if role in ROLE_PATHS and not artifact_path(artifact_root, role).exists():
             write_json_artifact(artifact_root, role, {}, overwrite=False)
+    return tuple(diagnostics)
 
 
 def sanitize_delegation_evidence(artifact_root: Path) -> None:
     path = artifact_path(artifact_root, "delegation_evidence")
     if not path.exists():
         return
-    payload = load_json(path)
-    agents = payload.get("agents") if isinstance(payload, Mapping) else None
-    if (
-        not isinstance(agents, Sequence)
-        or isinstance(agents, (str, bytes))
-        or len(agents) > 32
-    ):
-        write_json(path, {"agents": []})
-        raise EvalSafeEnvelopeError("delegation evidence rejected: invalid collection")
-    safe_agents = []
-    allowed = {"role", "agent_id", "prompt", "result", "changed_paths"}
-    for index, agent in enumerate(agents):
-        if not isinstance(agent, Mapping) or set(agent) - allowed:
-            write_json(path, {"agents": []})
-            raise EvalSafeEnvelopeError(
-                f"delegation evidence rejected: invalid record at index {index}"
-            )
-        changed_paths = agent.get("changed_paths", ())
-        if not isinstance(changed_paths, Sequence) or isinstance(
-            changed_paths, (str, bytes)
+    try:
+        payload = load_json(path)
+        agents = payload.get("agents") if isinstance(payload, Mapping) else None
+        if (
+            not isinstance(agents, Sequence)
+            or isinstance(agents, (str, bytes))
+            or len(agents) > 32
         ):
-            write_json(path, {"agents": []})
             raise EvalSafeEnvelopeError(
-                f"delegation evidence rejected: wrong field type at index {index}"
+                "delegation evidence rejected: invalid collection"
             )
-        safe_agents.append(
-            {
-                "role": safe_identifier(agent.get("role"), category="delegation role"),
-                "agent_id": safe_identifier(
-                    agent.get("agent_id"), category="delegation agent id"
-                ),
-                "prompt_present": isinstance(agent.get("prompt"), str)
-                and bool(agent["prompt"]),
-                "result_present": isinstance(agent.get("result"), str)
-                and bool(agent["result"]),
-                "changed_path_count": len(changed_paths),
-            }
-        )
+        safe_agents = []
+        allowed = {"role", "agent_id", "prompt", "result", "changed_paths"}
+        for index, agent in enumerate(agents):
+            if not isinstance(agent, Mapping) or set(agent) - allowed:
+                raise EvalSafeEnvelopeError(
+                    f"delegation evidence rejected: invalid record at index {index}"
+                )
+            changed_paths = agent.get("changed_paths", ())
+            if not isinstance(changed_paths, Sequence) or isinstance(
+                changed_paths, (str, bytes)
+            ):
+                raise EvalSafeEnvelopeError(
+                    f"delegation evidence rejected: wrong field type at index {index}"
+                )
+            safe_agents.append(
+                {
+                    "role": safe_identifier(
+                        agent.get("role"), category="delegation role"
+                    ),
+                    "agent_id": safe_identifier(
+                        agent.get("agent_id"), category="delegation agent id"
+                    ),
+                    "prompt_present": isinstance(agent.get("prompt"), str)
+                    and bool(agent["prompt"]),
+                    "result_present": isinstance(agent.get("result"), str)
+                    and bool(agent["result"]),
+                    "changed_path_count": len(changed_paths),
+                }
+            )
+    except EvalSafeEnvelopeError:
+        write_json(path, {"agents": []})
+        raise
     write_json(path, {"agents": safe_agents})
 
 
@@ -2874,18 +2909,27 @@ def safe_git_state(value: Mapping[str, object]) -> dict[str, object]:
                 "repository state rejected: branch collection budget exceeded"
             )
         for name, commit in branch_heads.items():
-            safe_name = safe_identifier(name, category="repository branch")
+            safe_name = safe_git_branch_identifier(name)
             safe_commit = safe_identifier(commit, category="repository head")
             safe_branch_heads[safe_name] = safe_commit
     return {
         "head": safe_identifier(head, category="repository head"),
-        "branch": safe_identifier(branch, category="repository branch"),
+        "branch": safe_git_branch_identifier(branch),
         "dirty": value.get("dirty") is True,
         "branch_count": branch_count,
         "worktree_count": worktree_count,
         "changed_path_count": changed_path_count,
         "branch_heads": safe_branch_heads,
     }
+
+
+def safe_git_branch_identifier(value: object) -> str:
+    try:
+        return safe_identifier(value, category="repository branch")
+    except EvalSafeEnvelopeError:
+        if not isinstance(value, str) or not value:
+            raise
+        return f"sha256:{hash_text(value)}"
 
 
 def local_branch_heads(repo: Path) -> dict[str, str]:

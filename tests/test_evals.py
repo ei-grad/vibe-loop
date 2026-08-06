@@ -152,6 +152,20 @@ class SkillEvalSchemaTests(unittest.TestCase):
         self.assertIn("harness.command is not allowed", diagnostics)
         self.assertNotIn("SECRET COMMAND CANARY", json.dumps(diagnostics))
 
+    def test_grader_ids_must_use_the_stable_identifier_alphabet(self) -> None:
+        canary = "UNSAFE GRADER ID CANARY /home/user/.ssh/id_rsa"
+        with tempfile.TemporaryDirectory() as directory:
+            artifact_root = Path(directory)
+            record = valid_record(
+                artifacts=write_required_artifacts(artifact_root)
+            ).to_json()
+            record["graders"][0]["id"] = canary
+
+            diagnostics = validate_skill_eval_run_record(record, artifact_root)
+
+        self.assertIn("grader entry 0 has invalid id", diagnostics)
+        self.assertNotIn(canary, json.dumps(diagnostics))
+
     def test_stale_source_fingerprint_is_reported(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             artifact_root = Path(directory)
