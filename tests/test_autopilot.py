@@ -139,6 +139,7 @@ from vibe_loop.config import (
     normalize_registry_runtime_context,
     resolve_task_agent,
 )
+from vibe_loop.generated_profiles import RuntimeTaskSourceResolution
 from vibe_loop.retry import ProviderLimitSignal
 from vibe_loop.runner import (
     AgentProviderLimitError,
@@ -8961,6 +8962,34 @@ class NativePlanningTests(unittest.TestCase):
             worker_calls[0]["command"],
         )
         self.assertIn(
+            "classify every requested validation or certification command",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "Never put a mainline-only gate in a worker-dispatched task",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "requires a clean checkout of the configured main branch",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "operator-owned release step outside vibe-loop run",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            'runtime-resolved runnable statuses ["Active", "Next", "Planned"]',
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "Do not weaken the gate, add a worker-branch bypass",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "verify that no mainline-only gate remains",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
             str(config.state_path / "runs.jsonl"),
             worker_calls[0]["command"],
         )
@@ -9013,6 +9042,60 @@ class NativePlanningTests(unittest.TestCase):
         self.assertEqual(records[1]["phase"], "started")
         self.assertEqual(records[2]["phase"], "terminal")
         self.assertEqual(records[2]["runnable_after"], 2)
+
+    def test_plan_worker_prompt_uses_runtime_resolved_runnable_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            status = collect_project_status(config)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            worker_commands: list[str] = []
+            resolved_source = dataclasses.replace(
+                config.task_source,
+                runnable_statuses=("ready",),
+            )
+            resolution = RuntimeTaskSourceResolution(
+                task_source=resolved_source,
+                origin="generated_cache",
+                diagnostics=(),
+                cache_path=config.generated_task_profile_path,
+            )
+
+            def worker_launcher(command, *, cwd, log_path, timeout_seconds, on_start):
+                worker_commands.append(command)
+                on_start(4242)
+                return NativePlanningProcessResult(exit_code=0, pid=4242)
+
+            with mock.patch.object(
+                VibeRunner,
+                "source_resolution",
+                new_callable=mock.PropertyMock,
+                return_value=resolution,
+            ):
+                result = run_native_planning(
+                    config,
+                    cycle_id="cycle-resolved-statuses",
+                    status=status,
+                    min_ready=2,
+                    run_store=run_store,
+                    analysis_runner=lambda prompt, output_path: {
+                        "should_plan": True,
+                        "reason": "the ready queue is below its target",
+                        "objective": "add one reviewed dependency-ready task",
+                    },
+                    worker_launcher=worker_launcher,
+                )
+
+        self.assertEqual(result.worker.status, "completed")
+        self.assertEqual(len(worker_commands), 1)
+        self.assertIn(
+            'runtime-resolved runnable statuses ["ready"]', worker_commands[0]
+        )
+        self.assertNotIn(
+            'runtime-resolved runnable statuses ["Active", "Next", "Planned"]',
+            worker_commands[0],
+        )
 
     def test_claimed_new_task_stays_productive_in_real_collection_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
