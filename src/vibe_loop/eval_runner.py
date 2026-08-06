@@ -327,6 +327,7 @@ class AgentCommandBatch:
     command_results: tuple[dict[str, object], ...]
     workflow_events: tuple[str, ...] = ()
     transcript_rejected: bool = False
+    evidence_diagnostics: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -425,7 +426,7 @@ def archive_previous_aggregate_artifacts(
     for relative_root in sorted(active_artifact_roots(previous_aggregate)):
         source = suite_root / relative_root
         if source.exists():
-            validate_archive_source(source)
+            validate_archive_source(source, artifact_root=relative_root)
             roots_to_archive.append((relative_root, source))
     validate_structured_artifact(
         "aggregate.json", previous_aggregate, category="aggregate"
@@ -465,7 +466,7 @@ def copy_archive_path(source: Path, destination: Path) -> None:
             shutil.copy2(source, destination, follow_symlinks=False)
 
 
-def validate_archive_source(source: Path) -> None:
+def validate_archive_source(source: Path, *, artifact_root: str) -> None:
     paths = [source] if source.is_file() else sorted(source.rglob("*"))
     for path in paths:
         relative = path.relative_to(source) if path != source else Path(path.name)
@@ -475,20 +476,40 @@ def validate_archive_source(source: Path) -> None:
             raise EvalSafeEnvelopeError("archive rejected: symlink source")
         if not path.is_file() or path.name == "run.log":
             continue
+        locator = f"{artifact_root}/{relative.as_posix()}"
         if path.suffix == ".jsonl":
             if path.stat().st_size > EVAL_MAX_STRUCTURED_BYTES:
-                raise EvalSafeEnvelopeError("archive rejected: byte budget exceeded")
-            project_transcript_jsonl(path.read_text(encoding="utf-8"))
+                raise EvalSafeEnvelopeError(
+                    f"archive {locator} rejected: byte budget exceeded"
+                )
+            if path.name != "transcript.jsonl":
+                raise EvalSafeEnvelopeError(
+                    f"archive {artifact_root} rejected: unknown artifact schema"
+                )
+            try:
+                raw = path.read_text(encoding="utf-8")
+                project_transcript_jsonl(raw)
+            except (OSError, UnicodeError, EvalSafeEnvelopeError):
+                raise EvalSafeEnvelopeError(
+                    f"archive {locator} rejected: invalid transcript"
+                ) from None
         elif path.suffix == ".json":
             if path.stat().st_size > EVAL_MAX_STRUCTURED_BYTES:
-                raise EvalSafeEnvelopeError("archive rejected: byte budget exceeded")
+                raise EvalSafeEnvelopeError(
+                    f"archive {locator} rejected: byte budget exceeded"
+                )
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError, ValueError):
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
                 raise EvalSafeEnvelopeError(
-                    "archive rejected: malformed JSON"
+                    f"archive {locator} rejected: malformed JSON"
                 ) from None
-            validate_structured_artifact(path.name, payload, category="archive")
+            category = (
+                f"archive {locator}"
+                if path.name in STRUCTURED_ARTIFACT_TOP_LEVEL_FIELDS
+                else f"archive {artifact_root}"
+            )
+            validate_structured_artifact(path.name, payload, category=category)
 
 
 def validate_structured_artifact(
@@ -732,9 +753,9 @@ def run_trial(
         agent_batch.transcript_rejected
         or write_transcript_if_missing(trial_root, execution)
     )
-    evidence_diagnostics = (
-        ("transcript evidence rejected",) if transcript_rejected else ()
-    )
+    evidence_diagnostics = list(agent_batch.evidence_diagnostics)
+    if transcript_rejected:
+        evidence_diagnostics.append("transcript evidence rejected")
     git_after = collect_git_state(repo)
     write_json_artifact(trial_root, "git_state_after", safe_git_state(git_after))
     write_text_artifact(trial_root, "diff", fixture_diff(repo, git_before))
@@ -747,39 +768,47 @@ def run_trial(
             hook_results=hook_results,
             runtime=hook_runtime,
         )
-    transcript_graders = run_transcript_graders(
-        config.transcript_graders,
-        repo=repo,
-        artifact_root=trial_root,
-        case=case,
-        condition=condition,
-        trial=trial,
-        run_id=run_id,
-        budgets=budgets,
-    )
-    if transcript_graders:
-        workflow_events = workflow_events_for_trial(
-            trial_root,
-            execution,
-            transcript_graders,
-            allow_artifact_events=False,
-            git_before=git_before,
-            git_after=git_after,
-            grader_output=deterministic,
+    try:
+        transcript_graders = run_transcript_graders(
+            config.transcript_graders,
+            repo=repo,
+            artifact_root=trial_root,
+            case=case,
             condition=condition,
+            trial=trial,
+            run_id=run_id,
+            budgets=budgets,
         )
-    else:
-        workflow_events = workflow_events_for_trial(
-            trial_root,
-            execution,
-            transcript_graders,
-            allow_artifact_events=True,
-            git_before=git_before,
-            git_after=git_after,
-            grader_output=deterministic,
-            condition=condition,
-            extra_events=agent_batch.workflow_events,
-        )
+    except EvalSafeEnvelopeError:
+        transcript_graders = []
+        evidence_diagnostics.append("grader evidence rejected")
+    try:
+        if transcript_graders:
+            workflow_events = workflow_events_for_trial(
+                trial_root,
+                execution,
+                transcript_graders,
+                allow_artifact_events=False,
+                git_before=git_before,
+                git_after=git_after,
+                grader_output=deterministic,
+                condition=condition,
+            )
+        else:
+            workflow_events = workflow_events_for_trial(
+                trial_root,
+                execution,
+                transcript_graders,
+                allow_artifact_events=True,
+                git_before=git_before,
+                git_after=git_after,
+                grader_output=deterministic,
+                condition=condition,
+                extra_events=agent_batch.workflow_events,
+            )
+    except EvalSafeEnvelopeError:
+        workflow_events = []
+        evidence_diagnostics.append("workflow event evidence rejected")
     write_json_artifact(trial_root, "workflow_events", {"events": workflow_events})
     lock_after = collect_lock_state(lock_manager, case.task_id)
     write_lock_evidence(
@@ -1092,6 +1121,7 @@ def execute_negative_prompt_set(
     prompt_results: list[dict[str, object]] = []
     workflow_events: list[str] = []
     transcript_rejected = False
+    evidence_diagnostics: list[str] = []
     spec = load_json(case.repo_path / "eval" / "expected-artifacts.json")
     negative_specs = spec.get("negative_prompts") if isinstance(spec, Mapping) else ()
     response_terms_by_id = {
@@ -1151,12 +1181,16 @@ def execute_negative_prompt_set(
         )
         prompt_usage = usage_metrics((), prompt_artifact_root, ())
         prompt_after = collect_git_state(prompt_repo)
-        prompt_events = workflow_events_for_trial(
-            prompt_artifact_root,
-            execution,
-            (),
-            allow_artifact_events=True,
-        )
+        try:
+            prompt_events = workflow_events_for_trial(
+                prompt_artifact_root,
+                execution,
+                (),
+                allow_artifact_events=True,
+            )
+        except EvalSafeEnvelopeError:
+            prompt_events = []
+            evidence_diagnostics.append("workflow event evidence rejected")
         workflow_events.extend(prompt_events)
         executions.append(execution)
         command_results.append(
@@ -1194,6 +1228,7 @@ def execute_negative_prompt_set(
         command_results=tuple(command_results),
         workflow_events=tuple(unique_preserving_order(workflow_events)),
         transcript_rejected=transcript_rejected,
+        evidence_diagnostics=tuple(unique_preserving_order(evidence_diagnostics)),
     )
 
 
@@ -1492,10 +1527,10 @@ def write_transcript_if_missing(
 ) -> bool:
     path = artifact_path(artifact_root, "transcript")
     if path.exists():
-        raw = path.read_text(encoding="utf-8")
         try:
+            raw = path.read_text(encoding="utf-8")
             records = project_transcript_jsonl(raw)
-        except EvalSafeEnvelopeError:
+        except (OSError, UnicodeError, EvalSafeEnvelopeError):
             write_safe_transcript(path, ())
             return True
         write_safe_transcript(path, records)
@@ -1809,7 +1844,7 @@ def workflow_events_for_trial(
                 )
             )
     if execution.unsafe_refused or unsafe_command_reason(
-        execution.stdout + execution.stderr
+        execution_output_for_classification(execution)
     ):
         events.append("unsafe_git_command")
     return list(normalize_workflow_events(unique_preserving_order(events)))
@@ -2413,7 +2448,7 @@ def failure_taxonomy_for_trial(
     if execution.timeout:
         labels.add("timeout")
     if execution.unsafe_refused or unsafe_command_reason(
-        execution.stdout + execution.stderr
+        execution_output_for_classification(execution)
     ):
         labels.add("unsafe_git")
     if execution.output_truncated:
@@ -3327,9 +3362,8 @@ def safe_workspace_dirty_summary(
             or path_diagnostics("workspace dirty file", relative_path)
         ):
             continue
-        try:
-            status = safe_identifier(parts[0], category="workspace file status")
-        except EvalSafeEnvelopeError:
+        status = parts[0]
+        if status not in {"??", "!!"} and not re.fullmatch(r"[MADRCU]{1,2}", status):
             continue
         projected.append(f"{status} {relative_path}")
     return projected
@@ -3711,6 +3745,13 @@ def unsafe_command_reason(command: str) -> str:
         if fragment in normalized:
             return fragment
     return ""
+
+
+def execution_output_for_classification(execution: CommandExecution) -> str:
+    stdout = execution.stdout
+    if is_stream_json(stdout):
+        stdout, _events = parse_stream_json(stdout)
+    return stdout + execution.stderr
 
 
 def parse_agent_command_specs(

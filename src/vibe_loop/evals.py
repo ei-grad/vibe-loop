@@ -796,7 +796,7 @@ def validate_source_fingerprints(
             current_sha = current_source_sha(path, current_source_fingerprints)
             if current_sha is None:
                 diagnostics.append(
-                    f"source fingerprint missing from current sources: {path}"
+                    f"source fingerprint entry {index} missing from current sources"
                 )
             elif current_sha != sha256:
                 diagnostics.append(f"source fingerprint entry {index} is stale")

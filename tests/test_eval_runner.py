@@ -21,13 +21,15 @@ from vibe_loop.eval_runner import (
     build_aggregate,
     build_eval_prompt,
     render_aggregate_markdown,
+    safe_workspace_dirty_summary,
+    score_trial,
     write_task_source_evidence,
     workflow_events_for_trial,
     workflow_taxonomy_labels,
 )
-from vibe_loop.eval_examples import materialize_eval_example
+from vibe_loop.eval_examples import list_eval_example_cases, materialize_eval_example
 from vibe_loop.config import load_config
-from vibe_loop.evals import EVAL_FAILURE_TAXONOMY
+from vibe_loop.evals import EVAL_FAILURE_TAXONOMY, EvalSafeEnvelopeError
 from vibe_loop.runner import VibeRunner
 
 
@@ -99,6 +101,10 @@ class EvalRunnerCliTests(unittest.TestCase):
                 "(artifact / 'transcript.jsonl').write_text("
                 "'{not-json " + canary + "\\n', encoding='utf-8')\n"
             ),
+            "transcript_encoding": (
+                "(artifact / 'transcript.jsonl').write_bytes("
+                'b\'{"type": "result", "result": "\\xff\\xfe"}\\n\')\n'
+            ),
             "workflow": (
                 "(artifact / 'workflow-events.json').write_text("
                 "json.dumps({'events': ['" + canary.lower() + "']}) + '\\n', "
@@ -145,24 +151,26 @@ class EvalRunnerCliTests(unittest.TestCase):
                     if path.is_file() and path.suffix in {".json", ".jsonl", ".md"}
                 ]
 
-                if category == "transcript":
-                    self.assertEqual(exit_code, 0)
-                    payload = json.loads(stdout.getvalue())
-                    record = payload["records"][0]
-                    run_record = json.loads(
-                        (
-                            root
-                            / "eval-runs/local-demo-v1/cases/negative-trigger-set"
-                            / "no_skill/trial-1/run.json"
-                        ).read_text(encoding="utf-8")
-                    )
-                    self.assertEqual(record["status"], "infrastructure_error")
-                    self.assertEqual(
-                        run_record["structured_result"]["schema_diagnostics"],
-                        ["transcript evidence rejected"],
-                    )
-                else:
-                    self.assertNotEqual(exit_code, 0)
+                self.assertEqual(exit_code, 0)
+                payload = json.loads(stdout.getvalue())
+                record = payload["records"][0]
+                run_record = json.loads(
+                    (
+                        root
+                        / "eval-runs/local-demo-v1/cases/negative-trigger-set"
+                        / "no_skill/trial-1/run.json"
+                    ).read_text(encoding="utf-8")
+                )
+                expected_diagnostic = (
+                    "workflow event evidence rejected"
+                    if category == "workflow"
+                    else "transcript evidence rejected"
+                )
+                self.assertEqual(record["status"], "infrastructure_error")
+                self.assertEqual(
+                    run_record["structured_result"]["schema_diagnostics"],
+                    [expected_diagnostic],
+                )
                 self.assertNotIn(canary, stdout.getvalue())
                 self.assertNotIn(canary, stderr.getvalue())
                 self.assertNotIn(canary.lower(), stdout.getvalue())
@@ -171,6 +179,48 @@ class EvalRunnerCliTests(unittest.TestCase):
                     text = path.read_text(encoding="utf-8")
                     self.assertNotIn(canary, text)
                     self.assertNotIn(canary.lower(), text)
+
+    def test_unknown_transcript_grader_labels_are_contained_per_trial(self) -> None:
+        canary = "UNKNOWN_GRADER_LABEL_CANARY"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "negative_agent.py"
+            grader = root / "unknown_label_grader.py"
+            write_negative_agent(agent)
+            write_python_executable(
+                grader,
+                "import json\n"
+                f"print(json.dumps({{'id': 'unknown-label', 'passed': True, "
+                f"'failure_taxonomy': [{canary!r}]}}))\n",
+            )
+
+            payload = run_eval(
+                root,
+                "--case",
+                "negative-trigger-set",
+                "--condition",
+                "no_skill",
+                "--agent-command",
+                f"no_skill={agent}",
+                "--transcript-grader",
+                str(grader),
+            )
+            trial_root = (
+                root
+                / "eval-runs/local-demo-v1/cases/negative-trigger-set"
+                / "no_skill/trial-1"
+            )
+            run_record = json.loads(
+                (trial_root / "run.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(payload["records"][0]["status"], "infrastructure_error")
+        self.assertEqual(
+            run_record["structured_result"]["schema_diagnostics"],
+            ["grader evidence rejected"],
+        )
+        self.assertNotIn(canary, json.dumps(payload))
+        self.assertNotIn(canary, json.dumps(run_record))
 
     def test_task_source_evidence_uses_default_and_generated_runtime_resolution(
         self,
@@ -1592,6 +1642,94 @@ class EvalRunnerCliTests(unittest.TestCase):
         self.assertIn("skill_activated", events)
         self.assertIn("integration_lock_busy_observed", events)
 
+    def test_stream_tool_output_does_not_trigger_unsafe_git_classification(
+        self,
+    ) -> None:
+        stream = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "name": "Read",
+                                    "input": {"file_path": "AGENTS.md"},
+                                }
+                            ]
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "content": "NEVER do git reset --hard without asking",
+                                }
+                            ]
+                        },
+                    }
+                ),
+                json.dumps({"type": "result", "result": "Done safely."}),
+            )
+        )
+        execution = CommandExecution(
+            command="agent",
+            exit_code=0,
+            stdout=stream,
+            stderr="",
+            started_at="2026-05-09T00:00:00+00:00",
+            finished_at="2026-05-09T00:00:01+00:00",
+            duration_seconds=1.0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            events = workflow_events_for_trial(
+                Path(directory), execution, (), allow_artifact_events=False
+            )
+        case = next(
+            case
+            for case in list_eval_example_cases()
+            if case.case_id == "negative-trigger-set"
+        )
+        scoring = score_trial(
+            case,
+            "no_skill",
+            execution,
+            {"passed": True, "checks": []},
+            (),
+            artifact_result=None,
+            schema_diagnostics=(),
+            command_count=1,
+            max_commands=10,
+        )
+
+        self.assertIn("instructions_inspected", events)
+        self.assertNotIn("unsafe_git_command", events)
+        self.assertTrue(scoring["passed"])
+        self.assertNotIn("unsafe_git", scoring["failure_taxonomy"])
+
+    def test_untracked_files_remain_in_safe_workspace_dirty_summary(self) -> None:
+        self.assertEqual(
+            safe_workspace_dirty_summary(
+                {
+                    "dirty_summary": [
+                        " M docs/foreign-notes.md",
+                        "?? docs/untracked.md",
+                        "A  added.py",
+                    ]
+                }
+            ),
+            [
+                "M docs/foreign-notes.md",
+                "?? docs/untracked.md",
+                "A added.py",
+            ],
+        )
+
     def test_forbidden_workflow_event_is_retained_from_artifact(self) -> None:
         execution = CommandExecution(
             command="agent",
@@ -1662,8 +1800,34 @@ class EvalRunnerCliTests(unittest.TestCase):
 
             self.assertNotEqual(exit_code, 0)
             self.assertFalse((suite_root / "history").exists())
+            self.assertIn(
+                "cases/negative-trigger-set/no_skill/trial-1/command-results.json",
+                stderr.getvalue(),
+            )
             self.assertNotIn(canary, stdout.getvalue())
             self.assertNotIn(canary, stderr.getvalue())
+
+    def test_archive_rejects_non_utf8_transcript_with_bounded_locator(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            suite_root = Path(directory)
+            relative_root = "cases/example/vibe_loop/trial-1"
+            trial_root = suite_root / relative_root
+            trial_root.mkdir(parents=True)
+            (trial_root / "transcript.jsonl").write_bytes(
+                b'{"type": "result", "result": "\xff\xfe"}\n'
+            )
+
+            with self.assertRaisesRegex(
+                EvalSafeEnvelopeError,
+                "cases/example/vibe_loop/trial-1/transcript.jsonl rejected: "
+                "invalid transcript",
+            ):
+                archive_previous_aggregate_artifacts(
+                    suite_root,
+                    {"records": [{"artifact_root": relative_root}]},
+                )
+
+            self.assertFalse((suite_root / "history").exists())
 
     def test_legacy_prior_aggregate_metrics_and_records_are_normalized(self) -> None:
         records = load_skill_quality_records()

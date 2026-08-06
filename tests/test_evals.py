@@ -166,6 +166,26 @@ class SkillEvalSchemaTests(unittest.TestCase):
 
         self.assertIn("source fingerprint entry 0 is stale", diagnostics)
 
+    def test_missing_source_fingerprint_diagnostic_does_not_echo_path(self) -> None:
+        canary = ".env/SOURCE_FINGERPRINT_CANARY"
+        with tempfile.TemporaryDirectory() as directory:
+            artifact_root = Path(directory)
+            record = valid_record(
+                artifacts=write_required_artifacts(artifact_root)
+            ).to_json()
+            record["source_fingerprints"][0]["path"] = canary
+
+            diagnostics = validate_skill_eval_run_record(
+                record,
+                artifact_root,
+                current_source_fingerprints={},
+            )
+
+        self.assertIn(
+            "source fingerprint entry 0 missing from current sources", diagnostics
+        )
+        self.assertNotIn(canary, json.dumps(diagnostics))
+
     def test_missing_required_artifacts_are_reported(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             artifact_root = Path(directory)

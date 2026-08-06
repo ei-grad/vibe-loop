@@ -22,8 +22,8 @@
       },
       {
         "role": "report_evidence",
-        "field": "latest.message",
-        "contains": "main-integration"
+        "field": "latest.reason",
+        "equals": "main_integration_lock_unavailable"
       },
       {
         "role": "structured_result",

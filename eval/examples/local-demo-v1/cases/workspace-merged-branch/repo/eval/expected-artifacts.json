@@ -22,8 +22,8 @@
       },
       {
         "role": "report_evidence",
-        "field": "latest.message",
-        "contains": "branch_already_merged"
+        "field": "latest.reason",
+        "equals": "branch_already_merged"
       },
       {
         "role": "structured_result",
