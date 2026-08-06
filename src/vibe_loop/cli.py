@@ -1909,11 +1909,50 @@ def render_detached_autopilot_launch(launch) -> str:
             )
             message += f"\nconfig contract blockers:\n{details}"
         return message
-    return (
+    lines = [
         f"autopilot started pid={launch.pid} "
         f"process_group={launch.process_group_id} session={launch.session_id} "
         f"run_id={launch.run_id} log={launch.log}"
-    )
+    ]
+    lines.extend(render_skill_deployment_advisories(launch.advisories))
+    return "\n".join(lines)
+
+
+def render_skill_deployment_advisories(
+    advisories: Sequence[Mapping[str, object]],
+) -> list[str]:
+    lines: list[str] = []
+    for advisory in advisories:
+        if advisory.get("code") not in {
+            "skill_deployment_drift",
+            "skill_deployment_check_failed",
+        }:
+            continue
+        if not lines:
+            lines.append("advisories:")
+        affected = ", ".join(str(name) for name in advisory.get("affected_skills", []))
+        differences: list[str] = []
+        for deployment in advisory.get("deployments", []):
+            if not isinstance(deployment, Mapping):
+                continue
+            target_root = str(deployment.get("target_root") or "unknown")
+            for difference in deployment.get("differences", []):
+                if not isinstance(difference, Mapping):
+                    continue
+                differences.append(
+                    f"{target_root}/{difference.get('path') or 'unknown'}="
+                    f"{difference.get('state') or 'unknown'}"
+                )
+        lines.append(
+            f"  - {advisory['code']}: "
+            + (f"skills={affected} " if affected else "")
+            + (
+                f"differences={'; '.join(differences)}"
+                if differences
+                else str(advisory.get("message") or "verification failed")
+            )
+        )
+    return lines
 
 
 def render_owned_process_identities(identities) -> str:
@@ -2199,6 +2238,12 @@ def render_autopilot_status(status: ProjectStatus) -> str:
                     + (f" changed_files={changed_files}" if changed_files else "")
                     + (f" changed_files_truncated={omitted}" if omitted else "")
                 )
+            elif advisory["code"] in {
+                "skill_deployment_drift",
+                "skill_deployment_check_failed",
+            }:
+                rendered = render_skill_deployment_advisories((advisory,))
+                lines.extend(rendered[1:])
             else:
                 changed_keys = ", ".join(advisory.get("changed_keys", []))
                 lines.append(f"  - {advisory['code']}: {changed_keys}")

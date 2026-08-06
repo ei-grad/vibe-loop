@@ -63,6 +63,9 @@ global write part of worker launch and obscure when deployment changed. The
 operator must inspect the verifier output and install explicitly from clean
 `main`.
 
+The [Autopilot PRD](prd/autopilot.md#prd-aut-002b-supervisor-configuration-lifetime)
+owns supervisor and CLI startup visibility for these deployment states.
+
 The bundle-agnostic implementation lives in
 `vibe_loop.skill_deployment`; `vibe_loop.skills` only supplies this repository's
 resource root and skill names. Other skill-producing CLIs should use this

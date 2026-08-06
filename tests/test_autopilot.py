@@ -278,6 +278,31 @@ class AutopilotStatusTests(unittest.TestCase):
             )
         )
 
+    def test_status_warns_about_manifest_missing_bundled_skill(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            home = root / "home"
+            repo.mkdir()
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            installed = home / ".codex" / "skills" / "autopilot" / "SKILL.md"
+            installed.parent.mkdir(parents=True)
+            installed.write_text("copied without a manifest\n", encoding="utf-8")
+
+            status = collect_project_status(load_config(repo), skill_home=home)
+            payload = status.to_json()
+            rendered = render_autopilot_status(status)
+
+        self.assertEqual(
+            [advisory["code"] for advisory in payload["advisories"]],
+            ["skill_deployment_drift"],
+        )
+        advisory = payload["advisories"][0]
+        self.assertEqual(advisory["severity"], "warning")
+        self.assertEqual(advisory["affected_skills"], ["autopilot"])
+        self.assertIn("autopilot/SKILL.md=unmanaged", rendered)
+        self.assertIn(".skill-manifest.json=manifest-missing", rendered)
+
     def test_status_alarms_on_six_approved_candidates_with_zero_closures(
         self,
     ) -> None:

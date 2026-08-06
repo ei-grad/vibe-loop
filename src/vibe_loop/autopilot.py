@@ -73,6 +73,7 @@ from vibe_loop.retry import (
     parse_provider_limit_reset_delay,
 )
 from vibe_loop.runtime_events import ACTIONABLE_RUNTIME_EVENT_KINDS
+from vibe_loop.skills import installed_skill_drift_advisories
 from vibe_loop.runner import (
     AgentProviderLimitError,
     AgentRuntimeContext,
@@ -586,7 +587,9 @@ def collect_project_status(
     *,
     process_exists: ProcessExists | None = None,
     disk_health_result: DiskHealthCycleResult | None = None,
+    skill_home: Path | None = None,
 ) -> ProjectStatus:
+    skill_advisories = installed_skill_drift_advisories(skill_home or Path.home())
     project_binding = resolve_project_binding(config)
     contract_blockers = config_contract_blockers(config)
     run_store = RunStore(config.state_path / "runs.jsonl")
@@ -629,6 +632,7 @@ def collect_project_status(
             last_cycle=latest_cycle_summary(run_store),
             non_closure=non_closure,
             latest_main_verification_failure=latest_verification_failure,
+            advisories=skill_advisories,
             blockers=(
                 *(item.code for item in project_binding.diagnostics),
                 *(item.code for item in contract_blockers),
@@ -803,7 +807,7 @@ def collect_project_status(
         workspace_diagnostics=workspace_diagnostics,
         supervisor=supervisor,
         blockers=tuple(blockers),
-        advisories=supervisor.advisories,
+        advisories=(*supervisor.advisories, *skill_advisories),
         observations=observations,
         stranded_review_tasks=stranded_reviews,
         last_cycle=last_cycle,
@@ -2510,6 +2514,7 @@ class AutopilotRunSummary:
     cycles: tuple[AutopilotCycleResult, ...] = ()
     blocker: str = ""
     log: Path | None = None
+    advisories: tuple[dict[str, object], ...] = ()
 
     @property
     def exit_code(self) -> int:
@@ -2527,6 +2532,7 @@ class AutopilotRunSummary:
             "started": self.started,
             "blocker": self.blocker,
             "log": str(self.log) if self.log is not None else "",
+            "advisories": [dict(advisory) for advisory in self.advisories],
             "cycles": [cycle.to_json() for cycle in self.cycles],
         }
 
@@ -2542,6 +2548,7 @@ class DetachedAutopilotLaunch:
     log: Path | None = None
     blocker: str = ""
     config_contract_blockers: tuple[ConfigContractBlocker, ...] = ()
+    advisories: tuple[dict[str, object], ...] = ()
 
     @property
     def exit_code(self) -> int:
@@ -2560,6 +2567,7 @@ class DetachedAutopilotLaunch:
             "config_contract_blockers": [
                 blocker.to_json() for blocker in self.config_contract_blockers
             ],
+            "advisories": [dict(advisory) for advisory in self.advisories],
         }
 
 
@@ -2804,6 +2812,7 @@ def start_detached_autopilot(
     """Start and verify a detached POSIX autopilot supervisor."""
 
     interval = require_autopilot_interval(interval)
+    skill_advisories = installed_skill_drift_advisories(Path.home())
     if os.name != "posix" or not hasattr(os, "setsid"):
         return DetachedAutopilotLaunch(
             repo=config.repo,
@@ -2968,6 +2977,7 @@ def start_detached_autopilot(
                     process_group_id=process_group_id,
                     session_id=session_id,
                     log=log_path,
+                    advisories=skill_advisories,
                 )
             if status.locked and lock_pid != process.pid:
                 blocker = "autopilot_supervisor_active"
@@ -3007,6 +3017,7 @@ def start_detached_autopilot(
         session_id=session_id,
         log=log_path,
         blocker=blocker,
+        advisories=skill_advisories,
     )
 
 
@@ -9121,6 +9132,7 @@ def run_autopilot(
     interval = require_autopilot_interval(interval)
     min_ready = require_positive_min_ready(min_ready)
     dispatch_min_ready = require_positive_dispatch_min_ready(dispatch_min_ready)
+    skill_advisories = installed_skill_drift_advisories(Path.home())
 
     supervisor_run_id = new_run_id("autopilot")
     binding = resolve_project_binding(config)
@@ -9270,6 +9282,7 @@ def run_autopilot(
                 "config_key_fingerprints": dict(config.config_key_fingerprints),
                 "reload_config_jobs": reload_config_jobs,
                 "code_identity": dict(IMPORTED_RUNTIME_CODE_IDENTITY),
+                "advisories": [dict(advisory) for advisory in skill_advisories],
             }
         )
         cycle_number = 0
@@ -9627,6 +9640,7 @@ def run_autopilot(
         started=True,
         cycles=tuple(cycles),
         log=supervisor_log,
+        advisories=skill_advisories,
     )
 
 
