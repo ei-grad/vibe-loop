@@ -63,7 +63,7 @@ jobs:
         self.assertEqual(explicit_root, explicit)
         self.assertTrue(bare)
 
-    def test_runtime_generated_nested_checkout_is_not_collected(self) -> None:
+    def test_repository_recursion_exclusions_are_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             shutil.copyfile(REPO_ROOT / "pyproject.toml", repo / "pyproject.toml")
@@ -72,11 +72,33 @@ jobs:
             (tests / "test_authoritative.py").write_text(
                 "def test_authoritative():\n    assert True\n"
             )
-            nested_tests = repo / ".vibe-loop" / "main-verification" / "repo" / "tests"
-            nested_tests.mkdir(parents=True)
-            (nested_tests / "test_nested.py").write_text(
-                "def test_nested_duplicate():\n    assert True\n"
+            excluded_tests = (
+                repo
+                / ".vibe-loop"
+                / "main-verification"
+                / "repo"
+                / "tests"
+                / "test_nested.py",
+                repo
+                / ".runtime-state"
+                / "verification"
+                / "repo"
+                / "tests"
+                / "test_runtime.py",
+                repo
+                / ".venv"
+                / "lib"
+                / "site-packages"
+                / "pkg"
+                / "tests"
+                / "test_vendored.py",
+                repo / "build" / "test_build.py",
+                repo / "dist" / "test_dist.py",
+                repo / "node_modules" / "pkg" / "test_node_modules.py",
             )
+            for path in excluded_tests:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("def test_excluded():\n    assert True\n")
 
             bare = collect_node_ids(repo)
             explicit_root = collect_node_ids(repo, ".")

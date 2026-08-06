@@ -53,5 +53,16 @@ exclude = [
 ]
 
 [tool.pytest.ini_options]
-norecursedirs = [".vibe-loop", "eval/examples/*/cases/*/repo"]
+norecursedirs = [
+    "*.egg",
+    ".*",
+    "_darcs",
+    "build",
+    "CVS",
+    "dist",
+    "node_modules",
+    "venv",
+    "{arch}",
+    "eval/examples/*/cases/*/repo",
+]
 testpaths = ["tests"]
