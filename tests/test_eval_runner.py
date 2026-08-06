@@ -224,7 +224,7 @@ class EvalRunnerCliTests(unittest.TestCase):
         self.assertNotIn(canary, json.dumps(run_record))
 
     def test_transcript_grader_id_is_rejected_and_contained_per_trial(self) -> None:
-        canary = "UNSAFE GRADER ID CANARY /home/user/.ssh/id_rsa"
+        canary = "UNSAFE GRADER ID CANARY .ssh/id_rsa"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             agent = root / "negative_agent.py"

@@ -153,7 +153,7 @@ class SkillEvalSchemaTests(unittest.TestCase):
         self.assertNotIn("SECRET COMMAND CANARY", json.dumps(diagnostics))
 
     def test_grader_ids_must_use_the_stable_identifier_alphabet(self) -> None:
-        canary = "UNSAFE GRADER ID CANARY /home/user/.ssh/id_rsa"
+        canary = "UNSAFE GRADER ID CANARY .ssh/id_rsa"
         with tempfile.TemporaryDirectory() as directory:
             artifact_root = Path(directory)
             record = valid_record(
