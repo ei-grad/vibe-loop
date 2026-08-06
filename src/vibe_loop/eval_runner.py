@@ -1885,8 +1885,11 @@ def detect_events_from_repo_state(
     events.append("instructions_inspected")
     events.append("worktree_state_inspected")
 
-    branches_after = git_after.get("branches", [])
-    if isinstance(branches_after, list) and len(branches_after) <= 1 and head_changed:
+    branches_before = git_ref_names(git_before.get("branches"))
+    branches_after = git_ref_names(git_after.get("branches"))
+    worktrees_before = git_worktree_count(git_before.get("worktrees"))
+    worktrees_after = git_worktree_count(git_after.get("worktrees"))
+    if branches_after - branches_before or worktrees_after > worktrees_before:
         events.append("branch_or_worktree_created")
 
     grader_passed = False
@@ -1915,6 +1918,20 @@ def detect_events_from_repo_state(
         events.append("skill_activated")
 
     return events
+
+
+def git_ref_names(value: object) -> set[str]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return set()
+    return {item for item in value if isinstance(item, str) and item}
+
+
+def git_worktree_count(value: object) -> int:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return 0
+    return sum(
+        1 for item in value if isinstance(item, str) and item.startswith("worktree ")
+    )
 
 
 def detect_regression_events_from_repo_state(
