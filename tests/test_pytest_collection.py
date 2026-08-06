@@ -3,6 +3,7 @@ from __future__ import annotations
 from _test_bootstrap import TEST_ENVIRONMENT_CONFIGURED as TEST_ENVIRONMENT_CONFIGURED
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -61,6 +62,29 @@ jobs:
         self.assertEqual(bare, explicit)
         self.assertEqual(explicit_root, explicit)
         self.assertTrue(bare)
+
+    def test_runtime_generated_nested_checkout_is_not_collected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            shutil.copyfile(REPO_ROOT / "pyproject.toml", repo / "pyproject.toml")
+            tests = repo / "tests"
+            tests.mkdir()
+            (tests / "test_authoritative.py").write_text(
+                "def test_authoritative():\n    assert True\n"
+            )
+            nested_tests = repo / ".vibe-loop" / "main-verification" / "repo" / "tests"
+            nested_tests.mkdir(parents=True)
+            (nested_tests / "test_nested.py").write_text(
+                "def test_nested_duplicate():\n    assert True\n"
+            )
+
+            bare = collect_node_ids(repo)
+            explicit_root = collect_node_ids(repo, ".")
+            explicit_tests = collect_node_ids(repo, "tests")
+
+        self.assertEqual(bare, ["tests/test_authoritative.py::test_authoritative"])
+        self.assertEqual(explicit_root, bare)
+        self.assertEqual(explicit_tests, bare)
 
     def test_materialized_eval_fixture_collects_from_its_own_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
