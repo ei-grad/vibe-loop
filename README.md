@@ -238,8 +238,9 @@ Install repository hooks with:
 make install-hooks
 ```
 
-The [release checklist](docs/release-checklist.md) owns versioning, installed
-hook behavior, skill readiness, TestPyPI staging, and publishing.
+Release procedures are in the [release checklist](docs/release-checklist.md);
+policy is authoritative in the
+[evals and release PRD](docs/prd/evals-release.md).
 
 ## License
 

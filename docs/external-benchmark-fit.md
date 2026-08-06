@@ -89,9 +89,9 @@ these as follow-on adapter requirements, not only benchmark background:
   reliability, and record user-simulator, model, API provider, and domain data
   versions because they materially affect comparability.
 
-## Reporting Rules
+## Reporting Recommendations
 
-Every external run must record:
+For useful and reproducible research evidence, an external run should record:
 
 - benchmark name, version, split, date or month, instance IDs, repository or
   image identifiers, and platform;
@@ -105,14 +105,18 @@ Every external run must record:
 - a statement that results are non-leaderboard unless the official harness,
   scaffold, sample, budget, and submission rules were followed.
 
-External benchmark results must not replace the local release gate. They are
-diagnostic context for adapter quality and broad agent capability, while local
-demo fixtures remain the authoritative test for bundled skill behavior.
+These are methodology recommendations. The sole authority for external-adapter
+behavior, evidence limits, and separation from release requirements is
+[PRD-EVL-006](prd/evals-release.md#prd-evl-006-external-benchmark-adapters).
 
 ## Pinned SWE-rebench V2 Smoke
 
-`eval/benchmarks/swe-rebench-v2-smoke.json` is the optional post-`0.2.0`
-follow-up for EVAL-10. It pins 24 `train` instances from
+`eval/benchmarks/swe-rebench-v2-smoke.json` is the repository's pinned research
+sample for EVAL-10. The mechanics and operator prerequisites below describe the
+current implementation;
+[PRD-EVL-006](prd/evals-release.md#prd-evl-006-external-benchmark-adapters)
+remains authoritative for its behavioral and evidentiary contract. The manifest
+pins 24 `train` instances from
 `nebius/SWE-rebench-V2` revision
 `475dd5e8703bb5fb22dd3c60b5d038b019eba1e0`: four each for Go, Java,
 JavaScript, Python, Rust, and TypeScript. Every selected row has a pre-built
@@ -165,5 +169,6 @@ infrastructure failures, while a valid fail-to-pass mismatch is an agent failure
 grader infrastructure failures therefore remain separate from agent command,
 timeout, patch-contract, or test-outcome failures. Image tags are preserved exactly,
 but the upstream dataset does not provide registry digests; resolve and record
-digests separately before treating repeated runs as stable comparisons. These
-results remain non-leaderboard evidence even when all tasks pass.
+digests separately before treating repeated runs as stable comparisons. Apply
+the [PRD-EVL-006 evidence limits](prd/evals-release.md#prd-evl-006-external-benchmark-adapters)
+when interpreting the results.

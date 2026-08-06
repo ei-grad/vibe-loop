@@ -87,12 +87,10 @@ Each trial needs a clean worktree or fresh fixture checkout. Do not reuse a
 modified repository, `.vibe-loop/` state directory, lock file, transcript, or
 skill cache across conditions unless that state is explicitly part of the task.
 
-The release-readiness gate is a smaller smoke matrix, not the full paired
-comparison. It should require the release-relevant `vibe_loop`,
-`vibe_loop_cli`, and `orchestrated_vibe_loop` case/condition pairs to pass, plus
-negative trigger prompts under `vibe_loop`; it should not require `no_skill`
-baseline failures before publishing. Paired no-skill evidence remains useful
-when measuring uplift or investigating regressions outside the release gate.
+Release-readiness matrix requirements are defined only by
+[PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate). Paired
+no-skill evidence remains useful when measuring uplift or investigating
+regressions outside that release contract.
 
 ## Task Suite Design
 
@@ -172,7 +170,7 @@ Recommended trial policy:
 
 - trigger evals: 3 runs per query initially, reporting trigger rate;
 - local smoke suite: 1 trial per condition for quick developer feedback;
-- release gate for bundled skill changes: 3 trials per task per condition;
+- repeated candidate studies: 3 trials per task per condition;
 - high-risk changes or flaky cases: 5 trials per task per condition;
 - public benchmark adapters: sample sizes follow
   [`docs/external-benchmark-fit.md`](external-benchmark-fit.md), with results
@@ -270,16 +268,11 @@ behavior and release policy. This strategy explains the methodology and
 research rationale without overriding that contract; the CLI reference owns
 the command and flag interface.
 
-The optional post-`0.2.0` SWE-rebench V2 smoke follow-up uses
-`eval/benchmarks/swe-rebench-v2-smoke.json`. Its 24 pinned multilingual
-instances require an operator-supplied matching task export, pinned upstream
-harness checkout, pre-pulled Docker images, and an agent wrapper that writes one
-matching non-empty patch per task. The adapter verifies complete task-record
-fingerprints before invoking the pinned harness. The authoritative external
-adapter contract is
-[PRD-EVL-006](prd/evals-release.md#prd-evl-006-external-benchmark-adapters); the
-broader benchmark selection rationale remains in the
-[external benchmark fit](external-benchmark-fit.md).
+The pinned SWE-rebench V2 research sample and its operator prerequisites are
+documented in the
+[external benchmark fit](external-benchmark-fit.md#pinned-swe-rebench-v2-smoke).
+[PRD-EVL-006](prd/evals-release.md#prd-evl-006-external-benchmark-adapters) is
+the sole authority for external-adapter behavior and evidentiary guarantees.
 
 ## Remaining Questions
 

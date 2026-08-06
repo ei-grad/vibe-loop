@@ -1,9 +1,9 @@
 # Release Checklist
 
-Use this checklist to produce evidence and start publishing. The GitHub release
-workflow, not this checklist, makes the exact-revision admission decision before
-either package-index credential is exercised. The contract is authoritative in
-[PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate).
+Use this checklist to produce evidence and start publishing. It documents the
+operator procedure; [PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate)
+is the sole authority for release classification, readiness, admission, and
+publishing policy.
 
 ## Versioning And Repository Hooks
 
@@ -25,7 +25,10 @@ for a compatible existing provenance hook.
 
 ## Bundled Skill Gate
 
-Run the local release gate from a clean repository state:
+Use [PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate) to
+determine whether the candidate classification requires readiness evidence and
+which matrix, trial, and blocking conditions apply. When readiness evidence is
+required, run the local release gate from a clean repository state:
 
 ```bash
 uv run vibe-loop eval release-gate --repo . --overwrite \
@@ -33,33 +36,10 @@ uv run vibe-loop eval release-gate --repo . --overwrite \
 ```
 
 The command runs `local-demo-v1` unless `--aggregate` or `--dry-run` is supplied.
-The release gate requires:
+Use `eval local-demo` for broad no-skill baseline comparisons. Use `--trials N`
+with `--minimum-trials N` when a repeated run is needed.
 
-- every required release-gate case/condition pair has at least one passing
-  trial;
-- the aggregate includes `skill_quality` condition summaries and
-  workflow-contract failure evidence;
-- the aggregate has no unresolved `workflow_contract_regression` flags;
-- any accepted workflow-contract regression is parked with a task id before
-  publishing;
-- the aggregate was produced at the exact clean commit and every required
-  trial contains the matching bundled-skill fingerprint;
-- release notes or the task plan will reference the stable evidence URL from
-  validated release-admission output, rather than a copied download URL.
-
-The default release matrix is intentionally smaller than the full paired eval
-suite. It excludes `no_skill`, covers finite `vibe_loop` behavior across the
-representative task domains, runs CLI-supervised cases under `vibe_loop_cli`,
-pins legacy workspace/integration stories to explicit worker-owned mode, runs
-`runtime-owned-implementation` with the slim runtime-owned worker contract,
-checks orchestration only on delegation-specific cases, and runs the negative
-trigger set under `vibe_loop`. Use `eval local-demo` for broad no-skill baseline
-comparisons. Use `--trials N --minimum-trials N` when a repeated release run is
-needed.
-
-The release gate may use a cheaper deterministic-enough model as long as the
-agent command, model id, and artifacts are recorded in the aggregate. For
-example:
+To run with an alternative recorded agent command and model, use:
 
 ```bash
 uv run vibe-loop eval release-gate --repo . --overwrite \
@@ -110,8 +90,11 @@ workflow-contract regression is covered by the same follow-up task.
 
 ## External Smoke Evidence
 
-External benchmark smoke results are optional. They should be summarized in a
-small JSON file and attached to the release record:
+[PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate) owns
+release attachment policy, and
+[PRD-EVL-006](prd/evals-release.md#prd-evl-006-external-benchmark-adapters) owns
+the external-adapter contract and its evidentiary limits. To attach a compact
+summary intentionally, pass it to the release gate:
 
 ```bash
 uv run vibe-loop eval release-gate --repo . --dry-run \
@@ -124,13 +107,12 @@ The release gate stores the summary file path, size, SHA-256, benchmark name,
 status, and selected summary fields. Do not attach raw benchmark logs or
 transcripts to the release-readiness record.
 
-The pinned SWE-rebench V2 multilingual smoke is a post-`0.2.0` follow-up, not a
-`0.2.0` release blocker and not a replacement for the local-demo matrix. Its
-result is absent by default and is recorded only when the operator intentionally
-passes the generated `swe-rebench-v2-multilingual-smoke-results.json` with
-`--external-benchmark-json`. Treat `infrastructure_failed` separately from
-`agent_failed` when interpreting the optional summary, and retain the manifest's
-non-leaderboard caveat in release evidence.
+The pinned SWE-rebench V2 multilingual smoke is a version-neutral research
+adapter. Its setup and interpretation are documented in
+[External Benchmark Fit](external-benchmark-fit.md#pinned-swe-rebench-v2-smoke).
+Pass the generated `swe-rebench-v2-multilingual-smoke-results.json` only when
+intentionally attaching that evidence, distinguish `infrastructure_failed`
+from `agent_failed`, and retain the manifest's non-leaderboard caveat.
 
 `docs/examples/release-readiness-dry-run.json` shows an exact-revision record
 shape with illustrative full commits and skill fingerprints, local-suite
@@ -138,7 +120,9 @@ evidence, and optional external smoke evidence.
 
 ## Publish
 
-After the release-readiness record passes:
+After the
+[PRD-EVL-005 admission prerequisites](prd/evals-release.md#prd-evl-005-release-readiness-gate)
+are satisfied:
 
 1. Upload its compact JSON for the exact commit through the `Skill Release
    Readiness Evidence` workflow. The immutable artifact name includes the full
@@ -150,12 +134,7 @@ After the release-readiness record passes:
 3. Run the release workflow for TestPyPI, optionally supplying the evidence run
    id to select among exact-head artifacts. PyPI remains restricted to a
    matching `v<version>` tag.
-4. The release workflow discovers the prior reachable release tag, classifies
-   every changed/renamed/deleted path, validates the record only when an owned
-   path changed, compares every distribution's bundled skills, and uploads a
-   hashed admission bundle containing the validated repository, workflow, run,
-   artifact, exact-head, and stable-reference provenance. Both publishers
-   download and revalidate that bundle and the distributions before trusted
-   publishing begins. A missing or changed provenance file blocks publication.
-   Releases with only unrelated paths emit an explicit exemption summary and
-   do not require provenance or run the 20-case gate.
+4. Let the release workflow apply the classification, exact-revision admission,
+   evidence transport, and pre-publishing checks defined by
+   [PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate). Do not
+   bypass or manually reconstruct that admission path.
