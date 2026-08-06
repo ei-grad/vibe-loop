@@ -294,6 +294,89 @@ def verify_worker_skill_deployments(home: Path) -> tuple[VerificationReport, ...
     return tuple(reports)
 
 
+def deployment_drift_advisories(
+    home: Path,
+    *,
+    source_root: Path,
+    skill_names: Iterable[str],
+) -> tuple[dict[str, object], ...]:
+    names = tuple(skill_names)
+    bundled_names = frozenset(names)
+    bundled_source_paths = frozenset(_source_files(source_root.resolve(), names))
+    deployments: list[dict[str, object]] = []
+    affected_skills: set[str] = set()
+    for report in verify_skill_deployments(home):
+        differences: list[dict[str, str]] = []
+        root_skills: set[str] = set()
+        for entry in report.entries:
+            skill_name = _bundled_skill_name(entry.relative_path, bundled_names)
+            if skill_name is None or entry.state == "in-sync":
+                continue
+            difference = {
+                "skill": skill_name,
+                "path": entry.relative_path,
+                "state": entry.state,
+            }
+            if entry.detail:
+                difference["detail"] = entry.detail
+            differences.append(difference)
+            root_skills.add(skill_name)
+        for relative_path in report.unmanaged:
+            if relative_path not in bundled_source_paths:
+                continue
+            skill_name = relative_path.split("/", 1)[0]
+            differences.append(
+                {
+                    "skill": skill_name,
+                    "path": relative_path,
+                    "state": "unmanaged",
+                }
+            )
+            root_skills.add(skill_name)
+        if report.manifest_error and root_skills:
+            manifest_state = (
+                "manifest-missing"
+                if report.manifest_error == "manifest missing"
+                else "manifest-error"
+            )
+            differences.extend(
+                {
+                    "skill": skill_name,
+                    "path": MANIFEST_NAME,
+                    "state": manifest_state,
+                    "detail": report.manifest_error,
+                }
+                for skill_name in sorted(root_skills)
+            )
+        if not differences:
+            continue
+        affected_skills.update(root_skills)
+        deployments.append(
+            {
+                "target_root": str(report.target_root),
+                "manifest_error": report.manifest_error,
+                "differences": differences,
+            }
+        )
+
+    if not deployments:
+        return ()
+    affected_names = sorted(affected_skills)
+    return (
+        {
+            "code": "skill_deployment_drift",
+            "severity": "warning",
+            "affected_skills": affected_names,
+            "deployments": deployments,
+            "message": (
+                "bundled skill deployments differ from their recorded source for "
+                f"{', '.join(affected_names)}; run `vibe-loop verify-skills`, then "
+                "reinstall from a clean main checkout"
+            ),
+        },
+    )
+
+
 def verify_target_root(target_root: Path) -> VerificationReport:
     target_root = target_root.resolve()
     try:
@@ -571,6 +654,14 @@ def _is_safe_relative_path(value: object) -> bool:
         return False
     path = Path(value)
     return not path.is_absolute() and ".." not in path.parts
+
+
+def _bundled_skill_name(
+    relative_path: str,
+    bundled_names: frozenset[str],
+) -> str | None:
+    skill_name = relative_path.split("/", 1)[0]
+    return skill_name if skill_name in bundled_names else None
 
 
 def _package_source_state(

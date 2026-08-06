@@ -1792,7 +1792,7 @@ def dispatch_specs(args: argparse.Namespace, config) -> int:
 def dispatch_autopilot(args: argparse.Namespace, config) -> int:
     command = getattr(args, "autopilot_command", None)
     if command == "status":
-        status = collect_project_status(config)
+        status = collect_project_status(config, skill_home=Path.home())
         if getattr(args, "json", False):
             print(json.dumps(status.to_json(), indent=2, default=list))
         else:
@@ -1861,6 +1861,7 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
                 max_tasks=getattr(args, "max_tasks", 0),
                 min_ready=min_ready,
                 dispatch_min_ready=dispatch_min_ready,
+                skill_home=Path.home(),
             )
             if getattr(args, "json", False):
                 print(json.dumps(launch.to_json(), indent=2))
@@ -1881,6 +1882,7 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
             min_ready=min_ready,
             dispatch_min_ready=dispatch_min_ready,
             install_reload_signal=bool(getattr(args, "detached_reload_signal", False)),
+            skill_home=Path.home(),
         )
         print(json.dumps(summary.to_json(), indent=2, default=list))
         return summary.exit_code
@@ -1909,11 +1911,52 @@ def render_detached_autopilot_launch(launch) -> str:
             )
             message += f"\nconfig contract blockers:\n{details}"
         return message
-    return (
+    lines = [
         f"autopilot started pid={launch.pid} "
         f"process_group={launch.process_group_id} session={launch.session_id} "
         f"run_id={launch.run_id} log={launch.log}"
-    )
+    ]
+    lines.extend(render_skill_deployment_advisories(launch.advisories))
+    return "\n".join(lines)
+
+
+def render_skill_deployment_advisories(
+    advisories: Sequence[Mapping[str, object]],
+) -> list[str]:
+    lines: list[str] = []
+    for advisory in advisories:
+        if advisory.get("code") not in {
+            "skill_deployment_drift",
+            "skill_deployment_check_failed",
+        }:
+            continue
+        if not lines:
+            lines.append("advisories:")
+        affected = ", ".join(str(name) for name in advisory.get("affected_skills", []))
+        differences: list[str] = []
+        for deployment in advisory.get("deployments", []):
+            if not isinstance(deployment, Mapping):
+                continue
+            target_root = str(deployment.get("target_root") or "unknown")
+            for difference in deployment.get("differences", []):
+                if not isinstance(difference, Mapping):
+                    continue
+                differences.append(
+                    f"{target_root}/{difference.get('path') or 'unknown'}="
+                    f"{difference.get('state') or 'unknown'}"
+                )
+        lines.append(
+            f"  - {advisory['code']}: "
+            + (f"skills={affected} " if affected else "")
+            + (
+                f"differences={'; '.join(differences)}"
+                if differences
+                else str(advisory.get("message") or "verification failed")
+            )
+        )
+        if differences and advisory.get("message"):
+            lines.append(f"    {advisory['message']}")
+    return lines
 
 
 def render_owned_process_identities(identities) -> str:
@@ -2199,6 +2242,12 @@ def render_autopilot_status(status: ProjectStatus) -> str:
                     + (f" changed_files={changed_files}" if changed_files else "")
                     + (f" changed_files_truncated={omitted}" if omitted else "")
                 )
+            elif advisory["code"] in {
+                "skill_deployment_drift",
+                "skill_deployment_check_failed",
+            }:
+                rendered = render_skill_deployment_advisories((advisory,))
+                lines.extend(rendered[1:])
             else:
                 changed_keys = ", ".join(advisory.get("changed_keys", []))
                 lines.append(f"  - {advisory['code']}: {changed_keys}")
@@ -2501,7 +2550,10 @@ def dispatch_autopilot_projects(args: argparse.Namespace) -> int:
         if entry is None:
             print(f"not in registry: {args.project}", file=sys.stderr)
             return 2
-        status = collect_project_status(load_registry_entry_config(entry))
+        status = collect_project_status(
+            load_registry_entry_config(entry),
+            skill_home=Path.home(),
+        )
         if use_json:
             status_payload = status.to_json()
             project_binding = status_payload.pop("project_binding", None)
@@ -2541,7 +2593,7 @@ def dispatch_autopilot_projects(args: argparse.Namespace) -> int:
 
     if command == "status":
         registry = ProjectRegistry.load(registry_path)
-        results = collect_registry_status(registry)
+        results = collect_registry_status(registry, skill_home=Path.home())
         if use_json:
             print(
                 json.dumps(

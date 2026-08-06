@@ -191,6 +191,19 @@ must state how many additional entries were omitted.
 Code staleness is advisory only and never authorizes a restart while workers
 are active.
 
+Supervisor and CLI startup must also run the bundled skill deployment verifier
+against both runtime roots. Drift in a bundled skill produces a typed
+`skill_deployment_drift` warning in the same advisory channel as supervisor
+code staleness. The warning names affected skills and reports `stale`,
+`runtime-edited`, `branch-sourced`, `unmanaged`, `manifest-missing`, and
+`manifest-error` states by runtime path. A missing or invalid manifest is
+reportable when bundled skill content is present. `unmanaged` applies only to
+paths that are part of the current shipped bundle; target-only metadata, caches,
+and independently managed content remain outside this advisory. The check is
+read-only, startup continues, and no automatic install or overwrite is
+authorized. If verification itself cannot complete, startup continues with a
+typed `skill_deployment_check_failed` warning.
+
 An unreadable or invalid file at a cycle boundary does not terminate the
 supervisor or advance the applied snapshot. The cycle retains the last valid
 configuration, withholds dispatch, records `autopilot_config_reload_failed`,

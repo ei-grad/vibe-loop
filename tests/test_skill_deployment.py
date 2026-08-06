@@ -15,6 +15,7 @@ from vibe_loop.cli import main
 from vibe_loop.skill_deployment import (
     MANIFEST_NAME,
     SkillDeploymentError,
+    deployment_drift_advisories,
     deploy_skill_bundle,
     verify_skill_deployments,
     verify_worker_skill_deployments,
@@ -281,6 +282,100 @@ class SkillDeploymentTests(unittest.TestCase):
         unmanaged.write_text("mutable\n", encoding="utf-8")
 
         self.assertEqual(verify_worker_skill_deployments(self.home), ())
+
+    def test_deployment_drift_advisory_reports_stale_bundled_skill(self) -> None:
+        self.deploy()
+        source = self.repo / "skills" / "example" / "SKILL.md"
+        source.write_text("version two\n", encoding="utf-8")
+
+        advisories = deployment_drift_advisories(
+            self.home,
+            source_root=self.repo / "skills",
+            skill_names=("example",),
+        )
+
+        self.assertEqual(len(advisories), 1)
+        advisory = advisories[0]
+        self.assertEqual(advisory["code"], "skill_deployment_drift")
+        self.assertEqual(advisory["affected_skills"], ["example"])
+        self.assertIn(
+            {
+                "skill": "example",
+                "path": "example/SKILL.md",
+                "state": "stale",
+                "detail": "source changed",
+            },
+            advisory["deployments"][0]["differences"],
+        )
+
+    def test_deployment_drift_advisory_reports_manifest_missing_root(self) -> None:
+        unmanaged = self.home / ".codex" / "skills" / "example" / "SKILL.md"
+        unmanaged.parent.mkdir(parents=True)
+        unmanaged.write_text("copied without a manifest\n", encoding="utf-8")
+
+        advisories = deployment_drift_advisories(
+            self.home,
+            source_root=self.repo / "skills",
+            skill_names=("example",),
+        )
+
+        self.assertEqual(len(advisories), 1)
+        differences = advisories[0]["deployments"][0]["differences"]
+        self.assertEqual(
+            {difference["state"] for difference in differences},
+            {"manifest-missing", "unmanaged"},
+        )
+        self.assertTrue(
+            all(difference["skill"] == "example" for difference in differences)
+        )
+
+    def test_deployment_drift_advisory_is_empty_for_in_sync_deployment(self) -> None:
+        self.deploy()
+
+        self.assertEqual(
+            deployment_drift_advisories(
+                self.home,
+                source_root=self.repo / "skills",
+                skill_names=("example",),
+            ),
+            (),
+        )
+
+    def test_deployment_drift_advisory_ignores_non_bundle_runtime_files(
+        self,
+    ) -> None:
+        self.deploy()
+        target = self.home / ".codex" / "skills" / "example"
+        (target / "agents").mkdir()
+        (target / "agents" / "openai.yaml").write_text(
+            "runtime metadata\n",
+            encoding="utf-8",
+        )
+        (target / "__pycache__").mkdir()
+        (target / "__pycache__" / "generated.pyc").write_bytes(b"generated")
+
+        self.assertEqual(
+            deployment_drift_advisories(
+                self.home,
+                source_root=self.repo / "skills",
+                skill_names=("example",),
+            ),
+            (),
+        )
+
+    def test_deployment_drift_advisory_reports_invalid_manifest(self) -> None:
+        self.deploy()
+        manifest = self.home / ".codex" / "skills" / MANIFEST_NAME
+        manifest.write_text("not json\n", encoding="utf-8")
+
+        advisories = deployment_drift_advisories(
+            self.home,
+            source_root=self.repo / "skills",
+            skill_names=("example",),
+        )
+
+        differences = advisories[0]["deployments"][0]["differences"]
+        self.assertIn("manifest-error", {item["state"] for item in differences})
 
     def test_verify_skills_cli_is_read_only_and_filters_its_report(self) -> None:
         self.deploy()

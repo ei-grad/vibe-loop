@@ -177,7 +177,12 @@ from vibe_loop.runs import (
     WorkerReport,
     autopilot_child_started_record,
 )
-from vibe_loop.cli import main, render_autopilot_status, render_autopilot_stop
+from vibe_loop.cli import (
+    main,
+    render_autopilot_status,
+    render_autopilot_stop,
+    render_detached_autopilot_launch,
+)
 from vibe_loop.processes import (
     ProcessNode,
     collect_owned_descendants,
@@ -277,6 +282,32 @@ class AutopilotStatusTests(unittest.TestCase):
                 end_main="head",
             )
         )
+
+    def test_status_warns_about_manifest_missing_bundled_skill(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            home = root / "home"
+            repo.mkdir()
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            installed = home / ".codex" / "skills" / "autopilot" / "SKILL.md"
+            installed.parent.mkdir(parents=True)
+            installed.write_text("copied without a manifest\n", encoding="utf-8")
+
+            status = collect_project_status(load_config(repo), skill_home=home)
+            payload = status.to_json()
+            rendered = render_autopilot_status(status)
+
+        self.assertEqual(
+            [advisory["code"] for advisory in payload["advisories"]],
+            ["skill_deployment_drift"],
+        )
+        advisory = payload["advisories"][0]
+        self.assertEqual(advisory["severity"], "warning")
+        self.assertEqual(advisory["affected_skills"], ["autopilot"])
+        self.assertIn("autopilot/SKILL.md=unmanaged", rendered)
+        self.assertIn(".skill-manifest.json=manifest-missing", rendered)
+        self.assertIn("reinstall from a clean main checkout", rendered)
 
     def test_status_alarms_on_six_approved_candidates_with_zero_closures(
         self,
@@ -2500,8 +2531,18 @@ class AutopilotRunTests(unittest.TestCase):
             configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
             config = load_config(repo)
             launcher, calls = self._recording_launcher()
+            skill_home = config.state_path / "test-home"
+            installed = skill_home / ".codex" / "skills" / "autopilot" / "SKILL.md"
+            installed.parent.mkdir(parents=True)
+            installed.write_text("copied without a manifest\n", encoding="utf-8")
 
-            summary = run_autopilot(config, once=True, jobs=2, launcher=launcher)
+            summary = run_autopilot(
+                config,
+                once=True,
+                jobs=2,
+                launcher=launcher,
+                skill_home=skill_home,
+            )
 
             manager = build_lock_manager(
                 config.repo, config.state_path / "locks", config.locks
@@ -2510,6 +2551,10 @@ class AutopilotRunTests(unittest.TestCase):
             records = RunStore(config.state_path / "runs.jsonl").read_records()
 
         self.assertTrue(summary.started)
+        self.assertEqual(
+            [advisory["code"] for advisory in summary.advisories],
+            ["skill_deployment_drift"],
+        )
         self.assertEqual(summary.exit_code, 0)
         self.assertEqual(len(summary.cycles), 1)
         self.assertEqual(summary.cycles[0].status, "completed")
@@ -2564,6 +2609,10 @@ class AutopilotRunTests(unittest.TestCase):
             started["process_birth_id"], process_birth_identity(os.getpid())
         )
         self.assertTrue(started["code_identity"]["fingerprint"].startswith("sha256:"))
+        self.assertEqual(
+            [advisory["code"] for advisory in started["advisories"]],
+            ["skill_deployment_drift"],
+        )
 
     def test_supervisor_code_staleness_reports_runtime_commits_and_clears(
         self,
@@ -4064,10 +4113,25 @@ class AutopilotRunTests(unittest.TestCase):
                 }
             )
             config = load_config(repo, runtime_context=dict(runtime_context))
+            skill_home = config.state_path / "test-home"
+            installed = skill_home / ".codex" / "skills" / "autopilot" / "SKILL.md"
+            installed.parent.mkdir(parents=True)
+            installed.write_text("copied without a manifest\n", encoding="utf-8")
 
-            launch = start_detached_autopilot(config, interval=60)
+            launch = start_detached_autopilot(
+                config,
+                interval=60,
+                skill_home=skill_home,
+            )
             try:
                 self.assertTrue(launch.started, launch.blocker)
+                self.assertEqual(
+                    [advisory["code"] for advisory in launch.advisories],
+                    ["skill_deployment_drift"],
+                )
+                rendered = render_detached_autopilot_launch(launch)
+                self.assertIn("autopilot/SKILL.md=unmanaged", rendered)
+                self.assertIn("reinstall from a clean main checkout", rendered)
                 status = collect_project_status(config)
                 self.assertEqual(status.supervisor.pid, launch.pid)
                 payload = json.dumps(status.to_json(), ensure_ascii=False)
