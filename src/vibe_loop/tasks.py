@@ -259,6 +259,15 @@ DELIVERABLE_COLLISION_PRECISION = (
 DELIVERABLE_COLLISION_WARNING_KEYS = frozenset(
     {"kind", "requested_path", "existing_path", "match", "effect", "precision"}
 )
+MAINLINE_ONLY_GATE_COMMAND_RE = re.compile(
+    r"(?:^|[\s`])(?:uv\s+run\s+)?vibe-loop\s+install-skills(?=\s|`|$)",
+    re.IGNORECASE,
+)
+VALIDATION_SECTION_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(?P<title>.*?)\s*#*\s*$")
+VALIDATION_SECTION_TITLE_RE = re.compile(
+    r"\b(?:acceptance|checks?|gates?|test plan|validation|verification)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -375,6 +384,21 @@ class Task:
         if self.hazards:
             payload["hazards"] = list(self.hazards)
         return payload
+
+
+def task_has_mainline_only_validation_gate(task: Task) -> bool:
+    sections = [task.acceptance, task.evidence]
+    validation_section = False
+    for line in task.body.splitlines():
+        heading = VALIDATION_SECTION_HEADING_RE.match(line)
+        if heading is not None:
+            validation_section = (
+                VALIDATION_SECTION_TITLE_RE.search(heading.group("title")) is not None
+            )
+            continue
+        if validation_section:
+            sections.append(line)
+    return MAINLINE_ONLY_GATE_COMMAND_RE.search("\n".join(sections)) is not None
 
 
 def task_deliverable_path_collisions(

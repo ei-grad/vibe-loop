@@ -1037,14 +1037,15 @@ authoritative task source represents that operator step, its status must be
 `gated`, with an actionable status reason, so the step remains visible to the
 operator. The planning worker must not invent a different hold status when
 `gated` is mistakenly configured as runnable; it reports that configuration
-defect, while queue admission still withholds the mainline-only gate. The worker
+defect, while candidate admission still withholds the mainline-only gate. The worker
 must not weaken the gate, add a worker-branch bypass, or prescribe an override
 whose result is still blocked by deployment policy, and must re-read all
 existing, created, or repaired worker tasks to verify that no mainline-only gate
-remains. Queue admission independently blocks a runnable-status task whose
-validation requires the known mainline-only bundled-skill installation command;
-this fail-closed check applies to the whole task source on every collection,
-including tasks published before the current planning cycle.
+remains. The shared candidate-admission path independently excludes a
+runnable-status task whose validation requires the known mainline-only
+bundled-skill installation command. Both supervisor queue reporting and every
+dispatch command consume that exclusion, including `run-until-done`; the
+fail-closed check applies to tasks published before the current planning cycle.
 Before creating new tasks or entering an isolated planning worktree, it must
 inspect the configured runtime state `runs.jsonl` for
 `candidate_scope_assessed` records whose `finding` is

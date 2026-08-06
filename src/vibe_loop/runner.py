@@ -187,6 +187,7 @@ from vibe_loop.tasks import (
     run_task_source_health,
     runnable_tasks_from_snapshot,
     task_deliverable_path_collisions,
+    task_has_mainline_only_validation_gate,
     task_source_error_diagnostics,
 )
 from vibe_loop.upstream import check_upstream_sync
@@ -1951,17 +1952,30 @@ class VibeRunner:
             and task.status in self.source_resolution.task_source.runnable_statuses
             and task.task_id not in excluded
         )
+        mainline_gate_task_ids = {
+            task.task_id
+            for task in ready
+            if task_has_mainline_only_validation_gate(task)
+        }
         dependency_candidates = runnable_tasks_from_snapshot(
             tasks,
             self.source_resolution.task_source.runnable_statuses,
             self.source_resolution.task_source.respect_source_order,
         )
         dependency_candidates = [
-            task for task in dependency_candidates if task.task_id not in excluded
+            task
+            for task in dependency_candidates
+            if task.task_id not in excluded
+            and task.task_id not in mainline_gate_task_ids
         ]
         dependency_candidate_ids = {task.task_id for task in dependency_candidates}
         done_task_ids = {task.task_id for task in tasks if task.done}
         exclusions = [
+            CandidateExclusion(task=task, mechanism="mainline_only_gate")
+            for task in ready
+            if task.task_id in mainline_gate_task_ids
+        ]
+        exclusions.extend(
             CandidateExclusion(
                 task=task,
                 mechanism="dependency",
@@ -1972,8 +1986,9 @@ class VibeRunner:
                 ),
             )
             for task in ready
-            if task.task_id not in dependency_candidate_ids
-        ]
+            if task.task_id not in mainline_gate_task_ids
+            and task.task_id not in dependency_candidate_ids
+        )
         if active_runs is None:
             lock_records = self.lock_manager.list_locks()
             locked_ids = frozenset(

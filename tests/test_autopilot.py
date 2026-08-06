@@ -9117,7 +9117,7 @@ class NativePlanningTests(unittest.TestCase):
             worker_calls[0]["command"],
         )
         self.assertIn(
-            "queue admission will still withhold the mainline-only gate",
+            "candidate admission will still withhold the mainline-only gate",
             worker_calls[0]["command"],
         )
         self.assertIn(

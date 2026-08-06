@@ -344,6 +344,38 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual([task.task_id for task in candidates], ["TASK-01"])
         self.assertEqual(sequence, ["list"])
 
+    def test_candidate_admission_excludes_mainline_only_validation_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tasks = [
+                Task(
+                    task_id="RELEASE-GATE",
+                    title="Run release certification",
+                    status="Next",
+                    body=(
+                        "## Verification\n\n"
+                        "- `uv run vibe-loop install-skills --codex "
+                        "--home <temporary-home>`\n"
+                    ),
+                ),
+                Task(
+                    task_id="TASK-01",
+                    title="Ordinary implementation",
+                    status="Next",
+                ),
+            ]
+            runner = self.explicit_runner(Path(directory), tasks)
+
+            candidates = runner.list_candidates()
+
+        self.assertEqual([task.task_id for task in candidates], ["TASK-01"])
+        self.assertEqual(
+            [
+                (exclusion.task.task_id, exclusion.mechanism)
+                for exclusion in runner.last_candidate_snapshot.exclusions
+            ],
+            [("RELEASE-GATE", "mainline_only_gate")],
+        )
+
     def test_fresh_dispatch_attempts_do_not_cache_health_success(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
