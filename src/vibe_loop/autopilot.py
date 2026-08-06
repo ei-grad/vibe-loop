@@ -589,7 +589,9 @@ def collect_project_status(
     disk_health_result: DiskHealthCycleResult | None = None,
     skill_home: Path | None = None,
 ) -> ProjectStatus:
-    skill_advisories = installed_skill_drift_advisories(skill_home or Path.home())
+    skill_advisories = (
+        installed_skill_drift_advisories(skill_home) if skill_home is not None else ()
+    )
     project_binding = resolve_project_binding(config)
     contract_blockers = config_contract_blockers(config)
     run_store = RunStore(config.state_path / "runs.jsonl")
@@ -2808,16 +2810,20 @@ def start_detached_autopilot(
     dispatch_min_ready: int = 1,
     verification_timeout: float = 5.0,
     verification_interval: float = 0.05,
+    skill_home: Path | None = None,
 ) -> DetachedAutopilotLaunch:
     """Start and verify a detached POSIX autopilot supervisor."""
 
     interval = require_autopilot_interval(interval)
-    skill_advisories = installed_skill_drift_advisories(Path.home())
+    skill_advisories = (
+        installed_skill_drift_advisories(skill_home) if skill_home is not None else ()
+    )
     if os.name != "posix" or not hasattr(os, "setsid"):
         return DetachedAutopilotLaunch(
             repo=config.repo,
             started=False,
             blocker=f"detached_autopilot_unsupported_platform:{sys.platform}",
+            advisories=skill_advisories,
         )
 
     binding = resolve_project_binding(config)
@@ -2826,6 +2832,7 @@ def start_detached_autopilot(
             repo=config.repo,
             started=False,
             blocker=binding.blocker,
+            advisories=skill_advisories,
         )
 
     contract_blockers = config_contract_blockers(config)
@@ -2835,6 +2842,7 @@ def start_detached_autopilot(
             started=False,
             blocker=contract_blockers[0].code,
             config_contract_blockers=contract_blockers,
+            advisories=skill_advisories,
         )
 
     lock_manager = build_lock_manager(
@@ -2856,6 +2864,7 @@ def start_detached_autopilot(
             run_id=str(existing.metadata.get("run_id") or ""),
             pid=int_value(existing.metadata.get("pid")),
             blocker=blocker,
+            advisories=skill_advisories,
         )
 
     launch_id = new_run_id("autopilot-detached")
@@ -2902,6 +2911,7 @@ def start_detached_autopilot(
             started=False,
             log=log_path,
             blocker=f"detached_autopilot_launch_failed:{exc}",
+            advisories=skill_advisories,
         )
     finally:
         if context_file is not None:
@@ -9121,6 +9131,7 @@ def run_autopilot(
     should_stop: Callable[[], bool] | None = None,
     install_signal_handlers: bool = True,
     install_reload_signal: bool = False,
+    skill_home: Path | None = None,
 ) -> AutopilotRunSummary:
     """Supervise ``run-until-done`` as a foreground persistent loop.
 
@@ -9132,7 +9143,9 @@ def run_autopilot(
     interval = require_autopilot_interval(interval)
     min_ready = require_positive_min_ready(min_ready)
     dispatch_min_ready = require_positive_dispatch_min_ready(dispatch_min_ready)
-    skill_advisories = installed_skill_drift_advisories(Path.home())
+    skill_advisories = (
+        installed_skill_drift_advisories(skill_home) if skill_home is not None else ()
+    )
 
     supervisor_run_id = new_run_id("autopilot")
     binding = resolve_project_binding(config)
@@ -9142,6 +9155,7 @@ def run_autopilot(
             run_id=supervisor_run_id,
             started=False,
             blocker=binding.blocker,
+            advisories=skill_advisories,
         )
 
     process_checker = process_exists if process_exists is not None else pid_exists
@@ -9210,6 +9224,7 @@ def run_autopilot(
             run_id=supervisor_run_id,
             started=False,
             blocker="autopilot_supervisor_active",
+            advisories=skill_advisories,
         )
         signal_stack.close()
         return summary
@@ -9219,6 +9234,7 @@ def run_autopilot(
             run_id=supervisor_run_id,
             started=False,
             blocker=f"autopilot_supervisor_lock_stale:{existing.stale_reason or 'unknown'}",
+            advisories=skill_advisories,
         )
         signal_stack.close()
         return summary
@@ -9231,6 +9247,7 @@ def run_autopilot(
             run_id=supervisor_run_id,
             started=False,
             blocker="autopilot_supervisor_active",
+            advisories=skill_advisories,
         )
         signal_stack.close()
         return summary
@@ -9849,12 +9866,17 @@ def collect_registry_status(
     registry: ProjectRegistry,
     *,
     process_exists: ProcessExists | None = None,
+    skill_home: Path | None = None,
 ) -> list[AggregateProjectStatus]:
     results: list[AggregateProjectStatus] = []
     for entry in registry.entries:
         try:
             config = load_registry_entry_config(entry)
-            status = collect_project_status(config, process_exists=process_exists)
+            status = collect_project_status(
+                config,
+                process_exists=process_exists,
+                skill_home=skill_home,
+            )
             results.append(
                 AggregateProjectStatus(
                     name=entry.name,

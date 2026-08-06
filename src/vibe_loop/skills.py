@@ -45,7 +45,12 @@ def install_skills(
 
 def installed_skill_drift_advisories(home: Path) -> tuple[dict[str, object], ...]:
     try:
-        return deployment_drift_advisories(home, skill_names=SKILL_NAMES)
+        source_root = Path(str(importlib.resources.files("vibe_loop") / "skills"))
+        return deployment_drift_advisories(
+            home,
+            source_root=source_root,
+            skill_names=SKILL_NAMES,
+        )
     except (OSError, SkillDeploymentError) as exc:
         return (
             {

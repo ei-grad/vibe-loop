@@ -297,9 +297,12 @@ def verify_worker_skill_deployments(home: Path) -> tuple[VerificationReport, ...
 def deployment_drift_advisories(
     home: Path,
     *,
+    source_root: Path,
     skill_names: Iterable[str],
 ) -> tuple[dict[str, object], ...]:
-    bundled_names = frozenset(skill_names)
+    names = tuple(skill_names)
+    bundled_names = frozenset(names)
+    bundled_source_paths = frozenset(_source_files(source_root.resolve(), names))
     deployments: list[dict[str, object]] = []
     affected_skills: set[str] = set()
     for report in verify_skill_deployments(home):
@@ -319,9 +322,9 @@ def deployment_drift_advisories(
             differences.append(difference)
             root_skills.add(skill_name)
         for relative_path in report.unmanaged:
-            skill_name = _bundled_skill_name(relative_path, bundled_names)
-            if skill_name is None:
+            if relative_path not in bundled_source_paths:
                 continue
+            skill_name = relative_path.split("/", 1)[0]
             differences.append(
                 {
                     "skill": skill_name,
@@ -358,17 +361,17 @@ def deployment_drift_advisories(
 
     if not deployments:
         return ()
-    names = sorted(affected_skills)
+    affected_names = sorted(affected_skills)
     return (
         {
             "code": "skill_deployment_drift",
             "severity": "warning",
-            "affected_skills": names,
+            "affected_skills": affected_names,
             "deployments": deployments,
             "message": (
                 "bundled skill deployments differ from their recorded source for "
-                f"{', '.join(names)}; run `vibe-loop verify-skills`, then reinstall "
-                "from a clean main checkout"
+                f"{', '.join(affected_names)}; run `vibe-loop verify-skills`, then "
+                "reinstall from a clean main checkout"
             ),
         },
     )

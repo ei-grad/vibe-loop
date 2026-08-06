@@ -290,6 +290,7 @@ class SkillDeploymentTests(unittest.TestCase):
 
         advisories = deployment_drift_advisories(
             self.home,
+            source_root=self.repo / "skills",
             skill_names=("example",),
         )
 
@@ -314,6 +315,7 @@ class SkillDeploymentTests(unittest.TestCase):
 
         advisories = deployment_drift_advisories(
             self.home,
+            source_root=self.repo / "skills",
             skill_names=("example",),
         )
 
@@ -333,10 +335,47 @@ class SkillDeploymentTests(unittest.TestCase):
         self.assertEqual(
             deployment_drift_advisories(
                 self.home,
+                source_root=self.repo / "skills",
                 skill_names=("example",),
             ),
             (),
         )
+
+    def test_deployment_drift_advisory_ignores_non_bundle_runtime_files(
+        self,
+    ) -> None:
+        self.deploy()
+        target = self.home / ".codex" / "skills" / "example"
+        (target / "agents").mkdir()
+        (target / "agents" / "openai.yaml").write_text(
+            "runtime metadata\n",
+            encoding="utf-8",
+        )
+        (target / "__pycache__").mkdir()
+        (target / "__pycache__" / "generated.pyc").write_bytes(b"generated")
+
+        self.assertEqual(
+            deployment_drift_advisories(
+                self.home,
+                source_root=self.repo / "skills",
+                skill_names=("example",),
+            ),
+            (),
+        )
+
+    def test_deployment_drift_advisory_reports_invalid_manifest(self) -> None:
+        self.deploy()
+        manifest = self.home / ".codex" / "skills" / MANIFEST_NAME
+        manifest.write_text("not json\n", encoding="utf-8")
+
+        advisories = deployment_drift_advisories(
+            self.home,
+            source_root=self.repo / "skills",
+            skill_names=("example",),
+        )
+
+        differences = advisories[0]["deployments"][0]["differences"]
+        self.assertIn("manifest-error", {item["state"] for item in differences})
 
     def test_verify_skills_cli_is_read_only_and_filters_its_report(self) -> None:
         self.deploy()

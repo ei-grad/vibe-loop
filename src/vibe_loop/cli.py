@@ -1792,7 +1792,7 @@ def dispatch_specs(args: argparse.Namespace, config) -> int:
 def dispatch_autopilot(args: argparse.Namespace, config) -> int:
     command = getattr(args, "autopilot_command", None)
     if command == "status":
-        status = collect_project_status(config)
+        status = collect_project_status(config, skill_home=Path.home())
         if getattr(args, "json", False):
             print(json.dumps(status.to_json(), indent=2, default=list))
         else:
@@ -1861,6 +1861,7 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
                 max_tasks=getattr(args, "max_tasks", 0),
                 min_ready=min_ready,
                 dispatch_min_ready=dispatch_min_ready,
+                skill_home=Path.home(),
             )
             if getattr(args, "json", False):
                 print(json.dumps(launch.to_json(), indent=2))
@@ -1881,6 +1882,7 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
             min_ready=min_ready,
             dispatch_min_ready=dispatch_min_ready,
             install_reload_signal=bool(getattr(args, "detached_reload_signal", False)),
+            skill_home=Path.home(),
         )
         print(json.dumps(summary.to_json(), indent=2, default=list))
         return summary.exit_code
@@ -1952,6 +1954,8 @@ def render_skill_deployment_advisories(
                 else str(advisory.get("message") or "verification failed")
             )
         )
+        if differences and advisory.get("message"):
+            lines.append(f"    {advisory['message']}")
     return lines
 
 
@@ -2546,7 +2550,10 @@ def dispatch_autopilot_projects(args: argparse.Namespace) -> int:
         if entry is None:
             print(f"not in registry: {args.project}", file=sys.stderr)
             return 2
-        status = collect_project_status(load_registry_entry_config(entry))
+        status = collect_project_status(
+            load_registry_entry_config(entry),
+            skill_home=Path.home(),
+        )
         if use_json:
             status_payload = status.to_json()
             project_binding = status_payload.pop("project_binding", None)
@@ -2586,7 +2593,7 @@ def dispatch_autopilot_projects(args: argparse.Namespace) -> int:
 
     if command == "status":
         registry = ProjectRegistry.load(registry_path)
-        results = collect_registry_status(registry)
+        results = collect_registry_status(registry, skill_home=Path.home())
         if use_json:
             print(
                 json.dumps(
