@@ -82,6 +82,23 @@ class SkillEvalSchemaTests(unittest.TestCase):
                 )
                 self.assertNotIn("CANARY", encoded)
 
+    def test_transcript_projection_accepts_current_claude_stream_shapes(self) -> None:
+        raw = (
+            Path(__file__).parent / "fixtures/eval/claude-real-stream.jsonl"
+        ).read_text(encoding="utf-8")
+
+        projected = project_transcript_jsonl(raw)
+        encoded = json.dumps(projected)
+
+        self.assertEqual(
+            [record["kind"] for record in projected],
+            ["system", "tool_call", "system", "system", "system", "result"],
+        )
+        self.assertEqual(projected[4]["duration_seconds"], 3)
+        self.assertEqual(projected[5]["input_tokens"], 30)
+        self.assertEqual(projected[5]["output_tokens"], 7)
+        self.assertNotIn("CANARY", encoded)
+
     def test_structured_byte_budget_covers_shipped_case_output_budgets(self) -> None:
         cases_root = Path(__file__).parents[1] / "eval/examples/local-demo-v1/cases"
         budgets = [

@@ -178,11 +178,14 @@ Before overwrite archival, every preexisting structured source below an active
 artifact root is parsed and checked against the same bounds. Malformed, unsafe,
 unknown, over-budget, or symlinked sources reject the archive before any history
 destination is created. Current safe transcript records are re-projected into
-the same envelope before copying. The legacy transcript shape containing
-exactly `stream` (`stdout` or `stderr`) and `text` is admitted only for archival
-projection: its text is discarded and only the encoded byte count is retained.
-Other legacy or unknown shapes remain rejected. This applies equally to root
-trials, nested `prompt-runs/**`, and structured copies under `history/**`.
+the same envelope before copying. Known Claude and Codex raw harness stream
+records from pre-envelope runs are projected through the same closed adapters;
+their content-bearing fields are discarded. The legacy transcript shape
+containing exactly `stream` (`stdout` or `stderr`) and `text` is also admitted
+only for archival projection: its text is discarded and only the encoded byte
+count is retained. Malformed records and unrecognized event types or fields
+remain rejected. This applies equally to root trials, nested `prompt-runs/**`,
+and structured copies under `history/**`.
 
 `logs/run.log` is the deliberate exception. It is an intentionally
 content-bearing audit artifact and may retain the harness command and captured

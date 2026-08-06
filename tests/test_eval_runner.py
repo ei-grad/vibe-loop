@@ -1497,6 +1497,57 @@ class EvalRunnerCliTests(unittest.TestCase):
         self.assertEqual(projected[0]["stdout_bytes"], len(canary.encode("utf-8")))
         self.assertNotIn(canary, transcript)
 
+    def test_overwrite_projects_pre_upgrade_raw_harness_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "negative_agent.py"
+            write_negative_agent(agent)
+            run_eval(
+                root,
+                "--case",
+                "negative-trigger-set",
+                "--condition",
+                "no_skill",
+                "--agent-command",
+                f"no_skill={agent}",
+            )
+            suite_root = root / "eval-runs/local-demo-v1"
+            transcript = (
+                suite_root
+                / "cases/negative-trigger-set/no_skill/trial-1/transcript.jsonl"
+            )
+            transcript.write_text(
+                (
+                    Path(__file__).parent / "fixtures/eval/claude-real-stream.jsonl"
+                ).read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+
+            payload = run_eval(
+                root,
+                "--case",
+                "negative-trigger-set",
+                "--condition",
+                "no_skill",
+                "--overwrite",
+                "--agent-command",
+                f"no_skill={agent}",
+            )
+            archived_transcripts = list(
+                (suite_root / "history").rglob("transcript.jsonl")
+            )
+            root_transcripts = [
+                path for path in archived_transcripts if "prompt-runs" not in path.parts
+            ]
+            self.assertEqual(len(root_transcripts), 1)
+            archived = root_transcripts[0].read_text(encoding="utf-8")
+            for path in archived_transcripts:
+                self.assertNotIn("CANARY", path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["conditions"]["no_skill"]["trials"], 1)
+        self.assertNotIn("CANARY", archived)
+        self.assertTrue(archived.strip())
+
     def test_stream_result_text_contributes_workflow_events(self) -> None:
         stream = "\n".join(
             (
