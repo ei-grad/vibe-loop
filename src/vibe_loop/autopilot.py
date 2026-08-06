@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import select
 import shutil
 import signal
@@ -164,6 +165,16 @@ from vibe_loop.workers import (
     restore_projected_worker_process_identity,
     worker_view_is_live,
     worktree_branch_delete_revalidation_guardrails,
+)
+
+MAINLINE_ONLY_GATE_COMMAND_RE = re.compile(
+    r"(?:^|[\s`])(?:uv\s+run\s+)?vibe-loop\s+install-skills(?=\s|`|$)",
+    re.IGNORECASE,
+)
+VALIDATION_SECTION_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(?P<title>.*?)\s*#*\s*$")
+VALIDATION_SECTION_TITLE_RE = re.compile(
+    r"\b(?:acceptance|checks?|gates?|test plan|validation|verification)\b",
+    re.IGNORECASE,
 )
 
 RunUntilDoneLauncher = Callable[..., int]
@@ -887,6 +898,14 @@ def collect_task_queue_status(
         candidate_exclusion_dispatch_blocker(exclusion)
         for exclusion in candidate_snapshot.exclusions
     )
+    mainline_gate_blockers = tuple(
+        blocker
+        for task in candidate_snapshot.ready
+        if (blocker := mainline_only_gate_dispatch_blocker(task)) is not None
+    )
+    mainline_gate_blocked_ids = {
+        str(blocker["task_id"]) for blocker in mainline_gate_blockers
+    }
     admission_blockers = tuple(
         {
             "task_id": task.task_id,
@@ -895,9 +914,13 @@ def collect_task_queue_status(
             **blocker.to_json(),
         }
         for task in candidate_snapshot.runnable
+        if task.task_id not in mainline_gate_blocked_ids
         if (blocker := task_agent_dispatch_blocker(effective_config, task)) is not None
     )
-    admission_blocked_ids = {str(blocker["task_id"]) for blocker in admission_blockers}
+    admission_blocked_ids = {
+        str(blocker["task_id"])
+        for blocker in (*mainline_gate_blockers, *admission_blockers)
+    }
     runnable = tuple(
         task
         for task in candidate_snapshot.runnable
@@ -934,7 +957,11 @@ def collect_task_queue_status(
             for task in tasks
             if task.status.casefold() == "gated"
         ),
-        dispatch_blockers=(*candidate_blockers, *admission_blockers),
+        dispatch_blockers=(
+            *candidate_blockers,
+            *mainline_gate_blockers,
+            *admission_blockers,
+        ),
     )
     return apply_dispatch_blockers(queue_status, attempt_circuit_blockers)
 
@@ -1028,6 +1055,43 @@ def candidate_exclusion_dispatch_blocker(
             "remedy": "Wait for the conflicting active run to finish.",
         }
     raise ValueError(f"unknown candidate exclusion mechanism: {exclusion.mechanism}")
+
+
+def mainline_only_gate_dispatch_blocker(
+    task: Task,
+) -> dict[str, object] | None:
+    validation_text = task_validation_text(task)
+    if MAINLINE_ONLY_GATE_COMMAND_RE.search(validation_text) is None:
+        return None
+    return {
+        "task_id": task.task_id,
+        "mechanism": "mainline_only_gate",
+        "code": "mainline_only_gate_in_worker_task",
+        "key": "task.validation",
+        "message": (
+            "task validation requires 'vibe-loop install-skills', which can only "
+            "produce accepted deployment evidence from a clean mainline checkout"
+        ),
+        "remedy": (
+            "Move the certification to an operator-owned task with status 'gated' "
+            "and an actionable status reason."
+        ),
+    }
+
+
+def task_validation_text(task: Task) -> str:
+    sections = [task.acceptance, task.evidence]
+    validation_section = False
+    for line in task.body.splitlines():
+        heading = VALIDATION_SECTION_HEADING_RE.match(line)
+        if heading is not None:
+            validation_section = (
+                VALIDATION_SECTION_TITLE_RE.search(heading.group("title")) is not None
+            )
+            continue
+        if validation_section:
+            sections.append(line)
+    return "\n".join(sections)
 
 
 def apply_dispatch_blockers(
@@ -7266,12 +7330,17 @@ def build_native_planning_worker_prompt(
         "requires a clean checkout of the configured main branch or can only run "
         "after the candidate is integrated. Record that requirement as an "
         "operator-owned release step outside vibe-loop run instead; if the step is "
-        "represented in the authoritative task source, its status must not be one "
-        f"of the runtime-resolved runnable statuses {encoded_runnable_statuses}. "
+        "represented in the authoritative task source, publish it with the exact "
+        "status `gated` and an actionable status reason so it remains visible to "
+        "operators. Do not invent another hold status. If `gated` appears in the "
+        f"runtime-resolved runnable statuses {encoded_runnable_statuses}, report "
+        "that configuration defect; queue admission will still withhold the "
+        "mainline-only gate. "
         "Do not weaken "
         "the gate, add a worker-branch bypass, or prescribe an override when "
         "deployment policy still classifies its result as blocked. Re-read every "
-        "created or repaired worker task and verify that no mainline-only gate "
+        "existing, created, or repaired worker task and verify that no "
+        "mainline-only gate "
         "remains in its body or acceptance criteria. Before "
         "creating new tasks or entering an isolated planning worktree, inspect "
         f"prior scope evidence in {scope_evidence_path}. Read JSONL records whose "

@@ -962,6 +962,137 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertIn("TASK-MALFORMED", rendered)
         self.assertIn("blockers: none", rendered)
 
+    def test_mainline_only_validation_gate_never_enters_worker_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            source = mock.Mock()
+            source.list_tasks.return_value = [
+                Task(
+                    task_id="RELEASE-GATE",
+                    title="Run release certification",
+                    status="Next",
+                    body=(
+                        "## Verification\n\n"
+                        "- `uv run vibe-loop install-skills --codex "
+                        "--home <temporary-home>`\n"
+                    ),
+                ),
+                Task(
+                    task_id="POLICY-DISCUSSION",
+                    title="Document the worker policy",
+                    status="Next",
+                    body=(
+                        "## Context\n\n"
+                        "A prior task incorrectly required `uv run vibe-loop "
+                        "install-skills --codex --home <temporary-home>`.\n"
+                    ),
+                ),
+                Task(
+                    task_id="OPERATOR-GATE",
+                    title="Install release skills from mainline",
+                    status="gated",
+                    status_reason="operator must certify the integrated candidate",
+                    acceptance="Run vibe-loop install-skills --codex.",
+                ),
+            ]
+
+            with mock.patch(
+                "vibe_loop.runner.build_task_source",
+                return_value=source,
+            ):
+                queue = collect_task_queue_status(
+                    config,
+                    attempt_circuit_states=(),
+                )
+
+        self.assertEqual(queue.runnable, 1)
+        self.assertEqual(
+            [task["id"] for task in queue.runnable_tasks],
+            ["POLICY-DISCUSSION"],
+        )
+        self.assertEqual(
+            queue.dispatch_blockers,
+            (
+                {
+                    "task_id": "RELEASE-GATE",
+                    "mechanism": "mainline_only_gate",
+                    "code": "mainline_only_gate_in_worker_task",
+                    "key": "task.validation",
+                    "message": (
+                        "task validation requires 'vibe-loop install-skills', which "
+                        "can only produce accepted deployment evidence from a clean "
+                        "mainline checkout"
+                    ),
+                    "remedy": (
+                        "Move the certification to an operator-owned task with "
+                        "status 'gated' and an actionable status reason."
+                    ),
+                },
+            ),
+        )
+        self.assertEqual(
+            queue.gated_tasks,
+            (
+                {
+                    "id": "OPERATOR-GATE",
+                    "title": "Install release skills from mainline",
+                    "status": "gated",
+                    "priority": "",
+                    "source": "",
+                    "reason": "operator must certify the integrated candidate",
+                },
+            ),
+        )
+
+    def test_mainline_gate_stays_blocked_when_gated_is_configured_runnable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            loaded = load_config(repo)
+            config = dataclasses.replace(
+                loaded,
+                task_source=dataclasses.replace(
+                    loaded.task_source,
+                    runnable_statuses=(
+                        *loaded.task_source.runnable_statuses,
+                        "gated",
+                    ),
+                ),
+            )
+            source = mock.Mock()
+            source.list_tasks.return_value = [
+                Task(
+                    task_id="OPERATOR-GATE",
+                    title="Install release skills from mainline",
+                    status="gated",
+                    status_reason="operator must certify the integrated candidate",
+                    acceptance="Run vibe-loop install-skills --codex.",
+                )
+            ]
+
+            with mock.patch(
+                "vibe_loop.runner.build_task_source",
+                return_value=source,
+            ):
+                queue = collect_task_queue_status(
+                    config,
+                    attempt_circuit_states=(),
+                )
+
+        self.assertEqual(queue.runnable, 0)
+        self.assertEqual(
+            [blocker["code"] for blocker in queue.dispatch_blockers],
+            ["mainline_only_gate_in_worker_task"],
+        )
+        self.assertEqual(
+            [task["id"] for task in queue.gated_tasks],
+            ["OPERATOR-GATE"],
+        )
+
     def test_unchanged_workspace_preflight_deferral_blocks_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -8978,6 +9109,18 @@ class NativePlanningTests(unittest.TestCase):
             worker_calls[0]["command"],
         )
         self.assertIn(
+            "publish it with the exact status `gated` and an actionable status reason",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "Do not invent another hold status",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "queue admission will still withhold the mainline-only gate",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
             'runtime-resolved runnable statuses ["Active", "Next", "Planned"]',
             worker_calls[0]["command"],
         )
@@ -8987,6 +9130,10 @@ class NativePlanningTests(unittest.TestCase):
         )
         self.assertIn(
             "verify that no mainline-only gate remains",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "existing, created, or repaired worker task",
             worker_calls[0]["command"],
         )
         self.assertIn(

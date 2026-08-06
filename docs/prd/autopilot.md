@@ -1034,10 +1034,17 @@ of the configured main branch, or can only produce valid evidence after
 integration, is an operator-owned release step outside `vibe-loop run`; it must
 not appear in the body or acceptance criteria of a worker-dispatched task. If the
 authoritative task source represents that operator step, its status must be
-outside the runtime-resolved runnable statuses. The planning worker must not
-weaken the gate, add a worker-branch bypass, or prescribe an override whose
-result is still blocked by deployment policy, and must re-read authored worker
-tasks to verify that no mainline-only gate remains.
+`gated`, with an actionable status reason, so the step remains visible to the
+operator. The planning worker must not invent a different hold status when
+`gated` is mistakenly configured as runnable; it reports that configuration
+defect, while queue admission still withholds the mainline-only gate. The worker
+must not weaken the gate, add a worker-branch bypass, or prescribe an override
+whose result is still blocked by deployment policy, and must re-read all
+existing, created, or repaired worker tasks to verify that no mainline-only gate
+remains. Queue admission independently blocks a runnable-status task whose
+validation requires the known mainline-only bundled-skill installation command;
+this fail-closed check applies to the whole task source on every collection,
+including tasks published before the current planning cycle.
 Before creating new tasks or entering an isolated planning worktree, it must
 inspect the configured runtime state `runs.jsonl` for
 `candidate_scope_assessed` records whose `finding` is
