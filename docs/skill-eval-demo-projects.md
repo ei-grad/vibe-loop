@@ -930,55 +930,18 @@ only when the bundled skill remains inactive.
 
 ## Expected Artifact Extensions
 
-All cases inherit the required artifact roles from
-[`docs/skill-eval-schema.md`](skill-eval-schema.md). Positive workflow cases
-also add these optional roles when available:
-
-| Artifact Role | Contents |
-| --- | --- |
-| `workflow_events` | JSON events from transcript classification, including skill activation, inspection, edit start, checks, review, re-review, commit, lock, report, and integration events. |
-| `git_state_before` | Initial HEAD, branch, dirtiness, local branches, and worktrees. |
-| `git_state_after` | Final HEAD, branch, dirtiness, local branches, and worktrees. |
-| `test_results` | Machine-readable command result for each verification command. |
-| `review_evidence` | Review request, reviewer identity or stub identity, findings, remediation mapping, and re-review result. |
-| `lock_evidence` | Task lock and main-integration lock records before and after the run. |
-| `workspace_evidence` | Worker workspace diagnostics keyed by task id, including diagnostic codes, stale/warning status, dirty summaries and fingerprints, duplicate worktree counts, and merged targets. |
-| `report_evidence` | `vibe-loop report` command result and matching run-store records. |
-| `generated_profile` | Generated discovery cache plus validation diagnostics. |
-| `budget_evidence` | Timeout, command count, output byte count, and disk delta. |
-
-Artifact paths must remain safe relative paths under the artifact root.
-Secret-like paths, parent traversal, absolute paths, symlinks, private keys,
-credential directories, and environment dumps are rejected before reads.
+All cases inherit the required and optional artifact roles, field contracts,
+path rules, and retention bounds from the
+[skill eval schema](skill-eval-schema.md#artifact-layout). This fixture
+specification declares only which roles and grading predicates each case uses;
+it does not widen their schemas.
 
 ## Trace Envelope
 
-Each case declares the transcript events that matter. The grader should identify
-events from the transcript and command logs, then apply case-specific predicates.
-It must not require exact natural-language phrasing.
-
-Common event names:
-
-- `skill_activated`
-- `instructions_inspected`
-- `task_source_inspected`
-- `worktree_state_inspected`
-- `branch_or_worktree_created`
-- `implementation_edit_started`
-- `verification_ran`
-- `review_requested`
-- `review_finding_received`
-- `review_finding_addressed`
-- `rereview_requested`
-- `commit_created`
-- `main_advanced_detected`
-- `main_integration_lock_acquired`
-- `main_integration_lock_released`
-- `main_fast_forwarded`
-- `main_verification_ran`
-- `worker_report_emitted`
-- `unnecessary_user_prompt`
-- `unsafe_git_command`
+Each case declares which schema-known workflow events matter and applies
+case-specific predicates. The grader derives them from in-process evidence or
+the [safe trace envelope](skill-eval-schema.md#structured-retention-envelope);
+it does not require exact natural-language phrasing.
 
 The trace envelope exists because workflow quality is not fully represented by a
 final repository tree. It should be narrow enough to avoid brittle trajectory

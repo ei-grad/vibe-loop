@@ -3,7 +3,9 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 import os
+import re
 import signal
 import shutil
 import subprocess
@@ -41,13 +43,20 @@ from vibe_loop.generated_profiles import resolve_runtime_task_source
 from vibe_loop.evals import (
     CLI_CONDITIONS,
     EVAL_CONDITIONS,
+    EVAL_FAILURE_TAXONOMY,
+    EVAL_MAX_STRUCTURED_BYTES,
     SKILL_CONDITIONS,
     EvalArtifactRef,
+    EvalSafeEnvelopeError,
     EvalSourceFingerprint,
     SkillEvalRunRecord,
     has_symlink_component,
     is_secret_like_eval_path,
+    normalize_workflow_events,
     path_diagnostics,
+    process_result_transcript_record,
+    project_transcript_jsonl,
+    safe_identifier,
     sha256_file,
     validate_skill_eval_run_record,
 )
@@ -138,7 +147,6 @@ class CommandExecution:
 
     def to_json(self) -> dict[str, object]:
         return {
-            "command": self.command,
             "exit_code": self.exit_code,
             "timeout": self.timeout,
             "duration_seconds": round(self.duration_seconds, 6),
@@ -165,18 +173,22 @@ class TranscriptGraderResult:
     workflow_events: tuple[str, ...]
 
     def to_json(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "id": self.id,
             "type": "transcript",
-            "command": self.command,
             "exit_code": self.exit_code,
             "passed": self.passed,
-            "payload": dict(self.payload),
-            "stdout": self.stdout,
-            "stderr": self.stderr,
             "failure_taxonomy": list(self.failure_taxonomy),
             "workflow_events": list(self.workflow_events),
         }
+        usage: dict[str, object] = {}
+        merge_usage(usage, self.payload)
+        if usage:
+            payload["usage"] = usage
+        command_count = command_count_from_payload(self.payload)
+        if command_count is not None:
+            payload["command_count"] = command_count
+        return payload
 
 
 @dataclasses.dataclass(frozen=True)
@@ -278,14 +290,18 @@ def archive_previous_aggregate_artifacts(
     aggregate_text = json.dumps(previous_aggregate, sort_keys=True)
     snapshot_id = "previous-" + hash_text(aggregate_text)[:12]
     snapshot_root = suite_root / "history" / snapshot_id
+    roots_to_archive = []
+    for relative_root in sorted(active_artifact_roots(previous_aggregate)):
+        source = suite_root / relative_root
+        if source.exists():
+            validate_archive_source(source)
+            roots_to_archive.append((relative_root, source))
+    validate_structured_value(previous_aggregate, category="aggregate")
     snapshot_root.mkdir(parents=True, exist_ok=True)
     write_json(snapshot_root / "aggregate.json", previous_aggregate)
 
     copied_roots: set[str] = set()
-    for relative_root in sorted(active_artifact_roots(previous_aggregate)):
-        source = suite_root / relative_root
-        if not source.exists():
-            continue
+    for relative_root, source in roots_to_archive:
         destination = snapshot_root / relative_root
         destination.parent.mkdir(parents=True, exist_ok=True)
         copy_archive_path(source, destination)
@@ -299,15 +315,84 @@ def archive_previous_aggregate_artifacts(
 
 def copy_archive_path(source: Path, destination: Path) -> None:
     if source.is_symlink():
-        return
+        raise EvalSafeEnvelopeError("archive rejected: symlink source")
     if source.is_dir():
         destination.mkdir(parents=True, exist_ok=True)
         for child in source.iterdir():
+            if child.name == "repo":
+                continue
             copy_archive_path(child, destination / child.name)
         return
     if source.is_file():
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination, follow_symlinks=False)
+
+
+def validate_archive_source(source: Path) -> None:
+    paths = [source] if source.is_file() else sorted(source.rglob("*"))
+    for path in paths:
+        relative = path.relative_to(source) if path != source else Path(path.name)
+        if "repo" in relative.parts:
+            continue
+        if path.is_symlink():
+            raise EvalSafeEnvelopeError("archive rejected: symlink source")
+        if not path.is_file() or path.name == "run.log":
+            continue
+        if path.stat().st_size > EVAL_MAX_STRUCTURED_BYTES:
+            raise EvalSafeEnvelopeError("archive rejected: byte budget exceeded")
+        if path.suffix == ".jsonl":
+            project_transcript_jsonl(path.read_text(encoding="utf-8"))
+        elif path.suffix == ".json":
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, ValueError):
+                raise EvalSafeEnvelopeError(
+                    "archive rejected: malformed JSON"
+                ) from None
+            validate_structured_value(payload, category="archive")
+
+
+def validate_structured_value(
+    value: object, *, category: str, depth: int = 0, items: list[int] | None = None
+) -> None:
+    if depth > 8:
+        raise EvalSafeEnvelopeError(f"{category} rejected: nesting budget exceeded")
+    if items is None:
+        items = [0]
+    items[0] += 1
+    if items[0] > 8192:
+        raise EvalSafeEnvelopeError(f"{category} rejected: collection budget exceeded")
+    if isinstance(value, Mapping):
+        forbidden = {
+            "command",
+            "input",
+            "message",
+            "output",
+            "payload",
+            "prompt",
+            "response",
+            "stderr",
+            "stdout",
+            "text",
+        }
+        for key, item in value.items():
+            if not isinstance(key, str) or key in forbidden:
+                raise EvalSafeEnvelopeError(f"{category} rejected: disallowed field")
+            validate_structured_value(
+                item, category=category, depth=depth + 1, items=items
+            )
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        for item in value:
+            validate_structured_value(
+                item, category=category, depth=depth + 1, items=items
+            )
+    elif isinstance(value, str):
+        if len(value) > 512:
+            raise EvalSafeEnvelopeError(f"{category} rejected: string budget exceeded")
+    elif isinstance(value, float) and not math.isfinite(value):
+        raise EvalSafeEnvelopeError(f"{category} rejected: non-finite number")
+    elif value is not None and not isinstance(value, bool | int | float):
+        raise EvalSafeEnvelopeError(f"{category} rejected: invalid value type")
 
 
 def active_artifact_roots(value: object) -> set[str]:
@@ -549,10 +634,10 @@ def run_trial(
     write_report_evidence(trial_root, latest_report)
     write_workspace_evidence(trial_root, repo, lock_manager=lock_manager)
     write_generated_profile_artifact(trial_root, repo)
+    sanitize_delegation_evidence(trial_root)
     write_missing_case_role_artifacts(trial_root, case, deterministic, execution)
     command_results = list(agent_batch.command_results) + [
         {
-            "command": result.command,
             "exit_code": result.exit_code,
             "type": "transcript_grader",
             "id": result.id,
@@ -595,7 +680,8 @@ def run_trial(
         usage=usage,
     )
     write_json_artifact(trial_root, "structured_result", structured_result)
-    write_json_artifact(trial_root, "final_repo_state", git_after)
+    safe_git_after = safe_git_state(git_after)
+    write_json_artifact(trial_root, "final_repo_state", safe_git_after)
     write_json_artifact(trial_root, "grader_outputs", {"graders": initial_graders})
     record = build_run_record(
         case,
@@ -609,7 +695,7 @@ def run_trial(
         config=config,
         execution=execution,
         artifacts=collect_artifacts(trial_root, case),
-        final_repo_state=git_after,
+        final_repo_state=safe_git_after,
         structured_result=structured_result,
         graders=initial_graders,
         scoring=initial_scoring,
@@ -669,7 +755,7 @@ def run_trial(
         config=config,
         execution=execution,
         artifacts=collect_artifacts(trial_root, case),
-        final_repo_state=git_after,
+        final_repo_state=safe_git_after,
         structured_result=structured_result,
         graders=final_graders,
         scoring=final_scoring,
@@ -803,12 +889,10 @@ def execute_trial_agent_commands(
     stream_events: tuple[str, ...] = ()
     if is_stream_json(execution.stdout):
         raw_stream = execution.stdout
-        result_text, parsed_events = parse_stream_json(raw_stream)
+        _, parsed_events = parse_stream_json(raw_stream)
         stream_events = tuple(parsed_events)
         transcript_path = artifact_path(trial_root, "transcript")
-        transcript_path.parent.mkdir(parents=True, exist_ok=True)
-        transcript_path.write_text(raw_stream, encoding="utf-8")
-        execution = dataclasses.replace(execution, stdout=result_text)
+        write_safe_transcript(transcript_path, project_transcript_jsonl(raw_stream))
     return AgentCommandBatch(
         execution=execution,
         command_results=({"type": "agent", **execution.to_json()},),
@@ -837,6 +921,13 @@ def execute_negative_prompt_set(
     command_results: list[dict[str, object]] = []
     prompt_results: list[dict[str, object]] = []
     workflow_events: list[str] = []
+    spec = load_json(case.repo_path / "eval" / "expected-artifacts.json")
+    negative_specs = spec.get("negative_prompts") if isinstance(spec, Mapping) else ()
+    response_terms_by_id = {
+        item.get("id"): string_list(item.get("response_terms"))
+        for item in negative_specs
+        if isinstance(item, Mapping) and isinstance(item.get("id"), str)
+    }
     for prompt_path in case.prompt_paths:
         prompt_id = Path(prompt_path).stem
         prompt_root = trial_root / "prompt-runs" / prompt_id
@@ -898,9 +989,6 @@ def execute_negative_prompt_set(
             {
                 "type": "agent_prompt",
                 "prompt_id": prompt_id,
-                "prompt_path": prompt_path,
-                "repo": str(prompt_repo),
-                "artifact_root": str(prompt_artifact_root),
                 "observed_command_count": prompt_command_count,
                 "usage": prompt_usage,
                 **execution.to_json(),
@@ -909,10 +997,14 @@ def execute_negative_prompt_set(
         prompt_results.append(
             {
                 "id": prompt_id,
-                "path": prompt_path,
                 "skill_activated": "skill_activated" in prompt_events,
                 "repository_changed": repository_changed(prompt_before, prompt_after),
-                "response": execution.stdout + execution.stderr,
+                "response_terms_matched": any(
+                    term in execution.stdout + execution.stderr
+                    for term in response_terms_by_id.get(prompt_id, ())
+                )
+                if response_terms_by_id.get(prompt_id)
+                else True,
             }
         )
     write_json_artifact(
@@ -1225,14 +1317,28 @@ def write_transcript_if_missing(
 ) -> None:
     path = artifact_path(artifact_root, "transcript")
     if path.exists():
+        raw = path.read_text(encoding="utf-8")
+        try:
+            records = project_transcript_jsonl(raw)
+        except EvalSafeEnvelopeError:
+            write_safe_transcript(path, ())
+            raise
+        write_safe_transcript(path, records)
         return
-    records = []
-    for stream_name, text in (
-        ("stdout", execution.stdout),
-        ("stderr", execution.stderr),
-    ):
-        for line in text.splitlines():
-            records.append({"stream": stream_name, "text": line})
+    write_safe_transcript(
+        path,
+        (
+            process_result_transcript_record(
+                stdout_bytes=len(execution.stdout.encode("utf-8")),
+                stderr_bytes=len(execution.stderr.encode("utf-8")),
+                exit_code=execution.exit_code,
+                timeout=execution.timeout,
+            ),
+        ),
+    )
+
+
+def write_safe_transcript(path: Path, records: Sequence[Mapping[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
@@ -1300,21 +1406,52 @@ def artifact_grader_output(
 
 
 def deterministic_grader_record(payload: Mapping[str, object]) -> dict[str, object]:
-    return {
-        "id": "local-demo-deterministic",
-        "type": "deterministic",
-        "passed": payload.get("passed") is True,
-        "output": dict(payload),
-    }
+    return safe_grader_record(
+        payload,
+        grader_id="local-demo-deterministic",
+        grader_type="deterministic",
+    )
 
 
 def artifact_grader_record(payload: Mapping[str, object]) -> dict[str, object]:
-    return {
-        "id": "local-demo-artifacts",
-        "type": "deterministic_artifact",
+    return safe_grader_record(
+        payload,
+        grader_id="local-demo-artifacts",
+        grader_type="deterministic_artifact",
+    )
+
+
+def safe_grader_record(
+    payload: Mapping[str, object], *, grader_id: str, grader_type: str
+) -> dict[str, object]:
+    record: dict[str, object] = {
+        "id": safe_identifier(grader_id, category="grader id"),
+        "type": grader_type,
         "passed": payload.get("passed") is True,
-        "output": dict(payload),
     }
+    exit_code = payload.get("exit_code")
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        record["exit_code"] = exit_code
+    checks = payload.get("checks")
+    if isinstance(checks, Sequence) and not isinstance(checks, (str, bytes)):
+        if len(checks) > 256:
+            raise EvalSafeEnvelopeError(
+                "grader checks rejected: collection budget exceeded"
+            )
+        safe_checks = []
+        for index, check in enumerate(checks):
+            if not isinstance(check, Mapping):
+                raise EvalSafeEnvelopeError(
+                    f"grader checks rejected: invalid record at index {index}"
+                )
+            safe_checks.append(
+                {
+                    "id": safe_identifier(check.get("id"), category="grader check id"),
+                    "passed": check.get("passed") is True,
+                }
+            )
+        record["checks"] = safe_checks
+    return record
 
 
 def run_transcript_graders(
@@ -1357,14 +1494,14 @@ def run_transcript_graders(
         payload = parse_grader_payload(execution.stdout)
         grader_id = str(payload.get("id") or f"transcript-grader-{index}")
         passed = payload.get("passed") is True and execution.exit_code == 0
-        failure_taxonomy = tuple(
-            item
-            for item in string_list(payload.get("failure_taxonomy"))
-            if isinstance(item, str)
+        raw_taxonomy = string_list(payload.get("failure_taxonomy"))
+        if any(item not in EVAL_FAILURE_TAXONOMY for item in raw_taxonomy):
+            raise EvalSafeEnvelopeError("grader result rejected: unknown taxonomy")
+        failure_taxonomy = tuple(raw_taxonomy)
+        raw_events = string_list(payload.get("workflow_events")) or string_list(
+            payload.get("events")
         )
-        workflow_events = tuple(
-            item for item in string_list(payload.get("workflow_events"))
-        ) or tuple(item for item in string_list(payload.get("events")))
+        workflow_events = normalize_workflow_events(raw_events)
         results.append(
             TranscriptGraderResult(
                 id=grader_id,
@@ -1465,7 +1602,11 @@ def workflow_events_for_trial(
     if allow_artifact_events and existing.is_file():
         loaded = load_json(existing)
         raw_events = loaded.get("events") if isinstance(loaded, Mapping) else loaded
-        events.extend(normalize_events(raw_events))
+        try:
+            events.extend(normalize_events(raw_events))
+        except EvalSafeEnvelopeError:
+            write_json(existing, {"events": []})
+            raise
     for result in transcript_graders:
         events.extend(result.workflow_events)
     if is_stream_json(execution.stdout):
@@ -1494,7 +1635,7 @@ def workflow_events_for_trial(
         execution.stdout + execution.stderr
     ):
         events.append("unsafe_git_command")
-    return unique_preserving_order(events)
+    return list(normalize_workflow_events(unique_preserving_order(events)))
 
 
 def detect_events_from_repo_state(
@@ -1603,11 +1744,9 @@ def deterministic_unit_tests_passed(
 def events_from_text(text: str) -> list[str]:
     events = []
     for line in text.splitlines():
-        marker = "vibe-loop-eval-event:"
-        if marker in line:
-            event = line.split(marker, 1)[1].strip()
-            if event:
-                events.append(event)
+        match = re.search(r"vibe-loop-eval-event:\s*([a-z][a-z0-9_]*)", line)
+        if match:
+            events.append(match.group(1))
     return events
 
 
@@ -1743,15 +1882,7 @@ def parse_stream_json(text: str) -> tuple[str, list[str]]:
 
 
 def normalize_events(value: object) -> list[str]:
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
-        return []
-    events: list[str] = []
-    for item in value:
-        if isinstance(item, str):
-            events.append(item)
-        elif isinstance(item, Mapping) and isinstance(item.get("event"), str):
-            events.append(item["event"])
-    return events
+    return list(normalize_workflow_events(value))
 
 
 def unique_preserving_order(values: Sequence[str]) -> list[str]:
@@ -1774,7 +1905,13 @@ def write_missing_case_role_artifacts(
     write_json_artifact(
         artifact_root,
         "test_results",
-        {"deterministic": deterministic},
+        {
+            "deterministic": safe_grader_record(
+                deterministic,
+                grader_id="local-demo-deterministic",
+                grader_type="deterministic",
+            )
+        },
         overwrite=False,
     )
     write_json_artifact(artifact_root, "review_evidence", {}, overwrite=False)
@@ -1800,12 +1937,56 @@ def write_missing_case_role_artifacts(
             write_json_artifact(artifact_root, role, {}, overwrite=False)
 
 
+def sanitize_delegation_evidence(artifact_root: Path) -> None:
+    path = artifact_path(artifact_root, "delegation_evidence")
+    if not path.exists():
+        return
+    payload = load_json(path)
+    agents = payload.get("agents") if isinstance(payload, Mapping) else None
+    if (
+        not isinstance(agents, Sequence)
+        or isinstance(agents, (str, bytes))
+        or len(agents) > 32
+    ):
+        write_json(path, {"agents": []})
+        raise EvalSafeEnvelopeError("delegation evidence rejected: invalid collection")
+    safe_agents = []
+    allowed = {"role", "agent_id", "prompt", "result", "changed_paths"}
+    for index, agent in enumerate(agents):
+        if not isinstance(agent, Mapping) or set(agent) - allowed:
+            write_json(path, {"agents": []})
+            raise EvalSafeEnvelopeError(
+                f"delegation evidence rejected: invalid record at index {index}"
+            )
+        changed_paths = agent.get("changed_paths", ())
+        if not isinstance(changed_paths, Sequence) or isinstance(
+            changed_paths, (str, bytes)
+        ):
+            write_json(path, {"agents": []})
+            raise EvalSafeEnvelopeError(
+                f"delegation evidence rejected: wrong field type at index {index}"
+            )
+        safe_agents.append(
+            {
+                "role": safe_identifier(agent.get("role"), category="delegation role"),
+                "agent_id": safe_identifier(
+                    agent.get("agent_id"), category="delegation agent id"
+                ),
+                "prompt_present": isinstance(agent.get("prompt"), str)
+                and bool(agent["prompt"]),
+                "result_present": isinstance(agent.get("result"), str)
+                and bool(agent["result"]),
+                "changed_path_count": len(changed_paths),
+            }
+        )
+    write_json(path, {"agents": safe_agents})
+
+
 def default_negative_prompt_results(
     artifact_root: Path,
     execution: CommandExecution,
     case: EvalExampleCase,
 ) -> dict[str, object]:
-    response = execution.stdout + execution.stderr
     state = load_json(artifact_path(artifact_root, "git_state_after"))
     repo_changed = bool(isinstance(state, Mapping) and state.get("dirty") is True)
     spec = load_json(case.repo_path / "eval" / "expected-artifacts.json")
@@ -1820,10 +2001,14 @@ def default_negative_prompt_results(
         "results": [
             {
                 "id": str(prompt.get("id", "")),
-                "path": str(prompt.get("path", "")),
                 "skill_activated": "skill_activated" in events,
                 "repository_changed": repo_changed,
-                "response": response,
+                "response_terms_matched": any(
+                    term in execution.stdout + execution.stderr
+                    for term in string_list(prompt.get("response_terms"))
+                )
+                if string_list(prompt.get("response_terms"))
+                else True,
             }
             for prompt in prompts
             if isinstance(prompt, Mapping)
@@ -1972,7 +2157,7 @@ def command_count_from_transcript(path: Path) -> int | None:
             continue
         if not isinstance(payload, Mapping):
             continue
-        event_type = payload.get("type") or payload.get("event")
+        event_type = payload.get("kind") or payload.get("type") or payload.get("event")
         if event_type in {"command", "tool_call", "shell_command"}:
             count += 1
     return count if count else None
@@ -2237,7 +2422,7 @@ def build_run_record(
         harness={
             "name": HARNESS_NAME,
             "version": HARNESS_VERSION,
-            "command": command,
+            "command_sha256": hash_text(command),
         },
         budget={
             "timeout_seconds": budgets["timeout_seconds"],
@@ -2376,8 +2561,6 @@ def skill_condition(condition: str, command: str) -> dict[str, object]:
         "skill_id": skill_id_for_condition(condition),
         "skill_sha256": skill_sha,
     }
-    if skill_path is not None:
-        payload["skill_path"] = str(skill_path)
     return payload
 
 
@@ -2414,6 +2597,49 @@ def collect_git_state(repo: Path) -> dict[str, object]:
     }
 
 
+def safe_git_state(value: Mapping[str, object]) -> dict[str, object]:
+    head = value.get("head")
+    branch = value.get("branch")
+    if not isinstance(head, str) or not isinstance(branch, str):
+        raise EvalSafeEnvelopeError("repository state rejected: invalid identity")
+    branches = value.get("branches")
+    branch_count = len(branches) if isinstance(branches, Sequence) else 0
+    worktrees = value.get("worktrees")
+    worktree_count = 0
+    if isinstance(worktrees, Sequence) and not isinstance(worktrees, (str, bytes)):
+        worktree_count = sum(
+            1
+            for item in worktrees
+            if isinstance(item, str) and item.startswith("worktree ")
+        )
+    status = value.get("status_short")
+    changed_path_count = (
+        len(status)
+        if isinstance(status, Sequence) and not isinstance(status, (str, bytes))
+        else 0
+    )
+    safe_branch_heads: dict[str, str] = {}
+    branch_heads = value.get("branch_heads")
+    if isinstance(branch_heads, Mapping):
+        if len(branch_heads) > 256:
+            raise EvalSafeEnvelopeError(
+                "repository state rejected: branch collection budget exceeded"
+            )
+        for name, commit in branch_heads.items():
+            safe_name = safe_identifier(name, category="repository branch")
+            safe_commit = safe_identifier(commit, category="repository head")
+            safe_branch_heads[safe_name] = safe_commit
+    return {
+        "head": safe_identifier(head, category="repository head"),
+        "branch": safe_identifier(branch, category="repository branch"),
+        "dirty": value.get("dirty") is True,
+        "branch_count": branch_count,
+        "worktree_count": worktree_count,
+        "changed_path_count": changed_path_count,
+        "branch_heads": safe_branch_heads,
+    }
+
+
 def local_branch_heads(repo: Path) -> dict[str, str]:
     output = git_output(
         repo,
@@ -2434,6 +2660,19 @@ def write_task_source_evidence(artifact_root: Path, config: VibeConfig) -> None:
     source = build_task_source(config.repo, resolution.task_source)
     tasks = source.list_tasks()
     runnable = runnable_tasks(source, resolution.task_source.runnable_statuses)
+
+    def safe_task(task) -> dict[str, object]:
+        payload = task.to_json()
+        return {
+            "id": payload.get("id"),
+            "status": payload.get("status"),
+            "requirement_ids": payload.get("requirement_ids", []),
+            "title_present": isinstance(payload.get("title"), str)
+            and bool(payload["title"]),
+            "acceptance_present": isinstance(payload.get("acceptance"), str)
+            and bool(payload["acceptance"]),
+        }
+
     write_json_artifact(
         artifact_root,
         "task_source_evidence",
@@ -2442,8 +2681,8 @@ def write_task_source_evidence(artifact_root: Path, config: VibeConfig) -> None:
             "backend_type": resolution.task_source.type,
             "task_ids": [task.task_id for task in tasks],
             "runnable_task_ids": [task.task_id for task in runnable],
-            "selected_task": runnable[0].to_json() if runnable else None,
-            "tasks": [task.to_json() for task in tasks],
+            "selected_task": safe_task(runnable[0]) if runnable else None,
+            "tasks": [safe_task(task) for task in tasks],
         },
     )
 
@@ -2619,10 +2858,40 @@ def write_report_evidence(
     artifact_root: Path,
     latest: Mapping[str, object] | None,
 ) -> None:
-    existing = load_json(artifact_path(artifact_root, "report_evidence"))
-    evidence = dict(existing) if isinstance(existing, Mapping) else {}
-    evidence["latest"] = dict(latest) if latest is not None else None
-    write_json_artifact(artifact_root, "report_evidence", evidence)
+    safe_latest = None
+    if latest is not None:
+        safe_latest = {
+            key: latest[key]
+            for key in (
+                "schema_version",
+                "record_type",
+                "run_id",
+                "task_id",
+                "status",
+                "commit",
+                "reported_at",
+            )
+            if key in latest
+        }
+        safe_latest["reason"] = worker_report_reason(latest.get("message"))
+    write_json_artifact(artifact_root, "report_evidence", {"latest": safe_latest})
+
+
+def worker_report_reason(value: object) -> str:
+    if not isinstance(value, str):
+        return "unspecified"
+    categories = (
+        "missing_claimed_worktree",
+        "branch_already_merged",
+        "foreign_dirty_claimed_worktree",
+        "duplicate_branch_worktrees",
+    )
+    for category in categories:
+        if category in value:
+            return category
+    if "main-integration" in value:
+        return "main_integration_lock_unavailable"
+    return "unspecified"
 
 
 def latest_worker_report(repo: Path, task_id: str | None) -> dict[str, object] | None:
@@ -2899,7 +3168,7 @@ def build_aggregate(
         "schema_version": 1,
         "suite_id": EXAMPLE_SUITE_ID,
         "generated_at": utc_now(),
-        "artifact_root": str(output_root),
+        "artifact_root": ".",
         "total_trials": len(records),
         "conditions": conditions,
         "cases": case_summaries(by_case_condition),

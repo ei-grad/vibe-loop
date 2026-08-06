@@ -138,7 +138,8 @@ output conventions, including editable source provenance.
 
 Evaluation invocations are documented in the
 [CLI reference](docs/cli-reference.md#evaluation-commands); evaluation methodology
-and release policy live in the [skill evaluation strategy](docs/skill-evaluation-strategy.md).
+lives in the [skill evaluation strategy](docs/skill-evaluation-strategy.md), and
+release policy lives in the [evals and release PRD](docs/prd/evals-release.md).
 
 ## Autopilot
 

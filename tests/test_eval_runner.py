@@ -29,6 +29,129 @@ from vibe_loop.runner import VibeRunner
 
 
 class EvalRunnerCliTests(unittest.TestCase):
+    def test_secret_like_output_is_retained_only_in_run_logs(self) -> None:
+        canary = "EVAL_OUTPUT_SECRET_CANARY"
+        grader_canary = "EVAL_GRADER_SECRET_CANARY"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "canary_agent.py"
+            grader = root / "canary_grader.py"
+            write_python_executable(
+                agent,
+                "import json\n"
+                "import sys\n"
+                f"canary = {canary!r}\n"
+                "print(json.dumps({'type': 'result', 'result': "
+                "'## main python workflow-contract task outcome def add multiple space the ' + canary}))\n"
+                "print(canary, file=sys.stderr)\n",
+            )
+            write_python_executable(
+                grader,
+                "import json\n"
+                "import sys\n"
+                f"canary = {grader_canary!r}\n"
+                "print(json.dumps({'id': 'safe-grader', 'passed': True, "
+                "'payload': {'secret': canary}, 'metrics': {'tokens': 7}}))\n"
+                "print(canary, file=sys.stderr)\n",
+            )
+
+            payload = run_eval(
+                root,
+                "--case",
+                "negative-trigger-set",
+                "--condition",
+                "no_skill",
+                "--agent-command",
+                f"no_skill={agent}",
+                "--transcript-grader",
+                str(grader),
+            )
+            suite_root = root / "eval-runs/local-demo-v1"
+            trial_root = suite_root / "cases/negative-trigger-set/no_skill/trial-1"
+            logs = list(trial_root.rglob("run.log"))
+            structured = [
+                path
+                for path in suite_root.rglob("*")
+                if path.is_file() and path.suffix in {".json", ".jsonl", ".md"}
+            ]
+
+            self.assertTrue(logs)
+            self.assertTrue(
+                any(canary in path.read_text(encoding="utf-8") for path in logs)
+            )
+            for path in structured:
+                with self.subTest(path=path.relative_to(suite_root)):
+                    text = path.read_text(encoding="utf-8")
+                    self.assertNotIn(canary, text)
+                    self.assertNotIn(grader_canary, text)
+            self.assertNotIn(canary, json.dumps(payload))
+            self.assertNotIn(grader_canary, json.dumps(payload))
+
+    def test_rejected_agent_structured_input_is_sanitized_and_not_diagnosed(
+        self,
+    ) -> None:
+        canary = "REJECTED_STRUCTURED_SECRET_CANARY"
+        bodies = {
+            "transcript": (
+                "(artifact / 'transcript.jsonl').write_text("
+                "'{not-json " + canary + "\\n', encoding='utf-8')\n"
+            ),
+            "workflow": (
+                "(artifact / 'workflow-events.json').write_text("
+                "json.dumps({'events': ['" + canary.lower() + "']}) + '\\n', "
+                "encoding='utf-8')\n"
+            ),
+        }
+        for category, body in bodies.items():
+            with (
+                self.subTest(category=category),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                agent = root / "rejected_agent.py"
+                write_python_executable(
+                    agent,
+                    "import json\n"
+                    "import os\n"
+                    "from pathlib import Path\n"
+                    "artifact = Path(os.environ['VIBE_LOOP_EVAL_ARTIFACT_DIR'])\n"
+                    + body
+                    + "print('## main python workflow-contract task outcome def add multiple space the')\n",
+                )
+                stdout = StringIO()
+                stderr = StringIO()
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        [
+                            "eval",
+                            "local-demo",
+                            "--output",
+                            str(root / "eval-runs"),
+                            "--json",
+                            "--case",
+                            "negative-trigger-set",
+                            "--condition",
+                            "no_skill",
+                            "--agent-command",
+                            f"no_skill={agent}",
+                        ]
+                    )
+                structured_files = [
+                    path
+                    for path in (root / "eval-runs").rglob("*")
+                    if path.is_file() and path.suffix in {".json", ".jsonl", ".md"}
+                ]
+
+                self.assertNotEqual(exit_code, 0)
+                self.assertNotIn(canary, stdout.getvalue())
+                self.assertNotIn(canary, stderr.getvalue())
+                self.assertNotIn(canary.lower(), stdout.getvalue())
+                self.assertNotIn(canary.lower(), stderr.getvalue())
+                for path in structured_files:
+                    text = path.read_text(encoding="utf-8")
+                    self.assertNotIn(canary, text)
+                    self.assertNotIn(canary.lower(), text)
+
     def test_task_source_evidence_uses_default_and_generated_runtime_resolution(
         self,
     ) -> None:
@@ -620,7 +743,8 @@ class EvalRunnerCliTests(unittest.TestCase):
         self.assertIn("workflow_contract", record["failure_taxonomy"])
         self.assertNotIn("task_outcome", record["failure_taxonomy"])
         self.assertEqual(payload["conditions"]["vibe_loop"]["pass_rate"], 0.0)
-        self.assertIn("report_evidence.latest.run_id", json.dumps(graders))
+        self.assertIn("artifact-case-contract", json.dumps(graders))
+        self.assertNotIn("report_evidence.latest.run_id", json.dumps(graders))
 
     def test_seeded_worker_report_run_id_can_pass_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1023,7 +1147,8 @@ class EvalRunnerCliTests(unittest.TestCase):
             record = json.loads((trial_root / "run.json").read_text(encoding="utf-8"))
 
         self.assertEqual(payload["conditions"]["vibe_loop"]["pass_rate"], 0.0)
-        self.assertEqual(report_evidence["latest"]["message"], "blocked")
+        self.assertEqual(report_evidence["latest"]["reason"], "unspecified")
+        self.assertNotIn("message", report_evidence["latest"])
         self.assertIn("workflow_contract", record["failure_taxonomy"])
 
     def test_lock_evidence_ignores_agent_spoofed_status(self) -> None:
@@ -1246,22 +1371,6 @@ class EvalRunnerCliTests(unittest.TestCase):
                 "--agent-command",
                 f"no_skill={agent}",
             )
-            external_secret = root / "outside-secret.txt"
-            external_secret.write_text("do not archive this target\n", encoding="utf-8")
-            prior_trial_root = (
-                root
-                / "eval-runs"
-                / "local-demo-v1"
-                / "cases"
-                / "negative-trigger-set"
-                / "no_skill"
-                / "trial-1"
-            )
-            symlink_path = prior_trial_root / "repo" / "archive-leak.txt"
-            try:
-                os.symlink(external_secret, symlink_path)
-            except OSError as exc:
-                self.skipTest(f"symlink creation unavailable: {exc}")
             payload = run_eval(
                 root,
                 "--case",
@@ -1283,25 +1392,66 @@ class EvalRunnerCliTests(unittest.TestCase):
                 / "logs"
                 / "run.log"
             )
-            archived_symlink = (
-                root
-                / "eval-runs"
-                / "local-demo-v1"
-                / previous_root
-                / "repo"
-                / "archive-leak.txt"
-            )
             archived_log_exists = archived_log.is_file()
-            archived_symlink_exists = archived_symlink.exists()
 
         self.assertTrue(
             previous_root.startswith("history/previous-"),
             f"expected history/previous-... but got: {previous_root!r}",
         )
         self.assertTrue(archived_log_exists)
-        self.assertFalse(archived_symlink_exists)
         self.assertEqual(current_root, "cases/negative-trigger-set/no_skill/trial-1")
         self.assertIn("pass_rate_regression", regressions[0]["regression_flags"])
+
+    def test_overwrite_rejects_unsafe_structured_history_without_partial_archive(
+        self,
+    ) -> None:
+        canary = "UNSAFE_HISTORY_SECRET_CANARY"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "negative_agent.py"
+            write_negative_agent(agent)
+            run_eval(
+                root,
+                "--case",
+                "negative-trigger-set",
+                "--condition",
+                "no_skill",
+                "--agent-command",
+                f"no_skill={agent}",
+            )
+            suite_root = root / "eval-runs/local-demo-v1"
+            command_results = (
+                suite_root
+                / "cases/negative-trigger-set/no_skill/trial-1/command-results.json"
+            )
+            command_results.write_text(
+                json.dumps({"commands": [], "payload": canary}) + "\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "eval",
+                        "local-demo",
+                        "--output",
+                        str(root / "eval-runs"),
+                        "--json",
+                        "--case",
+                        "negative-trigger-set",
+                        "--condition",
+                        "no_skill",
+                        "--overwrite",
+                        "--agent-command",
+                        f"no_skill={agent}",
+                    ]
+                )
+
+            self.assertNotEqual(exit_code, 0)
+            self.assertFalse((suite_root / "history").exists())
+            self.assertNotIn(canary, stdout.getvalue())
+            self.assertNotIn(canary, stderr.getvalue())
 
     def test_legacy_prior_aggregate_metrics_and_records_are_normalized(self) -> None:
         records = load_skill_quality_records()

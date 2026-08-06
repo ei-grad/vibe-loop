@@ -731,7 +731,7 @@ class EvalExampleTests(unittest.TestCase):
 
         self.assertFalse(result.passed)
         self.assertIn(
-            "required artifact role marked optional: test_results",
+            "marks required role optional",
             result.stdout,
         )
 
@@ -986,8 +986,8 @@ def artifact_content(
                     "runnable_task_ids": [case.task_id],
                     "selected_task": {
                         "id": case.task_id,
-                        "title": case.title,
-                        "acceptance": "fixture acceptance",
+                        "title_present": True,
+                        "acceptance_present": True,
                     },
                 },
                 sort_keys=True,

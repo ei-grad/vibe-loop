@@ -201,39 +201,12 @@ the exclusion count.
 
 ## Artifact Model
 
-Every trial should leave a reproducible artifact bundle. EVAL-01 should turn
-this into a versioned schema, but the research recommendation is:
-
-```text
-eval-runs/
-  <suite-id>/
-    manifest.json
-    aggregate.json
-    aggregate.md
-    cases/
-      <case-id>/
-        <condition>/
-          trial-<n>/
-            run.json
-            prompt.txt
-            skill-fingerprint.json
-            repo-fingerprint.json
-            logs/
-            transcript.jsonl
-            diff.patch
-            final-tree.json
-            command-results.json
-            deterministic-grades.json
-            trajectory-grades.json
-            human-review.json
-```
-
-Required fields include task id, condition, trial number, agent harness command,
-model id, skill id and hash, repository seed hash, budget, start and finish
-timestamps, timeout status, exit status, final commit or tree hash, raw grader
-outputs, summarized evidence, and failure taxonomy. Logs should be stored as
-files, not copied into aggregate JSON. Any path likely to contain credentials
-must be rejected or redacted by the harness.
+Every trial leaves a reproducible artifact bundle. The
+[skill eval schema](skill-eval-schema.md) is the sole authority for its layout,
+closed structured-retention envelope, bounds, archival validation, and the
+deliberate content-bearing `logs/run.log` exception. The Level 2 retention and
+grading requirements are owned by
+[PRD-EVL-002 and PRD-EVL-003](prd/evals-release.md#prd-evl-002-artifact-schema).
 
 ## Known Benchmark Pitfalls
 
@@ -310,8 +283,9 @@ broader benchmark selection rationale remains in the
 
 ## Remaining Questions
 
-- Which transcript fields can be stored safely without retaining secret-like
-  command output?
+- Structured transcript retention is resolved by the
+  [closed safe envelope](skill-eval-schema.md#structured-retention-envelope) and
+  the Level 2 [artifact and grading requirements](prd/evals-release.md#prd-evl-002-artifact-schema).
 - How should `vibe-loop` normalize costs and token counts across Codex, Claude,
   and other future harnesses when their telemetry differs?
 - Which deferred comparators, if any, become worth adapting after the first

@@ -61,8 +61,8 @@ eval-runs/
             grader-outputs.json
 ```
 
-`run.json` is the durable index. Large logs and transcripts stay in separate
-files and are referenced by relative path plus SHA-256. `diff.patch` may be an
+`run.json` is the durable index. Artifact files are referenced by relative path
+plus SHA-256. `diff.patch` may be an
 empty file for no-change trigger cases, but it is still recorded so aggregate
 tools can distinguish "no diff" from "missing diff".
 
@@ -72,16 +72,70 @@ Required artifact roles for a completed trial record:
 | --- | --- |
 | `prompt` | Exact user prompt sent to the harness. |
 | `run_log` | Harness stdout/stderr log or equivalent supervisor log. |
-| `transcript` | Tool and assistant trajectory used by workflow-contract graders. |
+| `transcript` | Versioned safe event envelope used by workflow-contract graders. |
 | `diff` | Final repository diff from the fixture base. |
 | `final_repo_state` | HEAD, branch, worktree dirtiness, local branches/worktrees, and lock state. |
 | `structured_result` | Machine-readable run outcome emitted by the harness or worker. |
 | `grader_outputs` | Deterministic, trajectory, model, and human grader outputs. |
 
-Additional artifacts are allowed when referenced by role and relative path.
+Additional artifacts are allowed only when their role and closed structured
+schema are defined here and they are referenced by relative path.
 Artifact paths are validated as safe relative paths. Absolute paths,
 parent-directory traversal, credential directories, `.env` files, private keys,
 token-like names, and other secret-like paths are rejected before file reads.
+
+## Structured Retention Envelope
+
+Every JSON or JSONL artifact is a closed, size-bounded safe envelope. Unknown
+fields and event shapes, malformed input, wrong types, non-finite numbers,
+excessive nesting, excessive collection cardinality, and over-budget strings or
+records fail closed. Rejection diagnostics contain only a fixed category and,
+where useful, a field name or collection index. They never contain rejected
+values, parser exception text, command output, prompts, or model responses.
+
+`transcript.jsonl` uses `schema_version = 1` and
+`record_type = "skill_eval_transcript_event"`. Each record has exactly one
+`kind` from `assistant`, `command`, `process_result`, `result`, `system`,
+`tool_call`, `tool_result`, or `usage`. A record may additionally contain only
+bounded numeric `command_count`, `cost_usd`, `duration_ms`, `duration_seconds`,
+`exit_code`, `input_tokens`, `output_tokens`, `tokens`, `stdout_bytes`, or
+`stderr_bytes`, and boolean `error` or `timeout`. A transcript is limited to 1
+MiB of input and 4,096 projected records. Tool names, command strings and
+arguments, tool input and output, stdout/stderr text, prompts, assistant prose,
+paths, exception or database messages, and arbitrary nested payloads are not
+admitted.
+
+`workflow-events.json` contains only `events`, a de-duplicated list of at most
+128 schema-known workflow labels. Labels are derived from raw in-process events
+before persistence. Unknown labels fail closed; they are not copied into a
+diagnostic. Command counting likewise uses raw in-process events or safe
+`command`/`tool_call` records and uses the maximum available observation, so
+sanitization cannot lower a count.
+
+The remaining structured artifacts retain only schema-known booleans, bounded
+numbers, statuses and failure-taxonomy labels, stable identifiers or SHA-256
+digests, safe artifact-relative paths, and bounded collections of those values.
+In particular, command results have result kinds and numeric outcomes but no
+command or path; negative-prompt summaries have prompt ids and boolean grading
+outcomes but no prompt, path, or response; grader records have grader/check ids,
+types, booleans, numeric usage/counts, admitted taxonomy, and workflow labels
+but no command, stdout/stderr, message, payload, or nested output.
+`run-result.json`, `run.json`, aggregates, and aggregate Markdown derive only
+from those admitted values. The harness command is represented by
+`harness.command_sha256`, not command text.
+
+Before overwrite archival, every preexisting structured source below an active
+artifact root is parsed and checked against the same bounds. Malformed, unsafe,
+unknown, over-budget, or symlinked sources reject the archive before any history
+destination is created. Safe structured sources are copied without widening
+their schema. This applies equally to root trials, nested `prompt-runs/**`, and
+structured copies under `history/**`.
+
+`logs/run.log` is the deliberate exception. It is an intentionally
+content-bearing audit artifact and may retain the harness command and captured
+stdout/stderr under the existing safe artifact-path and SHA-256 contract,
+including when archived. Consumers must not copy its text into any structured
+artifact or CLI diagnostic.
 
 ## Run Record
 
@@ -129,7 +183,7 @@ The first schema version validates a minimum nested contract:
   `skill_id = "orchestrated-vibe-loop"`.
 - `agent`: `name` and `command_source`.
 - `model`: `provider` and `id`.
-- `harness`: `name`, `version`, and `command`.
+- `harness`: `name`, `version`, and `command_sha256`.
 - `budget`: positive integer `timeout_seconds`, `max_commands`, and
   `max_output_bytes`.
 - `final_repo_state`: `head`, `branch`, and boolean `dirty`.

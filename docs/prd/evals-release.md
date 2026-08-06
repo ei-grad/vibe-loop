@@ -27,7 +27,11 @@ Every completed trial must leave a reproducible artifact bundle with a durable
 Acceptance must cover prompt, run log, transcript, diff, final repo state,
 structured result, grader outputs, source fingerprints, SHA-256 validation,
 secret-like path rejection before reads, stale fingerprint detection, and
-fresh-workspace evidence.
+fresh-workspace evidence. Structured transcript, result, grader, summary,
+aggregate, and history artifacts must retain only the closed, versioned,
+size-bounded envelope owned by the
+[skill eval schema](../skill-eval-schema.md#structured-retention-envelope).
+`logs/run.log` remains the deliberate content-bearing audit exception.
 
 Related implementation IDs: `EVAL-01`, `EVAL-03`.
 
@@ -40,7 +44,10 @@ Acceptance must cover task score, workflow score, trigger score, failure
 taxonomy, review/integration discipline failures, unsafe git behavior,
 unnecessary prompts, state contamination, timeout and infrastructure separation,
 and transcript/trace-envelope grading only where final state cannot prove the
-behavior.
+behavior. Grading must derive labels, counts, and classifications from
+in-process raw evidence before persistence or from the admitted safe envelope;
+missing or rejected evidence cannot silently turn an ungradable workflow into
+a pass or reduce an observed command count.
 
 Related implementation IDs: `EVAL-02`, `EVAL-03`, `EVAL-05`, `EVAL-08`,
 `EVAL-09`.

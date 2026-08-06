@@ -435,8 +435,8 @@ def artifact_task_source_evidence(
             "artifact-task-source-evidence",
             f"selected task is {selected.get('id')!r}, expected {task_id!r}",
         )
-    for field in ("title", "acceptance"):
-        if not isinstance(selected.get(field), str) or not selected[field]:
+    for field in ("title_present", "acceptance_present"):
+        if selected.get(field) is not True:
             return failed(
                 "artifact-task-source-evidence",
                 f"selected_task.{field} is required",
@@ -663,13 +663,16 @@ def artifact_orchestrated_delegation(
             diagnostics.append(f"delegation role missing: {role}")
             continue
         agent = matches[0]
-        for field in ("agent_id", "prompt", "result"):
-            if not isinstance(agent.get(field), str) or not agent[field]:
+        if not isinstance(agent.get("agent_id"), str) or not agent["agent_id"]:
+            diagnostics.append(f"{role}.agent_id is required")
+        for field in ("prompt_present", "result_present"):
+            if agent.get(field) is not True:
                 diagnostics.append(f"{role}.{field} is required")
-        if role in {"implementer", "remediator"} and not string_list(
-            agent.get("changed_paths")
+        if role in {"implementer", "remediator"} and not (
+            isinstance(agent.get("changed_path_count"), int)
+            and agent["changed_path_count"] > 0
         ):
-            diagnostics.append(f"{role}.changed_paths is required")
+            diagnostics.append(f"{role}.changed_path_count is required")
     if diagnostics:
         return failed("artifact-orchestrated-delegation", "; ".join(diagnostics))
     return passed("artifact-orchestrated-delegation")
@@ -868,9 +871,8 @@ def artifact_negative_prompt_results(
             return failed(
                 "artifact-negative-prompts", f"{prompt_id} repository_changed mismatch"
             )
-        response = result.get("response", "")
         terms = string_list(prompt.get("response_terms"))
-        if terms and not any(term in str(response) for term in terms):
+        if terms and result.get("response_terms_matched") is not True:
             return failed(
                 "artifact-negative-prompts", f"{prompt_id} response terms missing"
             )

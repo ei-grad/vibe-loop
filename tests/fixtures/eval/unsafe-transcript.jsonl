@@ -1,0 +1,2 @@
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"printf TRANSCRIPT_SECRET_CANARY"}}]}}
+{"type":"result","result":"TRANSCRIPT_SECRET_CANARY","duration_ms":12,"is_error":false,"total_cost_usd":0.25,"usage":{"input_tokens":3,"output_tokens":5}}
