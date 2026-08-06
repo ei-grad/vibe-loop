@@ -7227,10 +7227,12 @@ def validate_native_planning_decision(
 def build_native_planning_worker_prompt(
     config: VibeConfig,
     decision: NativePlanningDecision,
+    *,
+    runnable_statuses: Sequence[str],
 ) -> str:
     skill_prefix = config.agent.require_skill_ref_prefix()
     scope_evidence_path = config.state_path / "runs.jsonl"
-    runnable_statuses = json.dumps(list(config.task_source.runnable_statuses))
+    encoded_runnable_statuses = json.dumps(list(runnable_statuses))
     planning_warning_example = json.dumps(
         {
             "effect": DELIVERABLE_COLLISION_EFFECT,
@@ -7265,7 +7267,8 @@ def build_native_planning_worker_prompt(
         "after the candidate is integrated. Record that requirement as an "
         "operator-owned release step outside vibe-loop run instead; if the step is "
         "represented in the authoritative task source, its status must not be one "
-        f"of the configured runnable statuses {runnable_statuses}. Do not weaken "
+        f"of the runtime-resolved runnable statuses {encoded_runnable_statuses}. "
+        "Do not weaken "
         "the gate, add a worker-branch bypass, or prescribe an override when "
         "deployment policy still classifies its result as blocked. Re-read every "
         "created or repaired worker task and verify that no mainline-only gate "
@@ -7407,7 +7410,8 @@ def run_native_planning(
     analysis_only: bool = False,
 ) -> NativePlanningCycleResult:
     planning_started = time_module.monotonic()
-    analysis_vibe_runner = VibeRunner(config) if analysis_runner is None else None
+    planning_vibe_runner = VibeRunner(config)
+    analysis_vibe_runner = planning_vibe_runner if analysis_runner is None else None
     runner = (
         analysis_runner
         if analysis_runner is not None
@@ -7571,7 +7575,13 @@ def run_native_planning(
             )
         command = format_agent_command(
             command_template,
-            prompt=build_native_planning_worker_prompt(config, decision),
+            prompt=build_native_planning_worker_prompt(
+                config,
+                decision,
+                runnable_statuses=(
+                    planning_vibe_runner.source_resolution.task_source.runnable_statuses
+                ),
+            ),
             model=config.agent.model,
             effort=config.agent.effort,
         )

@@ -1034,12 +1034,10 @@ of the configured main branch, or can only produce valid evidence after
 integration, is an operator-owned release step outside `vibe-loop run`; it must
 not appear in the body or acceptance criteria of a worker-dispatched task. If the
 authoritative task source represents that operator step, its status must be
-outside the configured runnable statuses. The planning worker must not weaken
-the gate, add a worker-branch bypass, or prescribe an override whose result is
-still blocked by deployment policy, and must re-read authored worker tasks to
-verify that no mainline-only gate remains. An implementation worker that
-nevertheless receives an unsatisfiable gate still blocks rather than
-improvising.
+outside the runtime-resolved runnable statuses. The planning worker must not
+weaken the gate, add a worker-branch bypass, or prescribe an override whose
+result is still blocked by deployment policy, and must re-read authored worker
+tasks to verify that no mainline-only gate remains.
 Before creating new tasks or entering an isolated planning worktree, it must
 inspect the configured runtime state `runs.jsonl` for
 `candidate_scope_assessed` records whose `finding` is
