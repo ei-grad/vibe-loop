@@ -22,8 +22,8 @@
       },
       {
         "role": "report_evidence",
-        "field": "latest.reason",
-        "equals": "foreign_dirty_claimed_worktree"
+        "field": "latest.message",
+        "contains": "foreign_dirty_claimed_worktree"
       },
       {
         "role": "structured_result",

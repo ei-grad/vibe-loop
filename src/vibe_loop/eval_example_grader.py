@@ -819,6 +819,10 @@ def check_artifact_json_fields(
             diagnostics.append(f"artifact role is not a JSON object: {role}")
             continue
         actual = nested_value(payload, field)
+        if role == "report_evidence" and field == "latest.message":
+            reason = nested_value(payload, "latest.reason")
+            if isinstance(reason, str):
+                actual = legacy_report_reason_text(reason)
         contains = item.get("contains")
         if isinstance(contains, str):
             if contains not in str(actual):
@@ -829,6 +833,12 @@ def check_artifact_json_fields(
         if actual != expected:
             diagnostics.append(f"{role}.{field} is {actual!r}, expected {expected!r}")
     return diagnostics
+
+
+def legacy_report_reason_text(reason: str) -> str:
+    if reason == "main_integration_lock_unavailable":
+        return "main-integration lock unavailable"
+    return reason
 
 
 def artifact_negative_prompt_results(

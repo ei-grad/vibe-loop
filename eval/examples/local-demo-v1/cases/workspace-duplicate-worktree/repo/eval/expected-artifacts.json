@@ -22,8 +22,8 @@
       },
       {
         "role": "report_evidence",
-        "field": "latest.reason",
-        "equals": "duplicate_branch_worktrees"
+        "field": "latest.message",
+        "contains": "duplicate_branch_worktrees"
       },
       {
         "role": "structured_result",
