@@ -7230,6 +7230,7 @@ def build_native_planning_worker_prompt(
 ) -> str:
     skill_prefix = config.agent.require_skill_ref_prefix()
     scope_evidence_path = config.state_path / "runs.jsonl"
+    runnable_statuses = json.dumps(list(config.task_source.runnable_statuses))
     planning_warning_example = json.dumps(
         {
             "effect": DELIVERABLE_COLLISION_EFFECT,
@@ -7257,6 +7258,18 @@ def build_native_planning_worker_prompt(
         "leave the entire conflict-domain set undeclared, including resource "
         "domains; unknown domains serialize scheduling conservatively, while "
         "candidate path-scope enforcement remains explicitly unavailable. Before "
+        "publishing, classify every requested validation or certification command "
+        "by the checkout state in which it can produce valid evidence. Never put a "
+        "mainline-only gate in a worker-dispatched task: this includes a gate that "
+        "requires a clean checkout of the configured main branch or can only run "
+        "after the candidate is integrated. Record that requirement as an "
+        "operator-owned release step outside vibe-loop run instead; if the step is "
+        "represented in the authoritative task source, its status must not be one "
+        f"of the configured runnable statuses {runnable_statuses}. Do not weaken "
+        "the gate, add a worker-branch bypass, or prescribe an override when "
+        "deployment policy still classifies its result as blocked. Re-read every "
+        "created or repaired worker task and verify that no mainline-only gate "
+        "remains in its body or acceptance criteria. Before "
         "creating new tasks or entering an isolated planning worktree, inspect "
         f"prior scope evidence in {scope_evidence_path}. Read JSONL records whose "
         "record_type is candidate_scope_assessed and finding is "

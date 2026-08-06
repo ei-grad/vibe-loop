@@ -8961,6 +8961,34 @@ class NativePlanningTests(unittest.TestCase):
             worker_calls[0]["command"],
         )
         self.assertIn(
+            "classify every requested validation or certification command",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "Never put a mainline-only gate in a worker-dispatched task",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "requires a clean checkout of the configured main branch",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "operator-owned release step outside vibe-loop run",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            f"configured runnable statuses {json.dumps(list(config.task_source.runnable_statuses))}",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "Do not weaken the gate, add a worker-branch bypass",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
+            "verify that no mainline-only gate remains",
+            worker_calls[0]["command"],
+        )
+        self.assertIn(
             str(config.state_path / "runs.jsonl"),
             worker_calls[0]["command"],
         )

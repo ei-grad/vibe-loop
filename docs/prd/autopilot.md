@@ -1028,6 +1028,18 @@ including resource domains. Unknown domains serialize scheduling
 conservatively, while candidate path-scope enforcement remains explicitly
 unavailable as specified by
 [PRD-ORC-004](run-orchestration.md#prd-orc-004-runtime-gates-and-candidate-stabilization).
+Before publishing, the planning worker must classify validation and certification
+commands by their required checkout state. A gate that requires a clean checkout
+of the configured main branch, or can only produce valid evidence after
+integration, is an operator-owned release step outside `vibe-loop run`; it must
+not appear in the body or acceptance criteria of a worker-dispatched task. If the
+authoritative task source represents that operator step, its status must be
+outside the configured runnable statuses. The planning worker must not weaken
+the gate, add a worker-branch bypass, or prescribe an override whose result is
+still blocked by deployment policy, and must re-read authored worker tasks to
+verify that no mainline-only gate remains. An implementation worker that
+nevertheless receives an unsatisfiable gate still blocks rather than
+improvising.
 Before creating new tasks or entering an isolated planning worktree, it must
 inspect the configured runtime state `runs.jsonl` for
 `candidate_scope_assessed` records whose `finding` is
