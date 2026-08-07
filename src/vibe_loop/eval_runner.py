@@ -114,6 +114,21 @@ DELEGATION_DESCRIPTION_FIELDS = ("message", "prompt", "task_name", "description"
 DELEGATION_LABEL_FIELDS = ("task_name", "description")
 DELEGATION_AGENT_ID_FIELDS = ("target", "to", "agent_id", "name")
 DELEGATION_COMPLETED_STATES = frozenset({"completed", "done", "finished", "success"})
+# A failed agent still reports explanatory text, so result presence alone would
+# credit a delegation that produced no agent output.
+DELEGATION_FAILED_STATES = frozenset(
+    {
+        "aborted",
+        "canceled",
+        "cancelled",
+        "error",
+        "errored",
+        "failed",
+        "rejected",
+        "timed_out",
+        "timeout",
+    }
+)
 # Ordered by role, matched by position rather than precedence. Suffixes are
 # bounded so a noun like "correctness" is not read as the directive "correct".
 DELEGATION_ROLE_PATTERNS = (
@@ -2537,11 +2552,17 @@ def native_delegation_evidence(raw: str) -> tuple[dict[str, object], ...]:
         if not isinstance(envelope, Mapping):
             return ()
         item = envelope.get("item")
-        if isinstance(item, Mapping):
-            if not collect_codex_delegation_item(item, stream):
+        # An agent chooses the identifiers this reads, so a rejected one is a
+        # delegation the harness cannot attribute, not a harness error: report
+        # no native evidence rather than raising out of the trial.
+        try:
+            if isinstance(item, Mapping):
+                if not collect_codex_delegation_item(item, stream):
+                    return ()
+                continue
+            if not collect_claude_delegation_envelope(envelope, stream):
                 return ()
-            continue
-        if not collect_claude_delegation_envelope(envelope, stream):
+        except EvalSafeEnvelopeError:
             return ()
     return stream.evidence()
 
@@ -2576,10 +2597,17 @@ def collect_codex_delegation_item(
     if not agent_id:
         return False
     key = stream.record(role, agent_id, arguments)
-    if native_delegation_result_present(item.get("result")):
+    if not delegation_item_failed(item) and native_delegation_result_present(
+        item.get("result")
+    ):
         stream.resolved_calls.add(key)
     stream.resolved_agents.update(native_delegation_finished_agent_ids(item))
     return True
+
+
+def delegation_item_failed(item: Mapping[str, object]) -> bool:
+    status = item.get("status")
+    return isinstance(status, str) and status.casefold() in DELEGATION_FAILED_STATES
 
 
 def collect_claude_delegation_envelope(
@@ -2619,6 +2647,10 @@ def collect_claude_delegation_envelope(
         elif block_type == "tool_result":
             tool_use_id = block.get("tool_use_id")
             if not isinstance(tool_use_id, str):
+                continue
+            # A denied or failed spawn still carries explanatory text, so text
+            # alone would record a delegation that never produced agent output.
+            if block.get("is_error") is True:
                 continue
             agent_id = stream.pending_tool_uses.get(tool_use_id)
             if agent_id and claude_tool_result_present(block.get("content")):
@@ -2662,10 +2694,10 @@ def native_delegation_finished_agent_ids(item: Mapping[str, object]) -> set[str]
             if not isinstance(agent_id, str) or not isinstance(state, Mapping):
                 continue
             status = state.get("status")
-            finished_state = (
-                isinstance(status, str)
-                and status.casefold() in DELEGATION_COMPLETED_STATES
-            )
+            normalized_status = status.casefold() if isinstance(status, str) else ""
+            if normalized_status in DELEGATION_FAILED_STATES:
+                continue
+            finished_state = normalized_status in DELEGATION_COMPLETED_STATES
             if not finished_state and not native_delegation_result_present(state):
                 continue
             try:

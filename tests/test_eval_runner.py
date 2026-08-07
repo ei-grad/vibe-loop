@@ -2557,6 +2557,139 @@ class EvalRunnerCliTests(unittest.TestCase):
 
         self.assertEqual([record["role"] for record in evidence], ["reviewer"])
 
+    def test_native_delegation_ignores_denied_claude_tool_result(self) -> None:
+        # A denied spawn returns explanatory text as its result, so text alone
+        # would credit a delegation that never ran.
+        stream = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_1",
+                                    "name": "Agent",
+                                    "input": {
+                                        "description": "Independent review of slice",
+                                        "prompt": "Review the candidate diff",
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "toolu_1",
+                                    "is_error": True,
+                                    "content": "The tool use was rejected.",
+                                }
+                            ],
+                        },
+                    }
+                ),
+            )
+        )
+
+        self.assertEqual(native_delegation_evidence(stream), ())
+
+    def test_native_delegation_ignores_failed_codex_agent_state(self) -> None:
+        stream = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "call-1",
+                            "type": "collab_tool_call",
+                            "tool": "spawn_agent",
+                            "arguments": {
+                                "task_name": "review",
+                                "message": "Review the candidate",
+                            },
+                            "result": {"agent_id": "reviewer-1"},
+                            "status": "completed",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "call-2",
+                            "type": "collab_tool_call",
+                            "tool": "wait_agent",
+                            "agents_states": {
+                                "reviewer-1": {
+                                    "status": "failed",
+                                    "message": "agent crashed before reporting",
+                                }
+                            },
+                            "status": "completed",
+                        },
+                    }
+                ),
+            )
+        )
+
+        self.assertEqual(native_delegation_evidence(stream), ())
+
+    def test_native_delegation_rejects_unsafe_agent_identifier(self) -> None:
+        # The agent chooses these identifiers, so an unusable one must degrade
+        # to "no native evidence" instead of raising out of the trial.
+        stream = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "call-1",
+                    "type": "collab_tool_call",
+                    "tool": "spawn_agent",
+                    "arguments": {
+                        "target": "impl agent",
+                        "task_name": "implement",
+                        "message": "Implement the change",
+                    },
+                    "result": {"output": "done"},
+                    "status": "completed",
+                },
+            }
+        )
+
+        self.assertEqual(native_delegation_evidence(stream), ())
+
+    def test_native_claude_delegation_rejects_unsafe_agent_identifier(self) -> None:
+        stream = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "Agent",
+                            "input": {
+                                "name": "impl agent",
+                                "description": "implement",
+                                "prompt": "Implement the change",
+                            },
+                        }
+                    ],
+                },
+            }
+        )
+
+        self.assertEqual(native_delegation_evidence(stream), ())
+
     def test_delegation_role_follows_the_leading_directive(self) -> None:
         # Reviewer assignments routinely name remediation words in passing --
         # as the deliverable, as a quality bar, or as an explicit prohibition.

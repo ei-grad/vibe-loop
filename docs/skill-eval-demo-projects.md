@@ -976,6 +976,17 @@ The trace envelope exists because workflow quality is not fully represented by a
 final repository tree. It should be narrow enough to avoid brittle trajectory
 matching and broad enough to catch missing contract gates.
 
+A case runs under several conditions, and the same fixture can owe different
+workflow evidence in each: an orchestrated condition must additionally show
+delegation and role separation, while a finite condition must not. A case may
+therefore declare `condition_contracts` in `expected-artifacts.json`, mapping a
+condition id to its own `workflow_trace` and `artifact_contract`. The grader
+uses the entry for the trial's condition when the case declares one for that
+key, and the case-level contract otherwise; per-condition entries replace the
+case-level contract for that key rather than merging into it. Declare a
+per-condition entry only where the condition genuinely owes different evidence,
+so the case-level envelope stays the readable default.
+
 ## Failure Taxonomy Mapping
 
 Graders should map failures to the taxonomy in
