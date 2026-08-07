@@ -108,7 +108,7 @@ class SkillDeploymentTests(unittest.TestCase):
         )
         expected_phrases = {
             "vibe-loop": (
-                "--force-refresh --json",
+                "using its forced-refresh option",
                 "Never hand-edit the cache",
             ),
             "orchestrated-vibe-loop": (
