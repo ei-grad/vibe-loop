@@ -89,7 +89,7 @@ Optional structured roles use these closed envelopes:
 | `lock_evidence` | Task/run ids, lock state, process ids/state, timestamps, and the normalized acquire/release/final-status evidence used by case graders. Commands, logs, host paths, and fencing tokens are excluded. |
 | `workspace_evidence` | Per-task lifecycle/workspace statuses, booleans, diagnostic codes, counts, merged branch ids, and explicit dirty-file relative paths with size and SHA-256. |
 | `report_evidence` | Worker-report schema/type, task/run ids, status, commit, timestamp, and normalized reason label. |
-| `delegation_evidence` | Role and agent ids, prompt/result presence booleans, and changed-path count. |
+| `delegation_evidence` | Role and agent ids, prompt/result presence booleans, changed-path count, and an `evidence_source` of `native_stream` or `artifact` assigned by the harness. |
 | `generated_profile` | Schema/status, prompt version, confidence, profile kind, and bounded stable ids. |
 | `budget_evidence` | Timeout/truncation booleans and bounded duration, command, and byte counts. |
 | `negative_prompt_results` | Prompt id plus skill-activation, repository-change, and response-term-match booleans. |

@@ -103,6 +103,19 @@ ROLE_PATHS = {
     "task_source_evidence": "task-source-evidence.json",
     "hook_evidence": "hook-evidence.json",
 }
+# Native delegation surfaces differ per agent CLI: Codex exposes collaboration
+# tools on item envelopes, Claude exposes subagent tools as assistant tool_use
+# blocks. Both are read from the structured stream so agent-written delegation
+# artifacts never stand in for an actual delegation.
+DELEGATION_SPAWN_TOOLS = frozenset({"agent", "delegate_agent", "spawn_agent", "task"})
+DELEGATION_FOLLOWUP_TOOLS = frozenset({"followup_task", "send_message", "sendmessage"})
+DELEGATION_WAIT_TOOLS = frozenset({"wait", "wait_agent", "wait_for_agent"})
+DELEGATION_DESCRIPTION_FIELDS = ("message", "prompt", "task_name", "description")
+DELEGATION_AGENT_ID_FIELDS = ("target", "to", "agent_id", "name")
+DELEGATION_COMPLETED_STATES = frozenset({"completed", "done", "finished", "success"})
+REMEDIATION_ACTION_PATTERN = re.compile(
+    r"\b(?:remediat\w*|address\w*|fix|fixes|fixing|resolv\w*|correct\w*)\b"
+)
 STRUCTURED_ARTIFACT_TOP_LEVEL_FIELDS = {
     "aggregate.json": {
         "artifact_root",
@@ -2248,13 +2261,8 @@ def _events_for_tool_use(
             events.append("task_source_inspected")
     elif name in ("EnterWorktree", "enterWorktree"):
         events.append("branch_or_worktree_created")
-    elif name == "Agent":
-        desc = (
-            str(inp.get("description", "")) + " " + str(inp.get("prompt", ""))
-        ).lower()
-        if "review" in desc:
-            events.append("review_requested")
-            events.append("review_delegated")
+    else:
+        events.extend(delegation_events_for_tool(name, inp))
 
     return events, is_test, is_merge
 
@@ -2396,22 +2404,32 @@ def structured_tool_arguments(value: object) -> dict[str, object] | None:
 
 def delegation_events_for_tool(name: str, inp: Mapping[str, object]) -> list[str]:
     normalized = name.casefold().replace("-", "_")
-    if normalized not in {"delegate_agent", "followup_task", "spawn_agent"}:
+    if normalized in DELEGATION_FOLLOWUP_TOOLS:
+        followup = True
+    elif normalized in DELEGATION_SPAWN_TOOLS:
+        followup = False
+    else:
         return []
     description = " ".join(
-        str(inp.get(key, "")) for key in ("message", "prompt", "task_name")
+        str(inp.get(key, "")) for key in DELEGATION_DESCRIPTION_FIELDS
     ).casefold()
-    if normalized == "followup_task" and any(
+    if followup and any(
         marker in description
         for marker in ("closure review", "closure check", "re-review", "rereview")
     ):
         return ["review_finding_addressed", "rereview_requested"]
-    if "remediat" in description or "finding" in description:
-        if normalized == "followup_task":
+    # A reviewer assignment normally names findings as its deliverable, so a
+    # finding mention alone does not make a call remediation: remediation also
+    # asks for an action on that finding.
+    if "remediat" in description or (
+        "finding" in description
+        and REMEDIATION_ACTION_PATTERN.search(description) is not None
+    ):
+        if followup:
             return ["review_finding_received", "remediation_delegated"]
         return ["remediation_delegated"]
     if "review" in description:
-        if normalized == "followup_task":
+        if followup:
             return ["rereview_requested"]
         return ["review_requested", "review_delegated"]
     if "explor" in description or "investigat" in description:
@@ -2424,9 +2442,53 @@ def delegation_events_for_tool(name: str, inp: Mapping[str, object]) -> list[str
     return []
 
 
+class NativeDelegationStream:
+    """Delegation calls and their result signals collected from one stream."""
+
+    def __init__(self) -> None:
+        self.records: dict[tuple[str, str], dict[str, object]] = {}
+        # A call resolves either directly, when its own item carries the agent's
+        # output, or indirectly, when a later wait call reports that agent as
+        # finished. Codex spawn calls only return a receipt, so both are needed.
+        self.resolved_calls: set[tuple[str, str]] = set()
+        self.resolved_agents: set[str] = set()
+        self.pending_tool_uses: dict[str, str] = {}
+
+    def record(
+        self, role: str, agent_id: str, arguments: Mapping[str, object]
+    ) -> tuple[str, str]:
+        key = (role, agent_id)
+        previous = self.records.get(key)
+        self.records[key] = {
+            "role": role,
+            "agent_id": agent_id,
+            "prompt_present": bool(previous and previous.get("prompt_present") is True)
+            or any(
+                isinstance(arguments.get(field), str) and bool(arguments[field])
+                for field in DELEGATION_DESCRIPTION_FIELDS
+            ),
+        }
+        return key
+
+    def evidence(self) -> tuple[dict[str, object], ...]:
+        return tuple(
+            {
+                **record,
+                "result_present": True,
+                "changed_path_count": 0,
+                "evidence_source": "native_stream",
+            }
+            for key, record in self.records.items()
+            if key in self.resolved_calls or key[1] in self.resolved_agents
+        )
+
+
 def native_delegation_evidence(raw: str) -> tuple[dict[str, object], ...]:
-    records: dict[tuple[str, str], dict[str, object]] = {}
+    stream = NativeDelegationStream()
     for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
         try:
             envelope = json.loads(line)
         except (json.JSONDecodeError, ValueError):
@@ -2434,50 +2496,142 @@ def native_delegation_evidence(raw: str) -> tuple[dict[str, object], ...]:
         if not isinstance(envelope, Mapping):
             return ()
         item = envelope.get("item")
-        if not isinstance(item, Mapping):
+        if isinstance(item, Mapping):
+            if not collect_codex_delegation_item(item, stream):
+                return ()
             continue
-        item_type = item.get("type")
-        if item_type not in {"collab_tool_call", "mcp_tool_call"}:
-            continue
-        if item_type == "mcp_tool_call" and item.get("server") not in {
-            "collab",
-            "collaboration",
-        }:
-            continue
-        name = item.get("tool")
-        if not isinstance(name, str):
+        if not collect_claude_delegation_envelope(envelope, stream):
             return ()
-        arguments = structured_tool_arguments(item.get("arguments"))
-        if arguments is None:
-            arguments = {}
-        prompt = item.get("prompt")
-        if isinstance(prompt, str):
-            arguments = {**arguments, "prompt": prompt}
-        role = delegation_role_for_tool(name, arguments)
-        if role is None:
+    return stream.evidence()
+
+
+def collect_codex_delegation_item(
+    item: Mapping[str, object], stream: NativeDelegationStream
+) -> bool:
+    item_type = item.get("type")
+    if item_type not in {"collab_tool_call", "mcp_tool_call"}:
+        return True
+    if item_type == "mcp_tool_call" and item.get("server") not in {
+        "collab",
+        "collaboration",
+    }:
+        return True
+    name = item.get("tool")
+    if not isinstance(name, str):
+        return False
+    if name.casefold().replace("-", "_") in DELEGATION_WAIT_TOOLS:
+        stream.resolved_agents.update(native_delegation_finished_agent_ids(item))
+        return True
+    arguments = structured_tool_arguments(item.get("arguments"))
+    if arguments is None:
+        arguments = {}
+    prompt = item.get("prompt")
+    if isinstance(prompt, str):
+        arguments = {**arguments, "prompt": prompt}
+    role = delegation_role_for_tool(name, arguments)
+    if role is None:
+        return True
+    agent_id = native_delegation_agent_id(item, arguments)
+    if not agent_id:
+        return False
+    key = stream.record(role, agent_id, arguments)
+    if native_delegation_result_present(item.get("result")):
+        stream.resolved_calls.add(key)
+    stream.resolved_agents.update(native_delegation_finished_agent_ids(item))
+    return True
+
+
+def collect_claude_delegation_envelope(
+    envelope: Mapping[str, object], stream: NativeDelegationStream
+) -> bool:
+    if envelope.get("type") not in {"assistant", "user"}:
+        return True
+    message = envelope.get("message")
+    if not isinstance(message, Mapping):
+        return True
+    content = message.get("content")
+    if not isinstance(content, Sequence) or isinstance(content, (str, bytes)):
+        return True
+    for block in content:
+        if not isinstance(block, Mapping):
             continue
-        agent_id = native_delegation_agent_id(item, arguments)
-        if not agent_id:
-            return ()
-        result = item.get("result")
-        result_present = native_delegation_result_present(result)
-        if not result_present:
+        block_type = block.get("type")
+        if block_type == "tool_use":
+            name = block.get("name")
+            if not isinstance(name, str):
+                continue
+            arguments = block.get("input")
+            if not isinstance(arguments, Mapping):
+                arguments = {}
+            role = delegation_role_for_tool(name, arguments)
+            if role is None:
+                continue
+            agent_id = claude_delegation_agent_id(block, arguments)
+            if not agent_id:
+                return False
+            key = stream.record(role, agent_id, arguments)
+            tool_use_id = block.get("id")
+            if isinstance(tool_use_id, str) and tool_use_id:
+                stream.pending_tool_uses[tool_use_id] = agent_id
+            if claude_tool_result_present(block.get("result")):
+                stream.resolved_calls.add(key)
+        elif block_type == "tool_result":
+            tool_use_id = block.get("tool_use_id")
+            if not isinstance(tool_use_id, str):
+                continue
+            agent_id = stream.pending_tool_uses.get(tool_use_id)
+            if agent_id and claude_tool_result_present(block.get("content")):
+                stream.resolved_agents.add(agent_id)
+    return True
+
+
+def claude_delegation_agent_id(
+    block: Mapping[str, object], arguments: Mapping[str, object]
+) -> str:
+    for field in DELEGATION_AGENT_ID_FIELDS:
+        value = arguments.get(field)
+        if isinstance(value, str) and value:
+            return safe_identifier(value, category="delegation agent id")
+    value = block.get("id")
+    if isinstance(value, str) and value:
+        return safe_identifier(value, category="delegation agent id")
+    return ""
+
+
+def claude_tool_result_present(content: object) -> bool:
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, Mapping):
+        return native_delegation_result_present(content)
+    if isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
+        return any(claude_tool_result_present(entry) for entry in content)
+    return False
+
+
+def native_delegation_finished_agent_ids(item: Mapping[str, object]) -> set[str]:
+    finished: set[str] = set()
+    sources: list[object] = [item.get("agents_states")]
+    result = item.get("result")
+    if isinstance(result, Mapping):
+        sources.append(result.get("agents_states"))
+    for source in sources:
+        if not isinstance(source, Mapping):
             continue
-        key = (role, agent_id)
-        previous = records.get(key)
-        records[key] = {
-            "role": role,
-            "agent_id": agent_id,
-            "prompt_present": bool(previous and previous.get("prompt_present") is True)
-            or any(
-                isinstance(arguments.get(field), str) and bool(arguments[field])
-                for field in ("message", "prompt", "task_name")
-            ),
-            "result_present": bool(previous and previous.get("result_present") is True)
-            or result_present,
-            "changed_path_count": 0,
-        }
-    return tuple(records.values())
+        for agent_id, state in source.items():
+            if not isinstance(agent_id, str) or not isinstance(state, Mapping):
+                continue
+            status = state.get("status")
+            finished_state = (
+                isinstance(status, str)
+                and status.casefold() in DELEGATION_COMPLETED_STATES
+            )
+            if not finished_state and not native_delegation_result_present(state):
+                continue
+            try:
+                finished.add(safe_identifier(agent_id, category="delegation agent id"))
+            except EvalSafeEnvelopeError:
+                continue
+    return finished
 
 
 def native_delegation_result_present(result: object) -> bool:
@@ -2513,7 +2667,6 @@ def persist_native_delegation_evidence(
 
 
 def delegation_role_for_tool(name: str, arguments: Mapping[str, object]) -> str | None:
-    normalized = name.casefold().replace("-", "_")
     events = delegation_events_for_tool(name, arguments)
     if "remediation_delegated" in events:
         return "remediator"
@@ -2525,8 +2678,6 @@ def delegation_role_for_tool(name: str, arguments: Mapping[str, object]) -> str 
         return "explorer"
     if "implementation_delegated" in events:
         return "implementer"
-    if normalized == "delegate_agent":
-        return None
     return None
 
 
@@ -2774,6 +2925,9 @@ def sanitize_delegation_evidence(artifact_root: Path) -> None:
                     "result_present": isinstance(agent.get("result"), str)
                     and bool(agent["result"]),
                     "changed_path_count": len(changed_paths),
+                    # Provenance is assigned here, never copied from the agent:
+                    # `evidence_source` is not an accepted input field.
+                    "evidence_source": "artifact",
                 }
             )
     except EvalSafeEnvelopeError:

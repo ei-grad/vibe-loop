@@ -17,12 +17,22 @@ claim delegation or review do not satisfy these gates. If a required native
 delegation cannot be launched or completed, stop as blocked without editing or
 committing.
 
+Give every delegated agent a stable identifier when you start it, and address
+each continuation to that same identifier. Handbacks are attributed by that
+identifier, so an unnamed or renamed continuation reads as a replacement agent
+rather than as remediation or closure review by the responsible one.
+
 For Codex collaboration tools, use `spawn_agent` for the explorer,
 implementation agent, and independent reviewer; use `wait_agent` to collect
 their results. Keep the implementation agent available. If review finds a
 material issue, use `followup_task` with that same implementation agent for the
 fix, then `followup_task` with the same reviewer for the targeted closure check.
 Do not start a replacement agent for either continuation.
+
+For a harness whose subagent tool spawns a named agent and sends follow-up
+messages to it, name the explorer, implementer, and reviewer at spawn time and
+send the remediation and closure-review messages to the existing implementer and
+reviewer names. Do not spawn a second agent for either continuation.
 
 Use for bounded or unattended software work where the main agent is an
 orchestrator. The main agent owns task framing, agent assignment, handoffs,

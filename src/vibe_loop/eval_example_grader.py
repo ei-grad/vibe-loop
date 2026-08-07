@@ -688,6 +688,15 @@ def artifact_orchestrated_delegation(
         for field in ("prompt_present", "result_present"):
             if agent.get(field) is not True:
                 diagnostics.append(f"{role}.{field} is required")
+        # A writing role claimed by an agent-written artifact must show the
+        # files it touched. Stream-derived records carry no path list, and are
+        # not agent-authored, so the claim cannot be spoofed there.
+        if role in {"implementer", "remediator"} and (
+            agent.get("evidence_source") != "native_stream"
+        ):
+            changed = agent.get("changed_path_count")
+            if not isinstance(changed, int) or isinstance(changed, bool) or changed < 1:
+                diagnostics.append(f"{role}.changed_path_count must be positive")
     role_agents = {
         role: next((agent for agent in agents if agent.get("role") == role), None)
         for role in required_roles

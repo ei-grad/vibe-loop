@@ -24,6 +24,8 @@ from vibe_loop.eval_runner import (
     build_aggregate,
     build_eval_prompt,
     collect_git_state,
+    delegation_events_for_tool,
+    delegation_role_for_tool,
     evidence_backed_workflow_events,
     ensure_stream_json_format,
     execute_agent_command,
@@ -38,6 +40,7 @@ from vibe_loop.eval_runner import (
     workflow_events_for_trial,
     workflow_taxonomy_labels,
 )
+from vibe_loop.eval_example_grader import artifact_orchestrated_delegation
 from vibe_loop.eval_examples import (
     list_eval_example_cases,
     load_eval_example_case,
@@ -2475,6 +2478,327 @@ class EvalRunnerCliTests(unittest.TestCase):
         )
 
         self.assertEqual(native_delegation_evidence(stream), ())
+
+    def test_native_delegation_resolves_spawn_receipt_through_wait_state(self) -> None:
+        stream = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "call-1",
+                            "type": "collab_tool_call",
+                            "tool": "spawn_agent",
+                            "arguments": {
+                                "task_name": "review",
+                                "message": "Review the candidate",
+                            },
+                            "result": {"agent_id": "reviewer-1"},
+                            "status": "completed",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "call-2",
+                            "type": "collab_tool_call",
+                            "tool": "wait_agent",
+                            "agents_states": {
+                                "reviewer-1": {
+                                    "status": "completed",
+                                    "message": "no material findings",
+                                }
+                            },
+                            "status": "completed",
+                        },
+                    }
+                ),
+            )
+        )
+
+        evidence = native_delegation_evidence(stream)
+
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0]["role"], "reviewer")
+        self.assertEqual(evidence[0]["agent_id"], "reviewer-1")
+        self.assertIs(evidence[0]["result_present"], True)
+        self.assertEqual(evidence[0]["evidence_source"], "native_stream")
+
+    def test_native_delegation_skips_blank_stream_lines(self) -> None:
+        stream = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "call-1",
+                            "type": "collab_tool_call",
+                            "tool": "spawn_agent",
+                            "arguments": {
+                                "task_name": "review",
+                                "message": "Review the candidate",
+                            },
+                            "result": {
+                                "agent_id": "reviewer-1",
+                                "output": "no material findings",
+                            },
+                            "status": "completed",
+                        },
+                    }
+                ),
+                "",
+                json.dumps({"type": "turn.completed", "usage": {}}),
+            )
+        )
+
+        evidence = native_delegation_evidence(stream)
+
+        self.assertEqual([record["role"] for record in evidence], ["reviewer"])
+
+    def test_reviewer_assignment_naming_findings_is_not_remediation(self) -> None:
+        arguments = {
+            "task_name": "review",
+            "message": (
+                "Review the raw diff against acceptance criteria and report "
+                "material findings."
+            ),
+        }
+
+        self.assertEqual(
+            delegation_events_for_tool("spawn_agent", arguments),
+            ["review_requested", "review_delegated"],
+        )
+        self.assertEqual(delegation_role_for_tool("spawn_agent", arguments), "reviewer")
+        self.assertEqual(
+            delegation_events_for_tool(
+                "followup_task",
+                {
+                    "target": "implementer-1",
+                    "message": "Address the review finding and fix the parser.",
+                },
+            ),
+            ["review_finding_received", "remediation_delegated"],
+        )
+
+    def test_claude_native_delegation_covers_agent_and_handback(self) -> None:
+        spawns = (
+            ("toolu_1", "explorer-1", "Explore the task scope", "scope report"),
+            ("toolu_2", "implementer-1", "Implement the change", "change landed"),
+            (
+                "toolu_3",
+                "reviewer-1",
+                "Review the raw diff and report material findings",
+                "one material finding",
+            ),
+        )
+        lines = []
+        for tool_use_id, agent_name, prompt, result in spawns:
+            lines.append(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": tool_use_id,
+                                    "name": "Agent",
+                                    "input": {"name": agent_name, "prompt": prompt},
+                                }
+                            ]
+                        },
+                    }
+                )
+            )
+            lines.append(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_use_id,
+                                    "content": result,
+                                }
+                            ]
+                        },
+                    }
+                )
+            )
+        handbacks = (
+            (
+                "toolu_4",
+                "implementer-1",
+                "Address the material finding and fix the parser.",
+                "remediated",
+            ),
+            (
+                "toolu_5",
+                "reviewer-1",
+                "Run a targeted closure review of the remediation.",
+                "closed",
+            ),
+        )
+        for tool_use_id, target, message, result in handbacks:
+            lines.append(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": tool_use_id,
+                                    "name": "SendMessage",
+                                    "input": {"to": target, "message": message},
+                                }
+                            ]
+                        },
+                    }
+                )
+            )
+            lines.append(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_use_id,
+                                    "content": result,
+                                }
+                            ]
+                        },
+                    }
+                )
+            )
+        stream = "\n".join(lines)
+
+        evidence = native_delegation_evidence(stream)
+        _result, events = parse_stream_json(stream)
+
+        by_role = {record["role"]: record for record in evidence}
+        self.assertEqual(
+            set(by_role),
+            {"explorer", "implementer", "reviewer", "remediator", "rereviewer"},
+        )
+        self.assertNotEqual(
+            by_role["implementer"]["agent_id"], by_role["reviewer"]["agent_id"]
+        )
+        self.assertEqual(
+            by_role["remediator"]["agent_id"], by_role["implementer"]["agent_id"]
+        )
+        self.assertEqual(
+            by_role["rereviewer"]["agent_id"], by_role["reviewer"]["agent_id"]
+        )
+        for record in evidence:
+            self.assertIs(record["result_present"], True)
+            self.assertEqual(record["evidence_source"], "native_stream")
+        for event in (
+            "exploration_delegated",
+            "implementation_delegated",
+            "review_requested",
+            "review_delegated",
+            "review_finding_received",
+            "remediation_delegated",
+            "review_finding_addressed",
+            "rereview_requested",
+        ):
+            self.assertIn(event, events)
+
+    def test_claude_native_delegation_ignores_unanswered_agent_spawn(self) -> None:
+        stream = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "Agent",
+                            "input": {
+                                "name": "reviewer-1",
+                                "prompt": "Review the candidate",
+                            },
+                        }
+                    ]
+                },
+            }
+        )
+
+        self.assertEqual(native_delegation_evidence(stream), ())
+
+    def test_agent_written_delegation_evidence_needs_changed_paths(self) -> None:
+        record = {
+            "suite_id": "local-demo-v1",
+            "case_id": "finite-py-plan-table",
+            "condition": "orchestrated_vibe_loop",
+            "task": {"should_trigger": True},
+            "artifacts": [
+                {"role": "delegation_evidence", "path": "delegation-evidence.json"}
+            ],
+        }
+        spec = {
+            "condition_contracts": {
+                "orchestrated_vibe_loop": {
+                    "workflow_trace": {
+                        "required": ["implementation_delegated", "review_delegated"]
+                    }
+                }
+            }
+        }
+        agents = [
+            {
+                "role": "implementer",
+                "agent_id": "implementer-1",
+                "prompt_present": True,
+                "result_present": True,
+                "changed_path_count": 0,
+                "evidence_source": "artifact",
+            },
+            {
+                "role": "explorer",
+                "agent_id": "explorer-1",
+                "prompt_present": True,
+                "result_present": True,
+                "changed_path_count": 0,
+                "evidence_source": "artifact",
+            },
+            {
+                "role": "reviewer",
+                "agent_id": "reviewer-1",
+                "prompt_present": True,
+                "result_present": True,
+                "changed_path_count": 0,
+                "evidence_source": "artifact",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "delegation-evidence.json"
+            path.write_text(json.dumps({"agents": agents}), encoding="utf-8")
+            spoofed = artifact_orchestrated_delegation(root, record, spec)
+
+            agents[0]["changed_path_count"] = 2
+            path.write_text(json.dumps({"agents": agents}), encoding="utf-8")
+            honest = artifact_orchestrated_delegation(root, record, spec)
+
+            agents[0]["changed_path_count"] = 0
+            agents[0]["evidence_source"] = "native_stream"
+            path.write_text(json.dumps({"agents": agents}), encoding="utf-8")
+            native = artifact_orchestrated_delegation(root, record, spec)
+
+        self.assertFalse(spoofed["passed"])
+        self.assertIn(
+            "implementer.changed_path_count must be positive",
+            str(spoofed.get("message", "")),
+        )
+        self.assertTrue(honest["passed"])
+        self.assertTrue(native["passed"])
 
     def test_native_stream_ignores_agent_written_workflow_event_artifact(self) -> None:
         execution = CommandExecution(
