@@ -86,10 +86,10 @@ diagnostically useful but must report that gap instead of claiming
 exact-revision coverage.
 
 No eval record, and no other statement about a local environment or the skills
-installed in it, is published to GitHub or any other remote service, and no
-remotely hosted artifact is a precondition of publishing. Correspondence
-between a local environment and its installed skills is a local-run concern
-owned by [recorded skill deployment](../skill-deployment.md).
+installed in it, is published to GitHub or any other remote service, and no eval
+artifact is a precondition of publishing. Correspondence between a local
+environment and its installed skills is a local-run concern owned by
+[recorded skill deployment](../skill-deployment.md).
 
 Publishing must still bind what is published to what was built. Every
 publishing event resolves the canonical full commit being built, verifies that
@@ -98,13 +98,17 @@ records their fingerprint set and each distribution's name, size, and SHA-256,
 and blocks when a distribution's packaged skills differ from that commit. The
 [release-evidence schema](../skill-eval-schema.md#release-evidence-records) is
 the sole authority for the persisted admission field set. The admission record
-is revalidated against the repository and the distributions after transfer and
-before either publisher exercises trusted publishing, so a substituted,
-tampered, or extended record blocks publication. Tag-triggered PyPI and manual
-TestPyPI/PyPI publication share this contract. Admission command output and the
-GitHub job summary are deterministic and carry no secret-bearing or expiring
-values. Non-publishing `workflow_run` build/test executions produce no
-admission or publish-readiness claim.
+is the only artifact either publisher requires, and admission must succeed
+before either publisher starts. It is produced inside the same release run from
+the commit and the distributions being published, so it states nothing about an
+eval result or a local environment. The admission record is revalidated against
+the repository and the distributions after transfer and before either publisher
+exercises trusted publishing, so a substituted, tampered, or extended record
+blocks publication and where the record was held between jobs is never trusted.
+Tag-triggered PyPI and manual TestPyPI/PyPI publication share this contract.
+Admission command output and the GitHub job summary are deterministic and carry
+no secret-bearing or expiring values. Non-publishing `workflow_run` build/test
+executions produce no admission or publish-readiness claim.
 
 Acceptance must cover a curated release matrix distinct from the full paired
 eval suite, no required `no_skill` baseline for the release matrix, per-pair

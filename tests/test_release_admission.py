@@ -5,6 +5,7 @@ from _test_bootstrap import TEST_ENVIRONMENT_CONFIGURED as TEST_ENVIRONMENT_CONF
 import ast
 import io
 import json
+import re
 import subprocess
 import tempfile
 import unittest
@@ -47,7 +48,6 @@ FORBIDDEN_TRANSPORT_MODULES = (
     "urllib.request",
     "urllib.error",
     "http",
-    "http.client",
     "httpx",
     "requests",
     "aiohttp",
@@ -58,6 +58,73 @@ FORBIDDEN_TRANSPORT_MODULES = (
 )
 ALLOWED_SOCKET_ATTRIBUTES = frozenset({"gethostname"})
 FORBIDDEN_COMMAND_NAMES = frozenset({"gh", "curl", "wget"})
+# Splits a string constant into the words a shell would run, so a command buried
+# in a `shell=True` line is matched as well as a bare argv element. Regex
+# character classes such as `gh[oprsu]_` stay one token and do not match.
+COMMAND_SEPARATOR = re.compile(r"[\s;|&()<>]+")
+
+
+def imported_module_names(node: ast.AST) -> tuple[str, ...]:
+    """Dotted names an import binds, as written plus each `from` target."""
+
+    if isinstance(node, ast.Import):
+        return tuple(alias.name for alias in node.names)
+    if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+        return (node.module,) + tuple(
+            f"{node.module}.{alias.name}" for alias in node.names
+        )
+    return ()
+
+
+def local_socket_names(tree: ast.AST) -> set[str]:
+    """Local names bound to the `socket` module, including aliases."""
+
+    names = {"socket"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "socket" or alias.name.startswith("socket."):
+                    names.add((alias.asname or alias.name).partition(".")[0])
+    return names
+
+
+def outbound_transport_violations(source: str, location: str) -> list[str]:
+    """Report each lexical way `source` could carry local state off the host."""
+
+    tree = ast.parse(source)
+    socket_names = local_socket_names(tree)
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        for module in imported_module_names(node):
+            if any(
+                module == forbidden or module.startswith(f"{forbidden}.")
+                for forbidden in FORBIDDEN_TRANSPORT_MODULES
+            ):
+                violations.append(f"{location}:{node.lineno} transport {module}")
+            root, _, attribute = module.partition(".")
+            if (
+                root == "socket"
+                and attribute
+                and attribute not in ALLOWED_SOCKET_ATTRIBUTES
+            ):
+                violations.append(f"{location}:{node.lineno} socket use {module}")
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in socket_names
+            and node.attr not in ALLOWED_SOCKET_ATTRIBUTES
+        ):
+            violations.append(
+                f"{location}:{node.lineno} socket use {node.value.id}.{node.attr}"
+            )
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            for token in COMMAND_SEPARATOR.split(node.value):
+                if token in FORBIDDEN_COMMAND_NAMES:
+                    violations.append(
+                        f"{location}:{node.lineno} command {token} in "
+                        f"{node.value[:60]!r}"
+                    )
+    return violations
 
 
 class ReleaseAdmissionTests(unittest.TestCase):
@@ -88,52 +155,76 @@ class ReleaseAdmissionTests(unittest.TestCase):
         self.assertIn("render_release_admission_summary", admission)
         self.assertIn("GITHUB_STEP_SUMMARY", admission)
         self.assertNotIn("release-admission.json", build)
+        self.assertIn("publish-admission-${{ github.sha }}", admission)
+        # The admission record is the one artifact a publisher requires, so the
+        # dependency, its transfer, and revalidation must all precede the step
+        # that holds publishing credentials.
         for publish_job in (testpypi, pypi):
             self.assertIn("- admission", publish_job)
             self.assertIn("- test", publish_job)
             self.assertIn("--verify", publish_job)
+            self.assertIn("publish-admission-${{ github.sha }}", publish_job)
+            self.assertLess(
+                publish_job.index("Download publish admission"),
+                publish_job.index("Verify transferred admission and distributions"),
+            )
             self.assertLess(
                 publish_job.index("Verify transferred admission and distributions"),
                 publish_job.index("Publish distributions"),
             )
 
     def test_runtime_sources_carry_no_outbound_transport(self) -> None:
-        sources = sorted((repository_root() / "src/vibe_loop").rglob("*.py"))
+        root = repository_root()
+        sources = sorted((root / "src/vibe_loop").rglob("*.py"))
         self.assertTrue(sources)
-        transports: list[str] = []
-        socket_uses: list[str] = []
-        commands: list[str] = []
+        violations: list[str] = []
         for path in sources:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            location = str(path.relative_to(repository_root()))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    imported = tuple(alias.name for alias in node.names)
-                elif isinstance(node, ast.ImportFrom) and node.level == 0:
-                    imported = (node.module,) if node.module else ()
-                else:
-                    imported = ()
-                transports.extend(
-                    f"{location}:{node.lineno} {module}"
-                    for module in imported
-                    if module in FORBIDDEN_TRANSPORT_MODULES
+            violations.extend(
+                outbound_transport_violations(
+                    path.read_text(encoding="utf-8"),
+                    str(path.relative_to(root)),
                 )
-                if (
-                    isinstance(node, ast.Attribute)
-                    and isinstance(node.value, ast.Name)
-                    and node.value.id == "socket"
-                    and node.attr not in ALLOWED_SOCKET_ATTRIBUTES
-                ):
-                    socket_uses.append(f"{location}:{node.lineno} socket.{node.attr}")
-                if (
-                    isinstance(node, ast.Constant)
-                    and node.value in FORBIDDEN_COMMAND_NAMES
-                ):
-                    commands.append(f"{location}:{node.lineno} {node.value!r}")
+            )
 
-        self.assertEqual(transports, [])
-        self.assertEqual(socket_uses, [])
-        self.assertEqual(commands, [])
+        self.assertEqual(violations, [])
+
+    def test_transport_guard_reports_indirect_egress_forms(self) -> None:
+        # The guard is only worth having if it survives the obvious rewrites, so
+        # each admissible and each forbidden form is asserted directly.
+        admissible = outbound_transport_violations(
+            "import socket\n"
+            "import urllib.parse\n"
+            "from socket import gethostname\n"
+            "from urllib.parse import unquote\n"
+            "host = socket.gethostname()\n"
+            'pattern = "(?i)gh[oprsu]_[A-Za-z0-9_]+"\n'
+            'url = "https://github.com/ei-grad/vibe-loop"\n',
+            "admissible.py",
+        )
+        self.assertEqual(admissible, [])
+
+        for label, source in (
+            ("dotted import", "import urllib.request\n"),
+            ("from import", "from urllib import request\n"),
+            ("from submodule", "from urllib.request import urlopen\n"),
+            ("package import", "from http import client\n"),
+            ("third party", "import httpx\n"),
+            ("socket from import", "from socket import create_connection\n"),
+            (
+                "aliased socket",
+                "import socket as sk\nsk.create_connection(('h', 1))\n",
+            ),
+            ("argv command", 'run(["gh", "api", "repos"])\n'),
+            (
+                "shell string command",
+                'run("cd /tmp && curl -X POST https://example", shell=True)\n',
+            ),
+        ):
+            with self.subTest(form=label):
+                self.assertTrue(
+                    outbound_transport_violations(source, "candidate.py"),
+                    f"{label} escaped the transport guard",
+                )
 
     def test_eval_provenance_rejects_untracked_sources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

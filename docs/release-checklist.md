@@ -121,9 +121,10 @@ evidence, and optional external smoke evidence.
 
 ## Publish
 
-Nothing is uploaded to GitHub to authorize a release. The eval record stays on
-the machine that produced it; publishing is gated only on the built
-distributions matching the commit being published.
+No eval record is uploaded to GitHub to authorize a release: it stays on the
+machine that produced it. Publishing is gated only on the built distributions
+matching the commit being published, which the release run establishes for
+itself in its admission job.
 
 1. Decide, from the matrix result you just read, whether the candidate is worth
    releasing. If regressions were parked, cite the task ids in the release
