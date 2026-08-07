@@ -1852,12 +1852,6 @@ def workflow_events_for_trial(
     existing = artifact_path(artifact_root, "workflow_events")
     events: list[str] = []
     events.extend(extra_events)
-    if skill_invoked_by_agent_command(execution.command):
-        events.append("skill_activated")
-    if task_source and task_source_inspected_in_output(
-        execution.stdout + execution.stderr, task_source
-    ):
-        events.append("task_source_inspected")
     if allow_artifact_events and existing.is_file():
         loaded = load_json(existing)
         raw_events = loaded.get("events") if isinstance(loaded, Mapping) else loaded
@@ -1876,6 +1870,12 @@ def workflow_events_for_trial(
         events.extend(events_from_text(execution.stdout))
     events.extend(events_from_text(execution.stderr))
     has_explicit_events = bool(events)
+    if skill_invoked_by_agent_command(execution.command):
+        events.append("skill_activated")
+    if task_source and task_source_inspected_in_output(
+        execution.stdout + execution.stderr, task_source
+    ):
+        events.append("task_source_inspected")
     if git_before and git_after:
         if has_explicit_events:
             events.extend(

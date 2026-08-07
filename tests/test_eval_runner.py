@@ -115,6 +115,20 @@ class EvalRunnerCliTests(unittest.TestCase):
                 execution,
                 (),
                 allow_artifact_events=False,
+                git_before={
+                    "head": "a" * 40,
+                    "branch": "main",
+                    "branch_heads": {"main": "a" * 40},
+                    "worktrees": ["worktree /repo", "HEAD " + "a" * 40],
+                },
+                git_after={
+                    "head": "b" * 40,
+                    "branch": "main",
+                    "branch_heads": {"main": "b" * 40},
+                    "worktrees": ["worktree /repo", "HEAD " + "b" * 40],
+                },
+                grader_output={"checks": [{"id": "unit-tests", "passed": True}]},
+                condition="vibe_loop",
                 task_source={
                     "type": "markdown-profile",
                     "profile": {"source_paths": ["WORK.md"]},
@@ -123,6 +137,9 @@ class EvalRunnerCliTests(unittest.TestCase):
 
         self.assertIn("skill_activated", events)
         self.assertIn("task_source_inspected", events)
+        self.assertIn("verification_ran", events)
+        self.assertIn("commit_created", events)
+        self.assertIn("main_fast_forwarded", events)
 
     def test_codex_tool_activity_does_not_imply_skill_activation(self) -> None:
         execution = CommandExecution(
