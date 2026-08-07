@@ -58,13 +58,56 @@ An invalid manifest fails closed by default. `install-skills --force` prints the
 manifest error before replacing it, providing an explicit recovery path without
 deleting target-only content.
 
-Stale deployments block rather than auto-repair. Automatic repair would make a
-global write part of worker launch and obscure when deployment changed. The
-operator must inspect the verifier output and install explicitly from clean
-`main`.
+## Worker launch and post-integration refresh
 
-The [Autopilot PRD](prd/autopilot.md#prd-aut-002b-supervisor-configuration-lifetime)
+Worker preflight and `verify-skills` answer different questions. The verifier
+reports every managed drift state and exits non-zero for it. Worker preflight
+refuses to launch only where the installed content or its provenance is unknown:
+`runtime-edited`, `branch-sourced`, or an invalid manifest. That content is not
+the reviewed bundle and no automated step can decide what it is.
+
+A `stale` entry does not block worker launch. It means the installed copy still
+matches its manifest while the recorded source moved on, which is exactly what
+merging a bundled-skill change produces on the host that supplies the bundle.
+Blocking there halts every board on that host, across every repository, until an
+operator reinstalls by hand, which makes a bundled-skill edit unmergeable in
+practice. Preflight names the lagging paths and launches. It names the refresh
+below as the repair only when this repository supplies the running bundle;
+otherwise it names `install-skills`, because a bundle installed from a wheel or
+tool directory is never made stale, or repaired, by a repository merge.
+
+The runtime closes the window it opens. After a run advances `main`, it
+reinstalls recorded deployments of its own bundle whose source moved. The
+refresh is confined to that boundary:
+
+- it runs only when the repository that advanced supplies the running bundle;
+- it writes only the runtime roots that already record a stale deployment of
+  that bundle, so a runtime the operator never installed into does not acquire
+  one as a side effect. `install-skills` still writes both roots, because
+  choosing to install is an operator action;
+- it refuses the same non-mainline and dirty sources `install-skills` refuses;
+- a failed refresh is reported and never fails the run.
+
+A publish is not observable half-written. Managed files are replaced one at a
+time and the manifest is written last, so a reader landing mid-publish would
+otherwise see installed content that no longer matches the recorded digest and
+call the root `runtime-edited`, which blocks worker launch. Every install holds
+`.skill-deploy.lock` beside the runtime root for the whole overwrite check and
+write, and verification waits for that lock. The lock sits outside the root so
+the verifier still reports exactly the deployed tree, and it is only read, never
+created, by verification. The wait is bounded: a writer that outlives it is
+abandoned rather than stalling verification, and a root no writer has ever
+locked is read directly.
+
+Worker launch itself still performs no install: a global write there would
+obscure when deployment changed and would repair drift the operator has not
+seen. Supervisor and CLI startup verification likewise stays read-only; the
+[Autopilot PRD](prd/autopilot.md#prd-aut-002b-supervisor-configuration-lifetime)
 owns supervisor and CLI startup visibility for these deployment states.
+
+Because these checks read the operator's real home, the test suite substitutes
+an isolated one; see the
+[test-suite gate contract](test-suite-gates.md#host-state-isolation).
 
 The bundle-agnostic implementation lives in
 `vibe_loop.skill_deployment`; `vibe_loop.skills` only supplies this repository's

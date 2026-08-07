@@ -147,7 +147,11 @@ from vibe_loop.runs import (
     WorkerReport,
     settled_run_outcome,
 )
-from vibe_loop.skill_deployment import SkillDeploymentError
+from vibe_loop.skill_deployment import (
+    SkillDeploymentError,
+    VerificationEntry,
+    VerificationReport,
+)
 from vibe_loop.spec_diagnostics import SpecExecutionGateError
 from vibe_loop.tasks import (
     CommandTaskSource,
@@ -9602,6 +9606,144 @@ class AgentCommandModelTests(unittest.TestCase):
             launch.assert_not_called()
 
 
+class WorkerSkillDeploymentPreflightTests(unittest.TestCase):
+    """Worker launch policy for this host's recorded skill deployments."""
+
+    def _report(self, root: Path, state: str) -> VerificationReport:
+        return VerificationReport(
+            target_root=root,
+            entries=(
+                VerificationEntry(root, "vibe-loop/SKILL.md", state, "source changed"),
+            ),
+            unmanaged=(),
+        )
+
+    def _run_task_past_preflight(self, repo: Path) -> None:
+        runner = VibeRunner(
+            VibeConfig(
+                repo=repo,
+                agent_profiles={
+                    "opus": AgentConfig(command="worker --model {model} {prompt}")
+                },
+            )
+        )
+        task = Task(task_id="TASK-01", title="Task", status="Next", agent="opus")
+        with patch.object(runner, "ensure_spec_execution_gate"):
+            with patch("vibe_loop.runner.git_rev_parse", return_value="abc"):
+                runner.run_task(task)
+
+    def _stale_launch_advisories(self, repo: Path, supplies_bundle: bool) -> list[str]:
+        root = repo / "home" / ".claude" / "skills"
+        with (
+            patch(
+                "vibe_loop.runner.verify_worker_skill_deployments",
+                return_value=(self._report(root, "stale"),),
+            ),
+            patch(
+                "vibe_loop.runner.repository_supplies_bundle",
+                return_value=supplies_bundle,
+            ),
+            patch("vibe_loop.runner.report_status") as report,
+        ):
+            # A lagging deployment must not stop the launch; the run still
+            # fails on its own unresolved agent model.
+            with self.assertRaises(AgentResolutionError):
+                self._run_task_past_preflight(repo)
+
+        return [
+            call.args[0]
+            for call in report.call_args_list
+            if "lags its source" in call.args[0]
+        ]
+
+    def test_stale_deployment_is_reported_without_blocking_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            advisories = self._stale_launch_advisories(repo, supplies_bundle=True)
+
+            self.assertEqual(len(advisories), 1)
+            self.assertIn(
+                str(repo / "home" / ".claude" / "skills" / "vibe-loop" / "SKILL.md"),
+                advisories[0],
+            )
+            self.assertIn(
+                "refreshed after the next run that advances main", advisories[0]
+            )
+
+    def test_stale_advisory_names_the_manual_path_for_a_packaged_runtime(self) -> None:
+        # A runtime whose bundle lives outside this repository is never repaired
+        # by the post-integration refresh, so the advisory must not promise it.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            advisories = self._stale_launch_advisories(repo, supplies_bundle=False)
+
+            self.assertEqual(len(advisories), 1)
+            self.assertNotIn("advances main", advisories[0])
+            self.assertIn("`vibe-loop install-skills`", advisories[0])
+
+    def test_unknown_installed_provenance_blocks_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            root = repo / "home" / ".claude" / "skills"
+            for state in ("runtime-edited", "branch-sourced"):
+                with self.subTest(state=state):
+                    with patch(
+                        "vibe_loop.runner.verify_worker_skill_deployments",
+                        return_value=(self._report(root, state),),
+                    ):
+                        with self.assertRaises(SkillDeploymentError) as raised:
+                            self._run_task_past_preflight(repo)
+                    self.assertIn(
+                        f"{root / 'vibe-loop' / 'SKILL.md'}: {state}",
+                        "\n".join(raised.exception.diagnostics),
+                    )
+
+    def test_refresh_reports_a_failed_reinstall_instead_of_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(VibeConfig(repo=repo))
+            with (
+                patch(
+                    "vibe_loop.runner.refresh_stale_skill_deployments",
+                    side_effect=SkillDeploymentError("source tree is dirty"),
+                ),
+                patch("vibe_loop.runner.report_status") as report,
+            ):
+                self.assertEqual(runner.refresh_skill_deployments(), ())
+
+            messages = [call.args[0] for call in report.call_args_list]
+            self.assertTrue(
+                any(
+                    "skill deployment refresh failed" in message
+                    and "source tree is dirty" in message
+                    for message in messages
+                ),
+                messages,
+            )
+
+    def test_refresh_installs_from_this_repository_and_reports_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(VibeConfig(repo=repo))
+            refreshed = (repo / "home" / ".claude" / "skills" / "vibe-loop",)
+            with (
+                patch(
+                    "vibe_loop.runner.refresh_stale_skill_deployments",
+                    return_value=refreshed,
+                ) as refresh,
+                patch("vibe_loop.runner.report_status") as report,
+            ):
+                self.assertEqual(runner.refresh_skill_deployments(), refreshed)
+
+            self.assertEqual(refresh.call_args.kwargs["source_repo"], repo)
+            self.assertTrue(
+                any(
+                    "refreshed installed skill after integration" in call.args[0]
+                    for call in report.call_args_list
+                )
+            )
+
+
 class SessionIdInjectionTests(unittest.TestCase):
     def test_codex_structured_output_injection_allows_global_options(self) -> None:
         self.assertEqual(
@@ -10597,6 +10739,47 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             # The backend that finalizes external run provenance at release
             # must already see the settled outcome, not infer one afterwards.
             self.assertEqual(lock_manager.outcome_at_release("T-1"), "completed")
+
+    def test_a_run_that_advances_main_refreshes_the_skill_deployment(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+            reporting_worker = self._reporting_worker(runner, "completed")
+
+            def integrating_worker(command, cwd, log, **kwargs):
+                result = reporting_worker(command, cwd, log, **kwargs)
+                repo = runner.config.repo
+                (repo / "slice.txt").write_text("slice\n", encoding="utf-8")
+                subprocess.run(["git", "add", "slice.txt"], cwd=repo, check=True)
+                subprocess.run(
+                    ["git", "commit", "-m", "slice"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                )
+                return result
+
+            with patch.object(runner, "refresh_skill_deployments") as refresh:
+                result = self._run_task(runner, task, integrating_worker)
+
+            self.assertEqual(result.classification, "completed")
+            self.assertNotEqual(result.start_main, result.end_main)
+            refresh.assert_called_once_with()
+
+    def test_a_run_that_leaves_main_alone_keeps_the_deployment_untouched(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+
+            with patch.object(runner, "refresh_skill_deployments") as refresh:
+                result = self._run_task(
+                    runner, task, self._reporting_worker(runner, "completed")
+                )
+
+            self.assertEqual(result.start_main, result.end_main)
+            refresh.assert_not_called()
 
     def test_worker_owned_launch_uses_explicit_binding_without_overstripping(
         self,

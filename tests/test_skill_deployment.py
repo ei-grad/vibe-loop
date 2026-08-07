@@ -4,14 +4,17 @@ from _test_bootstrap import TEST_ENVIRONMENT_CONFIGURED as TEST_ENVIRONMENT_CONF
 
 import hashlib
 import json
+import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest import mock
 
+from vibe_loop import skill_deployment
 from vibe_loop.cli import main
 from vibe_loop.skill_deployment import (
     MANIFEST_NAME,
@@ -19,9 +22,15 @@ from vibe_loop.skill_deployment import (
     deployment_drift_advisories,
     deploy_skill_bundle,
     verify_skill_deployments,
+    verify_target_root,
     verify_worker_skill_deployments,
+    worker_launch_verdict,
 )
-from vibe_loop.skills import install_skills
+from vibe_loop.skills import (
+    install_skills,
+    refresh_stale_skill_deployments,
+    repository_supplies_bundle,
+)
 
 
 class SkillDeploymentTests(unittest.TestCase):
@@ -51,6 +60,21 @@ class SkillDeploymentTests(unittest.TestCase):
             check=True,
         )
         return completed.stdout.strip()
+
+    @contextmanager
+    def bundled_source(self):
+        """Make this fixture's repository the running `vibe_loop` skill bundle."""
+        with ExitStack() as stack:
+            stack.enter_context(
+                mock.patch(
+                    "vibe_loop.skills.importlib.resources.files",
+                    return_value=self.repo,
+                )
+            )
+            stack.enter_context(
+                mock.patch("vibe_loop.skills.SKILL_NAMES", ("example",))
+            )
+            yield
 
     def deploy(self, **kwargs: object) -> list[Path]:
         return deploy_skill_bundle(
@@ -330,6 +354,197 @@ class SkillDeploymentTests(unittest.TestCase):
         unmanaged.write_text("mutable\n", encoding="utf-8")
 
         self.assertEqual(verify_worker_skill_deployments(self.home), ())
+
+    def test_worker_launch_advises_stale_and_blocks_unknown_provenance(self) -> None:
+        self.deploy()
+        source = self.repo / "skills" / "example" / "SKILL.md"
+        source.write_text("version two\n", encoding="utf-8")
+
+        stale_reports = verify_worker_skill_deployments(self.home)
+        blocking, advisories = worker_launch_verdict(stale_reports)
+
+        # `verify-skills` keeps calling a lagging deployment blocking drift; only
+        # worker launch treats it as advisory.
+        self.assertTrue(all(report.blocking for report in stale_reports))
+        self.assertFalse(any(report.worker_blocking for report in stale_reports))
+        self.assertEqual(blocking, ())
+        self.assertEqual(
+            set(advisories),
+            {
+                f"{self.home / runtime / 'skills' / 'example' / 'SKILL.md'}: "
+                "stale: source changed"
+                for runtime in (".codex", ".claude")
+            },
+        )
+
+        installed = self.home / ".codex" / "skills" / "example" / "script.py"
+        installed.write_text("VALUE = 2\n", encoding="utf-8")
+        edited_blocking, _ = worker_launch_verdict(
+            verify_worker_skill_deployments(self.home)
+        )
+        self.assertEqual(
+            [report.target_root for report in edited_blocking],
+            [self.home / ".codex" / "skills"],
+        )
+
+    def test_refresh_reinstalls_a_stale_deployment_from_this_repository(self) -> None:
+        with self.bundled_source():
+            install_skills(False, False, self.home)
+            source = self.repo / "skills" / "example" / "SKILL.md"
+            source.write_text("version two\n", encoding="utf-8")
+            self.git("commit", "--all", "-m", "Edit the bundled skill")
+
+            refreshed = refresh_stale_skill_deployments(
+                self.home,
+                source_repo=self.repo,
+            )
+
+        self.assertEqual(
+            set(refreshed),
+            {
+                self.home / runtime / "skills" / "example"
+                for runtime in (".codex", ".claude")
+            },
+        )
+        for runtime in (".codex", ".claude"):
+            self.assertEqual(
+                (self.home / runtime / "skills" / "example" / "SKILL.md").read_text(
+                    encoding="utf-8"
+                ),
+                "version two\n",
+            )
+        reports = verify_worker_skill_deployments(self.home)
+        self.assertTrue(reports)
+        self.assertFalse(any(report.drifted for report in reports))
+
+    def test_refresh_skips_an_in_sync_host_and_a_foreign_bundle(self) -> None:
+        with self.bundled_source():
+            install_skills(False, False, self.home)
+
+            self.assertEqual(
+                refresh_stale_skill_deployments(self.home, source_repo=self.repo),
+                (),
+            )
+
+            source = self.repo / "skills" / "example" / "SKILL.md"
+            source.write_text("version two\n", encoding="utf-8")
+            self.git("commit", "--all", "-m", "Edit the bundled skill")
+            # A repository that does not supply the running bundle must not
+            # rewrite the host's deployment.
+            self.assertEqual(
+                refresh_stale_skill_deployments(
+                    self.home,
+                    source_repo=self.root / "other-repo",
+                ),
+                (),
+            )
+        self.assertEqual(
+            (self.home / ".codex" / "skills" / "example" / "SKILL.md").read_text(
+                encoding="utf-8"
+            ),
+            "version one\n",
+        )
+
+    def test_refresh_leaves_a_runtime_without_a_recorded_deployment_alone(self) -> None:
+        with self.bundled_source():
+            install_skills(False, False, self.home)
+            # An operator who uses only one runtime: the other root carries no
+            # recorded deployment and must not acquire one from a refresh.
+            shutil.rmtree(self.home / ".codex")
+            source = self.repo / "skills" / "example" / "SKILL.md"
+            source.write_text("version two\n", encoding="utf-8")
+            self.git("commit", "--all", "-m", "Edit the bundled skill")
+
+            refreshed = refresh_stale_skill_deployments(
+                self.home,
+                source_repo=self.repo,
+            )
+
+        self.assertEqual(refreshed, (self.home / ".claude" / "skills" / "example",))
+        self.assertFalse((self.home / ".codex").exists())
+        self.assertEqual(
+            (self.home / ".claude" / "skills" / "example" / "SKILL.md").read_text(
+                encoding="utf-8"
+            ),
+            "version two\n",
+        )
+
+    def test_publish_is_never_observed_half_written(self) -> None:
+        self.deploy()
+        source = self.repo / "skills" / "example" / "SKILL.md"
+        source.write_text("version two\n", encoding="utf-8")
+        self.git("commit", "--all", "-m", "Edit the bundled skill")
+        codex_root = self.home / ".codex" / "skills"
+
+        publishing = threading.Event()
+        release = threading.Event()
+        read_completed = threading.Event()
+        observed: list[object] = []
+        write_manifest = skill_deployment._write_manifest
+
+        def hold_before_manifest(root: Path, payload: dict) -> None:
+            # Managed files are already replaced here and the manifest still
+            # records the previous digests, which is the window a reader would
+            # misread as `runtime-edited`.
+            publishing.set()
+            release.wait(10)
+            write_manifest(root, payload)
+
+        def read_report() -> None:
+            observed.append(verify_target_root(codex_root))
+            read_completed.set()
+
+        writer = threading.Thread(target=self.deploy)
+        reader = threading.Thread(target=read_report)
+        with mock.patch.object(
+            skill_deployment,
+            "_write_manifest",
+            hold_before_manifest,
+        ):
+            writer.start()
+            try:
+                self.assertTrue(publishing.wait(10))
+                reader.start()
+                self.assertFalse(read_completed.wait(0.2))
+            finally:
+                release.set()
+                writer.join(10)
+        reader.join(10)
+
+        self.assertFalse(writer.is_alive())
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(
+            {entry.state for entry in observed[0].entries},
+            {"in-sync"},
+        )
+
+    def test_repository_supplies_bundle_only_for_an_in_tree_runtime(self) -> None:
+        with self.bundled_source():
+            self.assertTrue(repository_supplies_bundle(self.repo))
+            self.assertFalse(repository_supplies_bundle(self.root / "other-repo"))
+
+        packaged = self.root / "site-packages" / "vibe_loop"
+        (packaged / "skills").mkdir(parents=True)
+        with mock.patch(
+            "vibe_loop.skills.importlib.resources.files",
+            return_value=packaged,
+        ):
+            self.assertFalse(repository_supplies_bundle(self.repo))
+
+    def test_install_rejects_a_root_outside_this_home(self) -> None:
+        with self.assertRaisesRegex(SkillDeploymentError, "not a runtime root"):
+            self.deploy(roots=(self.root / "elsewhere" / "skills",))
+
+    def test_refresh_leaves_a_host_without_a_recorded_deployment_alone(self) -> None:
+        with self.bundled_source():
+            self.assertEqual(
+                refresh_stale_skill_deployments(self.home, source_repo=self.repo),
+                (),
+            )
+
+        self.assertFalse((self.home / ".codex").exists())
+        self.assertFalse((self.home / ".claude").exists())
 
     def test_deployment_drift_advisory_reports_stale_bundled_skill(self) -> None:
         self.deploy()

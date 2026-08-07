@@ -7,7 +7,10 @@ import json
 import os
 import shutil
 import subprocess
-from collections.abc import Callable, Iterable, Sequence
+import time
+import uuid
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from importlib.metadata import (
     PackageNotFoundError,
@@ -15,11 +18,27 @@ from importlib.metadata import (
 )
 from pathlib import Path
 
+try:  # pragma: no cover - platform dependent
+    import fcntl
+except ImportError:  # pragma: no cover - platform dependent
+    fcntl = None  # type: ignore[assignment]
+
 
 MANIFEST_NAME = ".skill-manifest.json"
 MANIFEST_VERSION = 1
+PUBLISH_LOCK_NAME = ".skill-deploy.lock"
+PUBLISH_LOCK_TIMEOUT_SECONDS = 5.0
+PUBLISH_LOCK_POLL_SECONDS = 0.01
 RUNTIME_TARGETS = (".codex", ".claude")
 BLOCKING_STATES = frozenset({"stale", "runtime-edited", "branch-sourced"})
+# A stale deployment still matches its manifest; only the recorded source moved
+# on. That is the expected state between merging a bundled-skill change and
+# refreshing the deployment, and it is repaired by the post-integration refresh
+# rather than by an operator. Blocking worker launch on it would halt every
+# board on the host until someone reinstalls by hand, so preflight blocks only
+# where the installed content or its provenance is unknown.
+WORKER_BLOCKING_STATES = frozenset({"runtime-edited", "branch-sourced"})
+WORKER_ADVISORY_STATES = BLOCKING_STATES - WORKER_BLOCKING_STATES
 
 
 class SkillDeploymentError(RuntimeError):
@@ -76,6 +95,13 @@ class VerificationReport:
             or any(entry.state in BLOCKING_STATES for entry in self.entries)
         )
 
+    @property
+    def worker_blocking(self) -> bool:
+        return bool(
+            self.manifest_error
+            or any(entry.state in WORKER_BLOCKING_STATES for entry in self.entries)
+        )
+
     def to_json(self) -> dict[str, object]:
         return {
             "target_root": str(self.target_root),
@@ -85,6 +111,7 @@ class VerificationReport:
             "unmanaged": list(self.unmanaged),
             "drifted": self.drifted,
             "blocking": self.blocking,
+            "worker_blocking": self.worker_blocking,
         }
 
 
@@ -93,6 +120,95 @@ def target_roots(home: Path) -> tuple[Path, Path]:
         home / RUNTIME_TARGETS[0] / "skills",
         home / RUNTIME_TARGETS[1] / "skills",
     )
+
+
+def publish_lock_path(target_root: Path) -> Path:
+    """Publish mutex for one runtime root.
+
+    It sits beside the root rather than inside it so the verifier keeps
+    reporting exactly the deployed tree and never counts the lock as unmanaged.
+    """
+    return target_root.parent / PUBLISH_LOCK_NAME
+
+
+@contextmanager
+def publishing_target_root(target_root: Path) -> Iterator[None]:
+    """Hold the publish mutex while one runtime root is rewritten.
+
+    Managed files are replaced one at a time and the manifest is written last,
+    so a reader landing mid-publish would see installed content that no longer
+    matches the recorded digest and classify the root as `runtime-edited`. That
+    became reachable without an operator present once integration started
+    refreshing deployments, so writers take this lock and readers wait for it.
+    """
+    path = publish_lock_path(target_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        _lock_handle(handle, exclusive=True)
+        try:
+            yield
+        finally:
+            _unlock_handle(handle)
+
+
+@contextmanager
+def reading_target_root(target_root: Path) -> Iterator[None]:
+    """Wait for an in-flight publish before reading one runtime root.
+
+    Verification stays read-only: a root that no writer has ever locked has no
+    lock file and is read directly. A writer that outlives the timeout is worse
+    than a torn read, so the wait is bounded and then abandoned.
+    """
+    path = publish_lock_path(target_root)
+    if fcntl is None or not path.is_file():
+        yield
+        return
+    try:
+        handle = path.open("rb")
+    except OSError:
+        yield
+        return
+    with handle:
+        locked = _lock_handle_until(handle, PUBLISH_LOCK_TIMEOUT_SECONDS)
+        try:
+            yield
+        finally:
+            if locked:
+                _unlock_handle(handle)
+
+
+def _lock_handle(handle, *, exclusive: bool) -> None:
+    if fcntl is None:  # pragma: no cover - platform dependent
+        return
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0 and exclusive:
+        handle.write(b"\0")
+        handle.flush()
+    fcntl.flock(
+        handle.fileno(),
+        fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH,
+    )
+
+
+def _lock_handle_until(handle, timeout_seconds: float) -> bool:
+    if fcntl is None:  # pragma: no cover - platform dependent
+        return False
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(PUBLISH_LOCK_POLL_SECONDS)
+        else:
+            return True
+
+
+def _unlock_handle(handle) -> None:
+    if fcntl is None:  # pragma: no cover - platform dependent
+        return
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def selected_target_roots(
@@ -156,9 +272,18 @@ def deploy_skill_bundle(
     package_name: str | None = None,
     source_repository: str | None = None,
     report_diagnostic: Callable[[str], None] | None = None,
+    roots: Sequence[Path] | None = None,
 ) -> list[Path]:
+    """Install `skill_names` into this home's runtime roots.
+
+    An explicit `roots` writes exactly those runtime roots instead of both, so
+    a caller repairing an existing deployment does not create one the operator
+    never installed. It also selects the reported paths, replacing `codex` and
+    `claude`, which only filter the report of an install that wrote both.
+    """
     source_root = source_root.resolve()
     names = tuple(skill_names)
+    write_roots = target_roots(home) if roots is None else _requested_roots(home, roots)
     source_state = inspect_source(
         source_root,
         package_name=package_name,
@@ -182,10 +307,69 @@ def deploy_skill_bundle(
 
     source_files = _source_files(source_root, names)
     installed_at = datetime.now(timezone.utc).isoformat()
-    roots = target_roots(home)
     manifests: dict[Path, dict[str, object]] = {}
     diagnostics: list[str] = []
+    with ExitStack() as publish:
+        # Locks are taken in one fixed order and held across the overwrite
+        # check as well as the write, so a concurrent installer can neither
+        # interleave a publish nor invalidate the check that authorized it.
+        for root in write_roots:
+            publish.enter_context(publishing_target_root(root))
+        _publish_skill_bundle(
+            source_files=source_files,
+            source_state=source_state,
+            names=names,
+            write_roots=write_roots,
+            manifests=manifests,
+            diagnostics=diagnostics,
+            installed_at=installed_at,
+            main_branch=main_branch,
+            force=force,
+            report_diagnostic=report_diagnostic,
+        )
+
+    reported_roots = (
+        write_roots
+        if roots is not None
+        else selected_target_roots(home, codex=codex, claude=claude)
+    )
+    return [root / name for root in reported_roots for name in names]
+
+
+def _requested_roots(home: Path, roots: Sequence[Path]) -> tuple[Path, ...]:
+    # Callers derive roots from verification reports, which carry resolved
+    # paths, so match on the resolved form and write the home-relative one.
+    known = {root.resolve(): root for root in target_roots(home)}
+    selected: list[Path] = []
+    unknown: list[str] = []
     for root in roots:
+        match = known.get(Path(root).resolve())
+        if match is None:
+            unknown.append(str(root))
+        elif match not in selected:
+            selected.append(match)
+    if unknown:
+        raise SkillDeploymentError(
+            "refusing to install into a path that is not a runtime root of this "
+            f"home: {', '.join(sorted(unknown))}"
+        )
+    return tuple(root for root in target_roots(home) if root in selected)
+
+
+def _publish_skill_bundle(
+    *,
+    source_files: dict[str, Path],
+    source_state: SourceState,
+    names: Sequence[str],
+    write_roots: Sequence[Path],
+    manifests: dict[Path, dict[str, object]],
+    diagnostics: list[str],
+    installed_at: str,
+    main_branch: str,
+    force: bool,
+    report_diagnostic: Callable[[str], None] | None,
+) -> None:
+    for root in write_roots:
         try:
             manifest = _load_manifest(root, allow_missing=True)
         except SkillDeploymentError as exc:
@@ -228,7 +412,7 @@ def deploy_skill_bundle(
         for diagnostic in diagnostics:
             report_diagnostic(diagnostic)
 
-    for root in roots:
+    for root in write_roots:
         root.mkdir(parents=True, exist_ok=True)
         manifest = manifests[root]
         old_entries = _manifest_entries(manifest)
@@ -245,9 +429,12 @@ def deploy_skill_bundle(
         for relative_path, source in source_files.items():
             target = root / relative_path
             target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_name(f".{target.name}.skill-deploy-new")
-            shutil.copy2(source, temporary)
-            os.replace(temporary, target)
+            temporary = target.with_name(f".{target.name}.{_scratch_suffix()}")
+            try:
+                shutil.copy2(source, temporary)
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
             entries[relative_path] = {
                 "source_repo": str(source_state.repo),
                 "source_commit": source_state.commit,
@@ -265,9 +452,6 @@ def deploy_skill_bundle(
             "entries": dict(sorted(entries.items())),
         }
         _write_manifest(root, payload)
-
-    reported_roots = selected_target_roots(home, codex=codex, claude=claude)
-    return [root / name for root in reported_roots for name in names]
 
 
 def verify_skill_deployments(
@@ -292,6 +476,40 @@ def verify_worker_skill_deployments(home: Path) -> tuple[VerificationReport, ...
             continue
         reports.append(report)
     return tuple(reports)
+
+
+def worker_launch_verdict(
+    reports: Sequence[VerificationReport],
+) -> tuple[tuple[VerificationReport, ...], tuple[str, ...]]:
+    """Split worker preflight reports into blocking reports and advisory lines.
+
+    Callers must refuse to launch when the blocking tuple is non-empty and
+    surface the advisory lines otherwise; see `WORKER_BLOCKING_STATES`.
+    """
+    blocking = tuple(report for report in reports if report.worker_blocking)
+    advisories = tuple(
+        f"{entry.target_root / entry.relative_path}: {entry.state}"
+        + (f": {entry.detail}" if entry.detail else "")
+        for report in reports
+        for entry in report.entries
+        if entry.state in WORKER_ADVISORY_STATES
+    )
+    return blocking, advisories
+
+
+def stale_deployment_entries(
+    reports: Sequence[VerificationReport],
+    *,
+    skill_names: Iterable[str],
+) -> tuple[VerificationEntry, ...]:
+    """Entries whose installed copy still matches a manifest the source left."""
+    names = frozenset(skill_names)
+    return tuple(
+        entry
+        for report in reports
+        for entry in report.entries
+        if entry.state == "stale" and entry.relative_path.split("/", 1)[0] in names
+    )
 
 
 def deployment_drift_advisories(
@@ -379,26 +597,27 @@ def deployment_drift_advisories(
 
 def verify_target_root(target_root: Path) -> VerificationReport:
     target_root = target_root.resolve()
-    try:
-        manifest = _load_manifest(target_root, allow_missing=False)
-    except SkillDeploymentError as exc:
+    with reading_target_root(target_root):
+        try:
+            manifest = _load_manifest(target_root, allow_missing=False)
+        except SkillDeploymentError as exc:
+            return VerificationReport(
+                target_root=target_root,
+                entries=(),
+                unmanaged=_unmanaged_paths(target_root, frozenset()),
+                manifest_error=str(exc),
+            )
+
+        manifest_entries = _manifest_entries(manifest)
+        entries = tuple(
+            _verify_entry(target_root, relative_path, recorded)
+            for relative_path, recorded in sorted(manifest_entries.items())
+        )
         return VerificationReport(
             target_root=target_root,
-            entries=(),
-            unmanaged=_unmanaged_paths(target_root, frozenset()),
-            manifest_error=str(exc),
+            entries=entries,
+            unmanaged=_unmanaged_paths(target_root, frozenset(manifest_entries)),
         )
-
-    manifest_entries = _manifest_entries(manifest)
-    entries = tuple(
-        _verify_entry(target_root, relative_path, recorded)
-        for relative_path, recorded in sorted(manifest_entries.items())
-    )
-    return VerificationReport(
-        target_root=target_root,
-        entries=entries,
-        unmanaged=_unmanaged_paths(target_root, frozenset(manifest_entries)),
-    )
 
 
 def render_verification_reports(
@@ -599,12 +818,22 @@ def _manifest_entries(manifest: dict[str, object]) -> dict[str, dict[str, object
 
 def _write_manifest(target_root: Path, payload: dict[str, object]) -> None:
     path = target_root / MANIFEST_NAME
-    temporary = target_root / f".{MANIFEST_NAME}.new"
-    temporary.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    temporary = target_root / f".{MANIFEST_NAME}.{_scratch_suffix()}"
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _scratch_suffix() -> str:
+    # Deployment is now also driven automatically after integration, so two
+    # runtimes can install concurrently. A shared scratch name would let one
+    # writer publish the other's partially copied file.
+    return f"{os.getpid()}.{uuid.uuid4().hex}.skill-deploy-new"
 
 
 def _owned_path(
