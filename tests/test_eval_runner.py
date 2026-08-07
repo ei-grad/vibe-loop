@@ -22,6 +22,8 @@ from vibe_loop.eval_runner import (
     build_aggregate,
     build_eval_prompt,
     collect_git_state,
+    evidence_backed_workflow_events,
+    execute_agent_command,
     render_aggregate_markdown,
     safe_workspace_dirty_summary,
     score_trial,
@@ -30,13 +32,190 @@ from vibe_loop.eval_runner import (
     workflow_events_for_trial,
     workflow_taxonomy_labels,
 )
-from vibe_loop.eval_examples import list_eval_example_cases, materialize_eval_example
+from vibe_loop.eval_examples import (
+    list_eval_example_cases,
+    load_eval_example_case,
+    materialize_eval_example,
+)
 from vibe_loop.config import load_config
 from vibe_loop.evals import EVAL_FAILURE_TAXONOMY, EvalSafeEnvelopeError
 from vibe_loop.runner import VibeRunner
 
 
 class EvalRunnerCliTests(unittest.TestCase):
+    def test_eval_agent_environment_replaces_outer_worker_identity(self) -> None:
+        case = load_eval_example_case("workspace-duplicate-worktree")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = materialize_eval_example(case.case_id, root / "repo")
+            artifact_root = root / "artifacts"
+            artifact_root.mkdir()
+            captured: dict[str, str] = {}
+
+            def capture_process(_command, *, env, **_kwargs):
+                captured.update(env)
+                return "", "", 0, False, False
+
+            outer_runtime = {
+                "VIBE_LOOP_BRANCH": "outer-branch",
+                "VIBE_LOOP_FENCING_TOKEN": "outer-token",
+                "VIBE_LOOP_LOG": "/outer/run.log",
+                "VIBE_LOOP_REPO": "/outer/repo",
+                "VIBE_LOOP_RUN_ID": "outer-run",
+                "VIBE_LOOP_STATE_DIR": "/outer/state",
+                "VIBE_LOOP_TASK_ID": "OUTER-01",
+                "VIBE_LOOP_WORKTREE": "/outer/worktree",
+            }
+            with (
+                patch.dict(os.environ, outer_runtime),
+                patch(
+                    "vibe_loop.eval_runner.run_process_with_budgets",
+                    side_effect=capture_process,
+                ),
+            ):
+                execute_agent_command(
+                    "agent",
+                    cwd=repo,
+                    artifact_root=artifact_root,
+                    case=case,
+                    condition="vibe_loop_cli",
+                    trial=1,
+                    run_id="fixture-run",
+                    prompt_text="DUP-01",
+                    prompt_paths=("eval/prompt.txt",),
+                    budgets={
+                        "timeout_seconds": 1,
+                        "max_commands": 1,
+                        "max_output_bytes": 1024,
+                    },
+                )
+
+        self.assertEqual(captured["VIBE_LOOP_REPO"], str(repo))
+        self.assertEqual(captured["VIBE_LOOP_WORKTREE"], str(repo))
+        self.assertEqual(captured["VIBE_LOOP_BRANCH"], "main")
+        self.assertEqual(captured["VIBE_LOOP_STATE_DIR"], str(repo / ".vibe-loop"))
+        self.assertEqual(captured["VIBE_LOOP_RUN_ID"], "fixture-run")
+        self.assertEqual(captured["VIBE_LOOP_TASK_ID"], "DUP-01")
+        self.assertNotIn("VIBE_LOOP_FENCING_TOKEN", captured)
+        self.assertNotIn("VIBE_LOOP_LOG", captured)
+
+    def test_codex_prompt_and_task_source_reads_project_workflow_events(self) -> None:
+        execution = CommandExecution(
+            command="codex exec '$vibe-loop LIST-02'",
+            exit_code=0,
+            stdout="completed LIST-02 from WORK.md\n",
+            stderr="/bin/zsh -lc 'sed -n 1,200p WORK.md' in /repo\n",
+            started_at="2026-05-09T00:00:00+00:00",
+            finished_at="2026-05-09T00:00:01+00:00",
+            duration_seconds=1.0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            events = workflow_events_for_trial(
+                Path(directory),
+                execution,
+                (),
+                allow_artifact_events=False,
+                task_source={
+                    "type": "markdown-profile",
+                    "profile": {"source_paths": ["WORK.md"]},
+                },
+            )
+
+        self.assertIn("skill_activated", events)
+        self.assertIn("task_source_inspected", events)
+
+    def test_codex_tool_activity_does_not_imply_skill_activation(self) -> None:
+        execution = CommandExecution(
+            command="codex exec 'summarize git status'",
+            exit_code=0,
+            stdout=json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": "/bin/zsh -lc 'git status --short'",
+                    },
+                }
+            ),
+            stderr="",
+            started_at="2026-05-09T00:00:00+00:00",
+            finished_at="2026-05-09T00:00:01+00:00",
+            duration_seconds=1.0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            events = workflow_events_for_trial(
+                Path(directory), execution, (), allow_artifact_events=False
+            )
+
+        self.assertIn("worktree_state_inspected", events)
+        self.assertNotIn("skill_activated", events)
+
+    def test_validated_post_run_evidence_projects_workflow_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "lock-evidence.json").write_text(
+                json.dumps(
+                    {
+                        "before": {"task_id": "TASK-01", "run_id": "run-01"},
+                        "acquire": {
+                            "owner_task_id": "TASK-01",
+                            "run_id": "run-01",
+                        },
+                        "release": {"released": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "report-evidence.json").write_text(
+                json.dumps(
+                    {
+                        "latest": {
+                            "status": "blocked",
+                            "reason": "duplicate_branch_worktrees",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "review-evidence.json").write_text(
+                json.dumps(
+                    {
+                        "initial": {"material_findings_count": 1},
+                        "rereview": {"material_findings_count": 0},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            events = evidence_backed_workflow_events(
+                root,
+                (
+                    "verification_ran",
+                    "commit_created",
+                    "main_fast_forwarded",
+                    "main_verification_ran",
+                ),
+            )
+
+        for event in (
+            "task_lock_acquired",
+            "review_requested",
+            "review_finding_received",
+            "review_finding_addressed",
+            "rereview_requested",
+            "main_integration_lock_acquired",
+            "main_integration_lock_released",
+            "workspace_preflight_blocked",
+            "worker_report_emitted",
+        ):
+            self.assertIn(event, events)
+        self.assertLess(
+            events.index("review_requested"), events.index("commit_created")
+        )
+        self.assertLess(
+            events.index("main_integration_lock_acquired"),
+            events.index("main_fast_forwarded"),
+        )
+
     def test_secret_like_output_is_retained_only_in_run_logs(self) -> None:
         canary = "EVAL_OUTPUT_SECRET_CANARY"
         grader_canary = "EVAL_GRADER_SECRET_CANARY"

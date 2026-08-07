@@ -797,6 +797,7 @@ def run_trial(
                 git_after=git_after,
                 grader_output=deterministic,
                 condition=condition,
+                task_source=case.task_source,
             )
         else:
             workflow_events = workflow_events_for_trial(
@@ -809,11 +810,11 @@ def run_trial(
                 grader_output=deterministic,
                 condition=condition,
                 extra_events=agent_batch.workflow_events,
+                task_source=case.task_source,
             )
     except EvalSafeEnvelopeError:
         workflow_events = []
         evidence_diagnostics.append("workflow event evidence rejected")
-    write_json_artifact(trial_root, "workflow_events", {"events": workflow_events})
     lock_after = collect_lock_state(lock_manager, case.task_id)
     write_lock_evidence(
         trial_root,
@@ -836,6 +837,8 @@ def run_trial(
         sanitize_review_evidence(trial_root)
     except EvalSafeEnvelopeError:
         evidence_diagnostics.append("review evidence rejected")
+    workflow_events = evidence_backed_workflow_events(trial_root, workflow_events)
+    write_json_artifact(trial_root, "workflow_events", {"events": workflow_events})
     evidence_diagnostics.extend(
         write_missing_case_role_artifacts(
             trial_root,
@@ -1362,6 +1365,18 @@ def execute_agent_command(
         )
 
     env = os.environ.copy()
+    for key in (
+        "VIBE_LOOP_BRANCH",
+        "VIBE_LOOP_FENCING_TOKEN",
+        "VIBE_LOOP_LOG",
+        "VIBE_LOOP_REPO",
+        "VIBE_LOOP_RUN_ID",
+        "VIBE_LOOP_STATE_DIR",
+        "VIBE_LOOP_TASK_ID",
+        "VIBE_LOOP_WORKTREE",
+    ):
+        env.pop(key, None)
+    fixture_branch = git_output(cwd, "branch", "--show-current") or "HEAD"
     env.update(
         {
             "PYTHONIOENCODING": "utf-8",
@@ -1383,6 +1398,9 @@ def execute_agent_command(
             "VIBE_LOOP_RUN_ID": run_id,
             "VIBE_LOOP_TASK_ID": case.task_id or "",
             "VIBE_LOOP_REPO": str(cwd),
+            "VIBE_LOOP_WORKTREE": str(cwd),
+            "VIBE_LOOP_BRANCH": fixture_branch,
+            "VIBE_LOOP_STATE_DIR": str(cwd / ".vibe-loop"),
         }
     )
     stdout, stderr, exit_code, timeout, truncated = run_process_with_budgets(
@@ -1829,10 +1847,17 @@ def workflow_events_for_trial(
     grader_output: Mapping[str, object] | None = None,
     condition: str = "",
     extra_events: Sequence[str] = (),
+    task_source: Mapping[str, object] | None = None,
 ) -> list[str]:
     existing = artifact_path(artifact_root, "workflow_events")
     events: list[str] = []
     events.extend(extra_events)
+    if skill_invoked_by_agent_command(execution.command):
+        events.append("skill_activated")
+    if task_source and task_source_inspected_in_output(
+        execution.stdout + execution.stderr, task_source
+    ):
+        events.append("task_source_inspected")
     if allow_artifact_events and existing.is_file():
         loaded = load_json(existing)
         raw_events = loaded.get("events") if isinstance(loaded, Mapping) else loaded
@@ -1920,10 +1945,119 @@ def detect_events_from_repo_state(
         if "verification_ran" in events:
             events.append("main_verification_ran")
 
-    if events and condition != "no_skill":
-        events.append("skill_activated")
-
     return events
+
+
+def skill_invoked_by_agent_command(command: str) -> bool:
+    return (
+        re.search(
+            r"(?:^|[\s'\"])[$/](?:orchestrated-|infinite-)?vibe-loop(?=\s|['\"]|$)",
+            command,
+        )
+        is not None
+    )
+
+
+def task_source_inspected_in_output(
+    text: str, task_source: Mapping[str, object]
+) -> bool:
+    tokens: list[str] = []
+    plan_path = task_source.get("plan_path")
+    if isinstance(plan_path, str) and plan_path:
+        tokens.append(plan_path)
+    profile = task_source.get("profile")
+    if isinstance(profile, Mapping):
+        tokens.extend(string_list(profile.get("source_paths")))
+    for key in ("list_command", "probe_command"):
+        command = task_source.get(key)
+        if isinstance(command, str) and command:
+            tokens.append(command.replace("{task_id}", "").strip())
+    if task_source.get("type") == "command":
+        tokens.extend(("vibe-loop tasks", "vibe-loop next"))
+    return any(token in text for token in tokens)
+
+
+def evidence_backed_workflow_events(
+    artifact_root: Path, events: Sequence[str]
+) -> list[str]:
+    projected = list(unique_preserving_order(events))
+    lock_evidence = load_json(artifact_path(artifact_root, "lock_evidence"))
+    if isinstance(lock_evidence, Mapping):
+        before = lock_evidence.get("before")
+        if (
+            isinstance(before, Mapping)
+            and isinstance(before.get("task_id"), str)
+            and isinstance(before.get("run_id"), str)
+        ):
+            insert_event_before(projected, "task_lock_acquired", "commit_created")
+        acquire = lock_evidence.get("acquire")
+        if (
+            isinstance(acquire, Mapping)
+            and isinstance(acquire.get("owner_task_id"), str)
+            and isinstance(acquire.get("run_id"), str)
+        ):
+            insert_event_before(
+                projected, "main_integration_lock_acquired", "main_fast_forwarded"
+            )
+        release = lock_evidence.get("release")
+        if isinstance(release, Mapping) and release.get("released") is True:
+            insert_event_after(
+                projected,
+                "main_integration_lock_released",
+                "main_verification_ran",
+            )
+
+    report_evidence = load_json(artifact_path(artifact_root, "report_evidence"))
+    latest = (
+        report_evidence.get("latest") if isinstance(report_evidence, Mapping) else None
+    )
+    if isinstance(latest, Mapping) and latest.get("status") in WORKER_REPORT_STATUSES:
+        projected.append("worker_report_emitted")
+        reason = latest.get("reason")
+        if reason in {
+            "missing_claimed_worktree",
+            "branch_already_merged",
+            "foreign_dirty_claimed_worktree",
+            "duplicate_branch_worktrees",
+        }:
+            insert_event_before(
+                projected, "workspace_preflight_blocked", "worker_report_emitted"
+            )
+        elif reason == "main_integration_lock_unavailable":
+            insert_event_before(
+                projected, "integration_lock_busy_observed", "worker_report_emitted"
+            )
+
+    review_evidence = load_json(artifact_path(artifact_root, "review_evidence"))
+    if isinstance(review_evidence, Mapping):
+        initial = review_evidence.get("initial")
+        rereview = review_evidence.get("rereview")
+        if isinstance(initial, Mapping):
+            insert_event_before(projected, "review_requested", "commit_created")
+            if isinstance(initial.get("material_findings_count"), int) and initial.get(
+                "material_findings_count"
+            ):
+                insert_event_before(
+                    projected, "review_finding_received", "commit_created"
+                )
+        if isinstance(rereview, Mapping):
+            insert_event_before(projected, "review_finding_addressed", "commit_created")
+            insert_event_before(projected, "rereview_requested", "commit_created")
+    return unique_preserving_order(projected)
+
+
+def insert_event_before(events: list[str], event: str, anchor: str) -> None:
+    if event in events:
+        return
+    index = events.index(anchor) if anchor in events else len(events)
+    events.insert(index, event)
+
+
+def insert_event_after(events: list[str], event: str, anchor: str) -> None:
+    if event in events:
+        return
+    index = events.index(anchor) + 1 if anchor in events else len(events)
+    events.insert(index, event)
 
 
 def git_branch_names(value: object) -> set[str]:
@@ -2105,7 +2239,6 @@ def _events_for_tool_use(
 def parse_stream_json(text: str) -> tuple[str, list[str]]:
     result_text = ""
     events: list[str] = []
-    has_tools = False
     skill_triggered = False
     saw_merge = False
 
@@ -2133,7 +2266,6 @@ def parse_stream_json(text: str) -> tuple[str, list[str]]:
             command = item.get("command")
             if not isinstance(command, str):
                 continue
-            has_tools = True
             tool_events, _, is_merge = _events_for_tool_use(
                 "Bash", {"command": command}, saw_merge
             )
@@ -2157,7 +2289,6 @@ def parse_stream_json(text: str) -> tuple[str, list[str]]:
             if block.get("type") != "tool_use":
                 continue
             name = block.get("name", "")
-            has_tools = True
             inp = block.get("input", {})
             if not isinstance(inp, dict):
                 inp = {}
@@ -2173,7 +2304,7 @@ def parse_stream_json(text: str) -> tuple[str, list[str]]:
             if is_merge:
                 saw_merge = True
 
-    if skill_triggered or (has_tools and events):
+    if skill_triggered:
         events.append("skill_activated")
 
     return result_text, unique_preserving_order(events)
