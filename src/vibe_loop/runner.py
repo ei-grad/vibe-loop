@@ -1224,6 +1224,21 @@ def _codex_call_id(event: Mapping[str, object]) -> str:
     return ""
 
 
+def shell_command_payload(command: object) -> str | None:
+    if not isinstance(command, str) or not command:
+        return None
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    if not argv or Path(argv[0]).name not in {"bash", "dash", "sh", "zsh"}:
+        return None
+    for index, argument in enumerate(argv[1:-1], start=1):
+        if argument.startswith("-") and "c" in argument[1:]:
+            return argv[index + 1]
+    return None
+
+
 def _invokes_worker_report(command: object, *, depth: int = 0) -> bool:
     if not isinstance(command, str) or not command or depth > 1:
         return False
@@ -1239,10 +1254,9 @@ def _invokes_worker_report(command: object, *, depth: int = 0) -> bool:
         and argv[1:3] == ["run", "vibe-loop"]
     ):
         return argv[3] == "report"
-    if argv and Path(argv[0]).name in {"bash", "dash", "sh", "zsh"}:
-        for index, argument in enumerate(argv[1:-1], start=1):
-            if argument.startswith("-") and "c" in argument[1:]:
-                return _invokes_worker_report(argv[index + 1], depth=depth + 1)
+    payload = shell_command_payload(command)
+    if payload is not None:
+        return _invokes_worker_report(payload, depth=depth + 1)
     return False
 
 

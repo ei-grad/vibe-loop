@@ -21,9 +21,11 @@ from vibe_loop.eval_runner import (
     archive_previous_aggregate_artifacts,
     build_aggregate,
     build_eval_prompt,
+    collect_git_state,
     render_aggregate_markdown,
     safe_workspace_dirty_summary,
     score_trial,
+    shell_command_creates_worktree,
     write_task_source_evidence,
     workflow_events_for_trial,
     workflow_taxonomy_labels,
@@ -1815,52 +1817,45 @@ class EvalRunnerCliTests(unittest.TestCase):
         self.assertIn("integration_lock_busy_observed", events)
 
     def test_codex_json_worktree_command_preserves_event_after_cleanup(self) -> None:
-        stream = json.dumps(
-            {
-                "type": "item.started",
-                "item": {
-                    "type": "command_execution",
-                    "command": (
-                        "/bin/zsh -lc 'git worktree add -b vibe-loop/task-1 "
-                        "../task-1 HEAD'"
-                    ),
-                },
-            }
+        envelope_types = (
+            "item.started",
+            "item.updated",
+            "item.completed",
+            "response.output_item.added",
+            "response.output_item.done",
         )
-        execution = CommandExecution(
-            command="agent",
-            exit_code=0,
-            stdout=stream,
-            stderr="",
-            started_at="2026-05-09T00:00:00+00:00",
-            finished_at="2026-05-09T00:00:01+00:00",
-            duration_seconds=1.0,
-        )
-        git_before = {
-            "head": "a" * 40,
-            "branch": "main",
-            "branch_heads": {"main": "a" * 40},
-            "worktrees": ["worktree /repo", "HEAD " + "a" * 40],
-        }
-        git_after = {
-            "head": "b" * 40,
-            "branch": "main",
-            "branch_heads": {"main": "b" * 40},
-            "worktrees": ["worktree /repo", "HEAD " + "b" * 40],
-        }
+        for envelope_type in envelope_types:
+            with self.subTest(envelope_type=envelope_type):
+                stream = json.dumps(
+                    {
+                        "type": envelope_type,
+                        "item": {
+                            "type": "command_execution",
+                            "command": (
+                                "/bin/zsh -lc 'git worktree add -b "
+                                "vibe-loop/task-1 ../task-1 HEAD'"
+                            ),
+                        },
+                    }
+                )
+                execution = CommandExecution(
+                    command="agent",
+                    exit_code=0,
+                    stdout=stream,
+                    stderr="",
+                    started_at="2026-05-09T00:00:00+00:00",
+                    finished_at="2026-05-09T00:00:01+00:00",
+                    duration_seconds=1.0,
+                )
+                with tempfile.TemporaryDirectory() as directory:
+                    events = workflow_events_for_trial(
+                        Path(directory),
+                        execution,
+                        (),
+                        allow_artifact_events=False,
+                    )
 
-        with tempfile.TemporaryDirectory() as directory:
-            events = workflow_events_for_trial(
-                Path(directory),
-                execution,
-                (),
-                allow_artifact_events=False,
-                git_before=git_before,
-                git_after=git_after,
-                condition="vibe_loop",
-            )
-
-        self.assertIn("branch_or_worktree_created", events)
+                self.assertIn("branch_or_worktree_created", events)
 
     def test_codex_json_search_for_worktree_command_does_not_emit_event(self) -> None:
         stream = json.dumps(
@@ -1902,14 +1897,12 @@ class EvalRunnerCliTests(unittest.TestCase):
         git_before = {
             "head": "a" * 40,
             "branch": "main",
-            "branches": ["main"],
             "branch_heads": {"main": "a" * 40},
             "worktrees": ["worktree /repo", "HEAD " + "a" * 40],
         }
         git_after = {
             "head": "b" * 40,
             "branch": "main",
-            "branches": ["main", "vibe-loop/task-1"],
             "branch_heads": {"main": "b" * 40, "vibe-loop/task-1": "b" * 40},
             "worktrees": [
                 "worktree /repo",
@@ -1948,14 +1941,12 @@ class EvalRunnerCliTests(unittest.TestCase):
         git_before = {
             "head": "a" * 40,
             "branch": "main",
-            "branches": ["main"],
             "branch_heads": {"main": "a" * 40},
             "worktrees": ["worktree /repo", "HEAD " + "a" * 40],
         }
         git_after = {
             "head": "b" * 40,
             "branch": "main",
-            "branches": ["main"],
             "branch_heads": {"main": "b" * 40},
             "worktrees": ["worktree /repo", "HEAD " + "b" * 40],
         }
@@ -1986,14 +1977,12 @@ class EvalRunnerCliTests(unittest.TestCase):
         git_before = {
             "head": "b" * 40,
             "branch": "main",
-            "branches": ["main"],
             "branch_heads": {"main": "b" * 40},
             "worktrees": ["worktree /repo", "HEAD " + "b" * 40],
         }
         git_after = {
             "head": "a" * 40,
             "branch": "HEAD",
-            "branches": ["(HEAD detached at aaaaaaa)", "main"],
             "branch_heads": {"main": "b" * 40},
             "worktrees": ["worktree /repo", "HEAD " + "a" * 40],
         }
@@ -2012,45 +2001,53 @@ class EvalRunnerCliTests(unittest.TestCase):
         self.assertNotIn("branch_or_worktree_created", events)
 
     def test_rendered_worktree_command_preserves_event_after_cleanup(self) -> None:
-        execution = CommandExecution(
-            command="agent",
-            exit_code=0,
-            stdout="",
-            stderr=(
-                "\x1b[1m/bin/zsh -lc 'git worktree add -b vibe-loop/task-1 "
-                "../task-1 HEAD'\x1b[0m in /repo\n"
-            ),
-            started_at="2026-05-09T00:00:00+00:00",
-            finished_at="2026-05-09T00:00:01+00:00",
-            duration_seconds=1.0,
+        renderings = (
+            "/bin/zsh -lc 'git worktree add ../task-1 -b vibe-loop/task-1'",
+            '/usr/bin/bash -c "git worktree add ../task-1 -b vibe-loop/task-1"',
+            "dash -c 'git worktree add ../task-1 -b vibe-loop/task-1'",
         )
-        git_before = {
-            "head": "a" * 40,
-            "branch": "main",
-            "branches": ["main"],
-            "branch_heads": {"main": "a" * 40},
-            "worktrees": ["worktree /repo", "HEAD " + "a" * 40],
-        }
-        git_after = {
-            "head": "b" * 40,
-            "branch": "main",
-            "branches": ["main"],
-            "branch_heads": {"main": "b" * 40},
-            "worktrees": ["worktree /repo", "HEAD " + "b" * 40],
-        }
+        for rendering in renderings:
+            with self.subTest(rendering=rendering):
+                execution = CommandExecution(
+                    command="agent",
+                    exit_code=0,
+                    stdout="",
+                    stderr=f"\x1b[1m{rendering}\x1b[0m in /repo\n",
+                    started_at="2026-05-09T00:00:00+00:00",
+                    finished_at="2026-05-09T00:00:01+00:00",
+                    duration_seconds=1.0,
+                )
+                with tempfile.TemporaryDirectory() as directory:
+                    events = workflow_events_for_trial(
+                        Path(directory), execution, (), allow_artifact_events=False
+                    )
 
-        with tempfile.TemporaryDirectory() as directory:
-            events = workflow_events_for_trial(
-                Path(directory),
-                execution,
-                (),
-                allow_artifact_events=False,
-                git_before=git_before,
-                git_after=git_after,
-                condition="vibe_loop",
+                self.assertIn("branch_or_worktree_created", events)
+
+    def test_worktree_command_detection_handles_shell_control_flow(self) -> None:
+        commands = (
+            "cd /repo\ngit worktree add ../wt -b task",
+            "cd /repo && \\\n  git worktree add ../wt -b task",
+            "if true; then git worktree add ../wt -b task; fi",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertTrue(shell_command_creates_worktree(command))
+
+    def test_collect_git_state_does_not_run_dead_branch_listing(self) -> None:
+        with (
+            patch("vibe_loop.eval_runner.git_output", return_value="") as git_output,
+            patch("vibe_loop.eval_runner.local_branch_heads", return_value={}),
+        ):
+            state = collect_git_state(Path("/repo"))
+
+        self.assertNotIn("branches", state)
+        self.assertFalse(
+            any(
+                "--format=%(refname:short)" in call.args
+                for call in git_output.mock_calls
             )
-
-        self.assertIn("branch_or_worktree_created", events)
+        )
 
     def test_rendered_search_for_worktree_command_does_not_emit_event(self) -> None:
         execution = CommandExecution(

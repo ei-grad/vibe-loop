@@ -61,7 +61,11 @@ from vibe_loop.evals import (
     validate_skill_eval_run_record,
 )
 from vibe_loop.runs import RunStore, WORKER_REPORT_STATUSES
-from vibe_loop.runner import VibeRunner
+from vibe_loop.runner import (
+    CODEX_ITEM_ENVELOPE_TYPES,
+    VibeRunner,
+    shell_command_payload,
+)
 from vibe_loop.tasks import build_task_source, runnable_tasks
 from vibe_loop.workers import build_worker_views
 
@@ -1937,23 +1941,27 @@ def git_worktree_count(value: object) -> int:
 
 
 ANSI_ESCAPE_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-RENDERED_SHELL_COMMAND = re.compile(r"^/bin/(?:ba|z)?sh\s+-lc\s+")
 WORKTREE_CREATION_COMMAND = re.compile(
-    r"(?:^|&&\s*|\|\|\s*|;\s*)['\"]?"
+    r"(?:^|(?:&&|\|\||;|[\r\n])\s*(?:(?:then|do|else)\s+)?)['\"]?"
     r"git\s+(?:worktree\s+add|checkout\s+-b)\b"
 )
 
 
 def shell_command_creates_worktree(command: str) -> bool:
     normalized = ANSI_ESCAPE_SEQUENCE.sub("", command).strip()
-    normalized = RENDERED_SHELL_COMMAND.sub("", normalized, count=1)
+    normalized = re.sub(r"\\\r?\n", " ", normalized)
+    for _ in range(2):
+        payload = shell_command_payload(normalized)
+        if payload is None:
+            break
+        normalized = payload.strip()
     return WORKTREE_CREATION_COMMAND.search(normalized) is not None
 
 
 def transient_worktree_events_from_output(text: str) -> list[str]:
     for raw_line in text.splitlines():
         line = ANSI_ESCAPE_SEQUENCE.sub("", raw_line).strip()
-        if not RENDERED_SHELL_COMMAND.match(line):
+        if shell_command_payload(line) is None:
             continue
         if shell_command_creates_worktree(line):
             return ["branch_or_worktree_created"]
@@ -2118,7 +2126,7 @@ def parse_stream_json(text: str) -> tuple[str, list[str]]:
             result_text = obj.get("result", "") or ""
             continue
 
-        if obj_type == "item.started":
+        if obj_type in CODEX_ITEM_ENVELOPE_TYPES:
             item = obj.get("item")
             if not isinstance(item, dict) or item.get("type") != "command_execution":
                 continue
@@ -2931,9 +2939,6 @@ def collect_git_state(repo: Path) -> dict[str, object]:
         "branch": git_output(repo, "branch", "--show-current") or "HEAD",
         "dirty": bool(status.strip()),
         "status_short": status.splitlines(),
-        "branches": git_output(
-            repo, "branch", "--format=%(refname:short)"
-        ).splitlines(),
         "branch_heads": local_branch_heads(repo),
         "worktrees": git_output(repo, "worktree", "list", "--porcelain").splitlines(),
     }
