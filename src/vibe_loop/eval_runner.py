@@ -111,10 +111,25 @@ DELEGATION_SPAWN_TOOLS = frozenset({"agent", "delegate_agent", "spawn_agent", "t
 DELEGATION_FOLLOWUP_TOOLS = frozenset({"followup_task", "send_message", "sendmessage"})
 DELEGATION_WAIT_TOOLS = frozenset({"wait", "wait_agent", "wait_for_agent"})
 DELEGATION_DESCRIPTION_FIELDS = ("message", "prompt", "task_name", "description")
+DELEGATION_LABEL_FIELDS = ("task_name", "description")
 DELEGATION_AGENT_ID_FIELDS = ("target", "to", "agent_id", "name")
 DELEGATION_COMPLETED_STATES = frozenset({"completed", "done", "finished", "success"})
-REMEDIATION_ACTION_PATTERN = re.compile(
-    r"\b(?:remediat\w*|address\w*|fix|fixes|fixing|resolv\w*|correct\w*)\b"
+# Ordered by role, matched by position rather than precedence. Suffixes are
+# bounded so a noun like "correctness" is not read as the directive "correct".
+DELEGATION_ROLE_PATTERNS = (
+    (
+        "remediator",
+        re.compile(
+            r"\b(?:remediat\w*|address(?:es|ed|ing)?|fix(?:es|ed|ing)?"
+            r"|resolv\w*|correct(?:s|ed|ing)?)\b"
+        ),
+    ),
+    ("reviewer", re.compile(r"\b(?:review\w*|audit\w*|critiqu\w*)")),
+    ("explorer", re.compile(r"\b(?:explor\w*|investigat\w*)")),
+    (
+        "implementer",
+        re.compile(r"\b(?:implement\w*|build\w*|chang\w*|modif\w*)"),
+    ),
 )
 STRUCTURED_ARTIFACT_TOP_LEVEL_FIELDS = {
     "aggregate.json": {
@@ -2402,6 +2417,26 @@ def structured_tool_arguments(value: object) -> dict[str, object] | None:
     return None
 
 
+def delegation_role_from_text(text: str) -> str | None:
+    """Resolve the role a delegation assigns, by its leading directive.
+
+    Assignment prose routinely names other roles in passing -- a reviewer is
+    told to report findings, or not to fix anything -- so counting keywords
+    misreads those mentions. The directive that opens the assignment is what
+    the receiving agent is being asked to do.
+    """
+    leading_role: str | None = None
+    leading_index: int | None = None
+    for role, pattern in DELEGATION_ROLE_PATTERNS:
+        match = pattern.search(text)
+        if match is None:
+            continue
+        if leading_index is None or match.start() < leading_index:
+            leading_role = role
+            leading_index = match.start()
+    return leading_role
+
+
 def delegation_events_for_tool(name: str, inp: Mapping[str, object]) -> list[str]:
     normalized = name.casefold().replace("-", "_")
     if normalized in DELEGATION_FOLLOWUP_TOOLS:
@@ -2410,34 +2445,40 @@ def delegation_events_for_tool(name: str, inp: Mapping[str, object]) -> list[str
         followup = False
     else:
         return []
+    label = " ".join(
+        str(inp.get(key, "")) for key in DELEGATION_LABEL_FIELDS
+    ).casefold()
     description = " ".join(
         str(inp.get(key, "")) for key in DELEGATION_DESCRIPTION_FIELDS
     ).casefold()
-    if followup and any(
-        marker in description
-        for marker in ("closure review", "closure check", "re-review", "rereview")
-    ):
-        return ["review_finding_addressed", "rereview_requested"]
-    # A reviewer assignment normally names findings as its deliverable, so a
-    # finding mention alone does not make a call remediation: remediation also
-    # asks for an action on that finding.
-    if "remediat" in description or (
-        "finding" in description
-        and REMEDIATION_ACTION_PATTERN.search(description) is not None
-    ):
-        if followup:
+    if followup:
+        if any(
+            marker in description
+            for marker in ("closure review", "closure check", "re-review", "rereview")
+        ):
+            return ["review_finding_addressed", "rereview_requested"]
+        # A follow-up to an agent that already ran, about a finding, is the
+        # handback of that finding however the message is worded.
+        if "remediat" in description or "finding" in description:
             return ["review_finding_received", "remediation_delegated"]
-        return ["remediation_delegated"]
-    if "review" in description:
+    # A short assignment label states the role directly; free-text prose is only
+    # consulted when no label is given.
+    role = delegation_role_from_text(label) or delegation_role_from_text(description)
+    if role == "remediator" and "remediat" not in description:
+        # A spawn opens a new assignment rather than handing a finding back, so
+        # fix/address wording alone describes implementation work.
+        role = "implementer"
+    if role == "reviewer":
         if followup:
             return ["rereview_requested"]
         return ["review_requested", "review_delegated"]
-    if "explor" in description or "investigat" in description:
+    if role == "remediator":
+        if followup:
+            return ["review_finding_received", "remediation_delegated"]
+        return ["remediation_delegated"]
+    if role == "explorer":
         return ["exploration_delegated"]
-    if any(
-        marker in description
-        for marker in ("build", "change", "fix", "implement", "modify")
-    ):
+    if role == "implementer":
         return ["implementation_delegated"]
     return []
 

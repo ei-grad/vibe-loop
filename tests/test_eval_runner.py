@@ -2557,30 +2557,70 @@ class EvalRunnerCliTests(unittest.TestCase):
 
         self.assertEqual([record["role"] for record in evidence], ["reviewer"])
 
-    def test_reviewer_assignment_naming_findings_is_not_remediation(self) -> None:
-        arguments = {
-            "task_name": "review",
-            "message": (
-                "Review the raw diff against acceptance criteria and report "
-                "material findings."
-            ),
-        }
+    def test_delegation_role_follows_the_leading_directive(self) -> None:
+        # Reviewer assignments routinely name remediation words in passing --
+        # as the deliverable, as a quality bar, or as an explicit prohibition.
+        # None of those turn a review into a handback.
+        reviewer_spawns = (
+            "Review the raw diff against acceptance criteria and report "
+            "material findings.",
+            "Review the diff for correctness and report any material findings.",
+            "Review the candidate and report findings; do not fix anything yourself.",
+            "Independent review: report material findings and their severity.",
+            "Review the change, assess correctness, and address nothing yourself.",
+            "Audit the patch and resolve nothing; just report findings.",
+            "Critique the implementation and list every material finding.",
+        )
+        for message in reviewer_spawns:
+            for arguments in ({"message": message}, {"task_name": "review"}):
+                with self.subTest(message=message, arguments=sorted(arguments)):
+                    self.assertEqual(
+                        delegation_events_for_tool("spawn_agent", arguments),
+                        ["review_requested", "review_delegated"],
+                    )
+                    self.assertEqual(
+                        delegation_role_for_tool("spawn_agent", arguments),
+                        "reviewer",
+                    )
 
-        self.assertEqual(
-            delegation_events_for_tool("spawn_agent", arguments),
-            ["review_requested", "review_delegated"],
+        # A spawn opens a new assignment, so fix/address wording is
+        # implementation; only a follow-up hands a finding back.
+        implementer_spawns = (
+            "Fix the failing slug test",
+            "Address the flaky import and add a regression test",
+            "Implement the change",
         )
-        self.assertEqual(delegation_role_for_tool("spawn_agent", arguments), "reviewer")
-        self.assertEqual(
-            delegation_events_for_tool(
-                "followup_task",
-                {
-                    "target": "implementer-1",
-                    "message": "Address the review finding and fix the parser.",
-                },
-            ),
-            ["review_finding_received", "remediation_delegated"],
+        for message in implementer_spawns:
+            with self.subTest(message=message):
+                self.assertEqual(
+                    delegation_events_for_tool("spawn_agent", {"message": message}),
+                    ["implementation_delegated"],
+                )
+
+        handbacks = (
+            "Address the review finding and fix the parser.",
+            "After the review, address the finding.",
+            "Remediate the material finding",
         )
+        for message in handbacks:
+            with self.subTest(message=message):
+                self.assertEqual(
+                    delegation_events_for_tool(
+                        "followup_task",
+                        {"target": "implementer-1", "message": message},
+                    ),
+                    ["review_finding_received", "remediation_delegated"],
+                )
+
+        closures = ("Run a targeted closure review", "Re-review the change")
+        for message in closures:
+            with self.subTest(message=message):
+                self.assertEqual(
+                    delegation_events_for_tool(
+                        "followup_task", {"target": "reviewer-1", "message": message}
+                    ),
+                    ["review_finding_addressed", "rereview_requested"],
+                )
 
     def test_claude_native_delegation_covers_agent_and_handback(self) -> None:
         spawns = (
