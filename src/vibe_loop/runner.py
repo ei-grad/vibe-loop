@@ -165,7 +165,10 @@ from vibe_loop.skill_deployment import (
     verify_worker_skill_deployments,
     worker_launch_verdict,
 )
-from vibe_loop.skills import refresh_stale_skill_deployments
+from vibe_loop.skills import (
+    refresh_stale_skill_deployments,
+    repository_supplies_bundle,
+)
 from vibe_loop.spec_diagnostics import ensure_spec_execution_gate
 from vibe_loop.telemetry import (
     ATTRIBUTION_DIAGNOSTIC_LIMIT,
@@ -2480,12 +2483,20 @@ class VibeRunner:
                 "installed skills failed provenance verification",
                 diagnostics=render_verification_reports(blocking_reports),
             )
-        for advisory in skill_advisories:
-            report_status(
-                f"installed skill deployment lags its source: {advisory}; "
-                "it is refreshed after the next integration, or by "
-                "`vibe-loop install-skills`"
+        if skill_advisories:
+            # Only a runtime whose bundle resolves inside this repository can be
+            # repaired by the post-integration refresh; a packaged install must
+            # be told to reinstall instead of waiting for a repair that this
+            # repository can never perform.
+            remedy = (
+                "it is refreshed after the next run that advances main"
+                if repository_supplies_bundle(self.config.repo)
+                else "run `vibe-loop install-skills` to refresh it"
             )
+            for advisory in skill_advisories:
+                report_status(
+                    f"installed skill deployment lags its source: {advisory}; {remedy}"
+                )
         self.ensure_spec_execution_gate()
         agent_selection = task_agent_operation(
             task,

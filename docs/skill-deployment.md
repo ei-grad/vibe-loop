@@ -71,18 +71,33 @@ matches its manifest while the recorded source moved on, which is exactly what
 merging a bundled-skill change produces on the host that supplies the bundle.
 Blocking there halts every board on that host, across every repository, until an
 operator reinstalls by hand, which makes a bundled-skill edit unmergeable in
-practice. Preflight names the lagging paths and launches.
+practice. Preflight names the lagging paths and launches. It names the refresh
+below as the repair only when this repository supplies the running bundle;
+otherwise it names `install-skills`, because a bundle installed from a wheel or
+tool directory is never made stale, or repaired, by a repository merge.
 
 The runtime closes the window it opens. After a run advances `main`, it
 reinstalls recorded deployments of its own bundle whose source moved. The
 refresh is confined to that boundary:
 
 - it runs only when the repository that advanced supplies the running bundle;
-- it writes only roots that already carry a recorded deployment of that bundle,
-  so a host that never installed the skills does not acquire one as a side
-  effect;
+- it writes only the runtime roots that already record a stale deployment of
+  that bundle, so a runtime the operator never installed into does not acquire
+  one as a side effect. `install-skills` still writes both roots, because
+  choosing to install is an operator action;
 - it refuses the same non-mainline and dirty sources `install-skills` refuses;
 - a failed refresh is reported and never fails the run.
+
+A publish is not observable half-written. Managed files are replaced one at a
+time and the manifest is written last, so a reader landing mid-publish would
+otherwise see installed content that no longer matches the recorded digest and
+call the root `runtime-edited`, which blocks worker launch. Every install holds
+`.skill-deploy.lock` beside the runtime root for the whole overwrite check and
+write, and verification waits for that lock. The lock sits outside the root so
+the verifier still reports exactly the deployed tree, and it is only read, never
+created, by verification. The wait is bounded: a writer that outlives it is
+abandoned rather than stalling verification, and a root no writer has ever
+locked is read directly.
 
 Worker launch itself still performs no install: a global write there would
 obscure when deployment changed and would repair drift the operator has not

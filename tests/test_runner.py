@@ -9632,30 +9632,54 @@ class WorkerSkillDeploymentPreflightTests(unittest.TestCase):
             with patch("vibe_loop.runner.git_rev_parse", return_value="abc"):
                 runner.run_task(task)
 
+    def _stale_launch_advisories(self, repo: Path, supplies_bundle: bool) -> list[str]:
+        root = repo / "home" / ".claude" / "skills"
+        with (
+            patch(
+                "vibe_loop.runner.verify_worker_skill_deployments",
+                return_value=(self._report(root, "stale"),),
+            ),
+            patch(
+                "vibe_loop.runner.repository_supplies_bundle",
+                return_value=supplies_bundle,
+            ),
+            patch("vibe_loop.runner.report_status") as report,
+        ):
+            # A lagging deployment must not stop the launch; the run still
+            # fails on its own unresolved agent model.
+            with self.assertRaises(AgentResolutionError):
+                self._run_task_past_preflight(repo)
+
+        return [
+            call.args[0]
+            for call in report.call_args_list
+            if "lags its source" in call.args[0]
+        ]
+
     def test_stale_deployment_is_reported_without_blocking_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
-            root = repo / "home" / ".claude" / "skills"
-            with (
-                patch(
-                    "vibe_loop.runner.verify_worker_skill_deployments",
-                    return_value=(self._report(root, "stale"),),
-                ),
-                patch("vibe_loop.runner.report_status") as report,
-            ):
-                # A lagging deployment must not stop the launch; the run still
-                # fails on its own unresolved agent model.
-                with self.assertRaises(AgentResolutionError):
-                    self._run_task_past_preflight(repo)
+            advisories = self._stale_launch_advisories(repo, supplies_bundle=True)
 
-            advisories = [
-                call.args[0]
-                for call in report.call_args_list
-                if "lags its source" in call.args[0]
-            ]
             self.assertEqual(len(advisories), 1)
-            self.assertIn(str(root / "vibe-loop" / "SKILL.md"), advisories[0])
-            self.assertIn("install-skills", advisories[0])
+            self.assertIn(
+                str(repo / "home" / ".claude" / "skills" / "vibe-loop" / "SKILL.md"),
+                advisories[0],
+            )
+            self.assertIn(
+                "refreshed after the next run that advances main", advisories[0]
+            )
+
+    def test_stale_advisory_names_the_manual_path_for_a_packaged_runtime(self) -> None:
+        # A runtime whose bundle lives outside this repository is never repaired
+        # by the post-integration refresh, so the advisory must not promise it.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            advisories = self._stale_launch_advisories(repo, supplies_bundle=False)
+
+            self.assertEqual(len(advisories), 1)
+            self.assertNotIn("advances main", advisories[0])
+            self.assertIn("`vibe-loop install-skills`", advisories[0])
 
     def test_unknown_installed_provenance_blocks_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
