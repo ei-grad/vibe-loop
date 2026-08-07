@@ -57,10 +57,18 @@ class EvalRunnerCliTests(unittest.TestCase):
                 return "", "", 0, False, False
 
             outer_runtime = {
+                "VIBE_LOOP_AGENT_KIND": "outer-agent-kind",
+                "VIBE_LOOP_AGENT_PROFILE": "outer-agent-profile",
                 "VIBE_LOOP_BRANCH": "outer-branch",
                 "VIBE_LOOP_FENCING_TOKEN": "outer-token",
+                "VIBE_LOOP_IMPLEMENTER_SESSION": "outer-implementer",
                 "VIBE_LOOP_LOG": "/outer/run.log",
+                "VIBE_LOOP_PRIMARY_REPO": "/outer/primary",
+                "VIBE_LOOP_PRIOR_FINDINGS": "outer-findings",
                 "VIBE_LOOP_REPO": "/outer/repo",
+                "VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS": "1",
+                "VIBE_LOOP_REVIEWER_SESSION": "outer-reviewer",
+                "VIBE_LOOP_REVIEWER_SESSION_ATTESTATION": "outer-attestation",
                 "VIBE_LOOP_RUN_ID": "outer-run",
                 "VIBE_LOOP_STATE_DIR": "/outer/state",
                 "VIBE_LOOP_TASK_ID": "OUTER-01",
@@ -98,13 +106,60 @@ class EvalRunnerCliTests(unittest.TestCase):
         self.assertEqual(captured["VIBE_LOOP_TASK_ID"], "DUP-01")
         self.assertNotIn("VIBE_LOOP_FENCING_TOKEN", captured)
         self.assertNotIn("VIBE_LOOP_LOG", captured)
+        for key in (
+            "VIBE_LOOP_AGENT_KIND",
+            "VIBE_LOOP_AGENT_PROFILE",
+            "VIBE_LOOP_IMPLEMENTER_SESSION",
+            "VIBE_LOOP_PRIMARY_REPO",
+            "VIBE_LOOP_PRIOR_FINDINGS",
+            "VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS",
+            "VIBE_LOOP_REVIEWER_SESSION",
+            "VIBE_LOOP_REVIEWER_SESSION_ATTESTATION",
+        ):
+            self.assertNotIn(key, captured)
 
     def test_codex_prompt_and_task_source_reads_project_workflow_events(self) -> None:
         execution = CommandExecution(
             command="codex exec '$vibe-loop LIST-02'",
             exit_code=0,
-            stdout="completed LIST-02 from WORK.md\n",
-            stderr="/bin/zsh -lc 'sed -n 1,200p WORK.md' in /repo\n",
+            stdout="\n".join(
+                (
+                    json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "type": "command_execution",
+                                "command": "/bin/zsh -lc 'sed -n 1,200p WORK.md'",
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "type": "command_execution",
+                                "command": "uv run -m pytest tests/test_work.py",
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "type": "command_execution",
+                                "command": "git commit -m 'Complete LIST-02'",
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "result",
+                            "result": "vibe-loop-eval-event: skill_activated",
+                        }
+                    ),
+                )
+            ),
+            stderr="completed LIST-02 from WORK.md\n",
             started_at="2026-05-09T00:00:00+00:00",
             finished_at="2026-05-09T00:00:01+00:00",
             duration_seconds=1.0,
@@ -140,6 +195,66 @@ class EvalRunnerCliTests(unittest.TestCase):
         self.assertIn("verification_ran", events)
         self.assertIn("commit_created", events)
         self.assertIn("main_fast_forwarded", events)
+
+    def test_prompt_and_final_summary_do_not_imply_workflow_events(self) -> None:
+        execution = CommandExecution(
+            command=(
+                "claude -p --output-format stream-json "
+                "'/vibe-loop LIST-02 from WORK.md'"
+            ),
+            exit_code=1,
+            stdout="completed LIST-02 from WORK.md\n",
+            stderr="error: agent crashed\n",
+            started_at="2026-05-09T00:00:00+00:00",
+            finished_at="2026-05-09T00:00:01+00:00",
+            duration_seconds=1.0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            events = workflow_events_for_trial(
+                Path(directory),
+                execution,
+                (),
+                allow_artifact_events=False,
+                task_source={
+                    "type": "markdown-profile",
+                    "profile": {"source_paths": ["", "WORK.md"]},
+                },
+            )
+
+        self.assertNotIn("skill_activated", events)
+        self.assertNotIn("task_source_inspected", events)
+
+    def test_echoed_evidence_tokens_do_not_imply_workflow_events(self) -> None:
+        execution = CommandExecution(
+            command="agent",
+            exit_code=0,
+            stdout=json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": (
+                            "echo 'vibe-loop tasks /skills/vibe-loop/SKILL.md'"
+                        ),
+                    },
+                }
+            ),
+            stderr="",
+            started_at="2026-05-09T00:00:00+00:00",
+            finished_at="2026-05-09T00:00:01+00:00",
+            duration_seconds=1.0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            events = workflow_events_for_trial(
+                Path(directory),
+                execution,
+                (),
+                allow_artifact_events=False,
+                task_source={"type": "command"},
+            )
+
+        self.assertNotIn("skill_activated", events)
+        self.assertNotIn("task_source_inspected", events)
 
     def test_codex_tool_activity_does_not_imply_skill_activation(self) -> None:
         execution = CommandExecution(
@@ -1678,7 +1793,7 @@ class EvalRunnerCliTests(unittest.TestCase):
                 "--condition",
                 "vibe_loop",
                 "--agent-command",
-                f"vibe_loop={agent}",
+                f"vibe_loop={agent} {{prompt}}",
             )
             trial_root = (
                 root
@@ -2375,6 +2490,74 @@ class EvalRunnerCliTests(unittest.TestCase):
             )
 
         self.assertEqual(events, ["unnecessary_user_prompt"])
+
+    def test_rejected_workflow_events_are_not_repopulated_from_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "rejected_workflow_agent.py"
+            write_python_executable(
+                agent,
+                "import json\n"
+                "import os\n"
+                "from pathlib import Path\n"
+                "artifact = Path(os.environ['VIBE_LOOP_EVAL_ARTIFACT_DIR'])\n"
+                "(artifact / 'workflow-events.json').write_text(\n"
+                "    json.dumps({'events': ['unknown_event']}) + '\\n',\n"
+                "    encoding='utf-8',\n"
+                ")\n",
+            )
+
+            run_eval(
+                root,
+                "--case",
+                "workspace-duplicate-worktree",
+                "--condition",
+                "vibe_loop",
+                "--agent-command",
+                f"vibe_loop={agent}",
+            )
+            trial_root = (
+                root
+                / "eval-runs/local-demo-v1/cases/workspace-duplicate-worktree"
+                / "vibe_loop/trial-1"
+            )
+            run_record = json.loads(
+                (trial_root / "run.json").read_text(encoding="utf-8")
+            )
+            events = json.loads(
+                (trial_root / "workflow-events.json").read_text(encoding="utf-8")
+            )["events"]
+
+        self.assertIn(
+            "workflow event evidence rejected",
+            run_record["structured_result"]["schema_diagnostics"],
+        )
+        self.assertEqual(events, [])
+
+    def test_no_skill_baseline_does_not_project_preseeded_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "no_skill_agent.py"
+            write_python_executable(agent, "print('no skill used')\n")
+
+            run_eval(
+                root,
+                "--case",
+                "workspace-duplicate-worktree",
+                "--condition",
+                "no_skill",
+                "--agent-command",
+                f"no_skill={agent}",
+            )
+            events = json.loads(
+                (
+                    root
+                    / "eval-runs/local-demo-v1/cases/workspace-duplicate-worktree"
+                    / "no_skill/trial-1/workflow-events.json"
+                ).read_text(encoding="utf-8")
+            )["events"]
+
+        self.assertNotIn("task_lock_acquired", events)
 
     def test_overwrite_rejects_unsafe_structured_history_without_partial_archive(
         self,

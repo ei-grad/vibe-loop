@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import shlex
 import signal
 import shutil
 import subprocess
@@ -772,6 +773,7 @@ def run_trial(
             hook_results=hook_results,
             runtime=hook_runtime,
         )
+    workflow_events_rejected = False
     try:
         transcript_graders = run_transcript_graders(
             config.transcript_graders,
@@ -814,6 +816,7 @@ def run_trial(
             )
     except EvalSafeEnvelopeError:
         workflow_events = []
+        workflow_events_rejected = True
         evidence_diagnostics.append("workflow event evidence rejected")
     lock_after = collect_lock_state(lock_manager, case.task_id)
     write_lock_evidence(
@@ -837,7 +840,8 @@ def run_trial(
         sanitize_review_evidence(trial_root)
     except EvalSafeEnvelopeError:
         evidence_diagnostics.append("review evidence rejected")
-    workflow_events = evidence_backed_workflow_events(trial_root, workflow_events)
+    if not workflow_events_rejected and condition != "no_skill":
+        workflow_events = evidence_backed_workflow_events(trial_root, workflow_events)
     write_json_artifact(trial_root, "workflow_events", {"events": workflow_events})
     evidence_diagnostics.extend(
         write_missing_case_role_artifacts(
@@ -1366,10 +1370,18 @@ def execute_agent_command(
 
     env = os.environ.copy()
     for key in (
+        "VIBE_LOOP_AGENT_KIND",
+        "VIBE_LOOP_AGENT_PROFILE",
         "VIBE_LOOP_BRANCH",
         "VIBE_LOOP_FENCING_TOKEN",
+        "VIBE_LOOP_IMPLEMENTER_SESSION",
         "VIBE_LOOP_LOG",
+        "VIBE_LOOP_PRIMARY_REPO",
+        "VIBE_LOOP_PRIOR_FINDINGS",
         "VIBE_LOOP_REPO",
+        "VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS",
+        "VIBE_LOOP_REVIEWER_SESSION",
+        "VIBE_LOOP_REVIEWER_SESSION_ATTESTATION",
         "VIBE_LOOP_RUN_ID",
         "VIBE_LOOP_STATE_DIR",
         "VIBE_LOOP_TASK_ID",
@@ -1863,19 +1875,15 @@ def workflow_events_for_trial(
     for result in transcript_graders:
         events.extend(result.workflow_events)
     if is_stream_json(execution.stdout):
-        result_text, stream_events = parse_stream_json(execution.stdout)
+        result_text, stream_events = parse_stream_json(
+            execution.stdout, task_source=task_source
+        )
         events.extend(stream_events)
         events.extend(events_from_text(result_text))
     else:
         events.extend(events_from_text(execution.stdout))
     events.extend(events_from_text(execution.stderr))
     has_explicit_events = bool(events)
-    if skill_invoked_by_agent_command(execution.command):
-        events.append("skill_activated")
-    if task_source and task_source_inspected_in_output(
-        execution.stdout + execution.stderr, task_source
-    ):
-        events.append("task_source_inspected")
     if git_before and git_after:
         if has_explicit_events:
             events.extend(
@@ -1948,33 +1956,29 @@ def detect_events_from_repo_state(
     return events
 
 
-def skill_invoked_by_agent_command(command: str) -> bool:
-    return (
-        re.search(
-            r"(?:^|[\s'\"])[$/](?:orchestrated-|infinite-)?vibe-loop(?=\s|['\"]|$)",
-            command,
-        )
-        is not None
-    )
-
-
-def task_source_inspected_in_output(
-    text: str, task_source: Mapping[str, object]
-) -> bool:
-    tokens: list[str] = []
+def task_source_evidence_tokens(
+    task_source: Mapping[str, object],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    paths: list[str] = []
+    commands: list[str] = []
     plan_path = task_source.get("plan_path")
     if isinstance(plan_path, str) and plan_path:
-        tokens.append(plan_path)
+        paths.append(plan_path)
     profile = task_source.get("profile")
     if isinstance(profile, Mapping):
-        tokens.extend(string_list(profile.get("source_paths")))
+        paths.extend(path for path in string_list(profile.get("source_paths")) if path)
     for key in ("list_command", "probe_command"):
         command = task_source.get(key)
         if isinstance(command, str) and command:
-            tokens.append(command.replace("{task_id}", "").strip())
+            normalized = command.replace("{task_id}", "").strip()
+            if normalized:
+                commands.append(normalized)
     if task_source.get("type") == "command":
-        tokens.extend(("vibe-loop tasks", "vibe-loop next"))
-    return any(token in text for token in tokens)
+        commands.extend(("vibe-loop tasks", "vibe-loop next"))
+    return (
+        tuple(unique_preserving_order(paths)),
+        tuple(unique_preserving_order(commands)),
+    )
 
 
 def evidence_backed_workflow_events(
@@ -2181,6 +2185,7 @@ def _events_for_tool_use(
     name: str,
     inp: dict[str, object],
     saw_merge: bool,
+    task_source: Mapping[str, object] | None = None,
 ) -> tuple[list[str], bool, bool]:
     events: list[str] = []
     is_test = False
@@ -2222,8 +2227,20 @@ def _events_for_tool_use(
             events.append("main_integration_lock_acquired")
         if "vibe-loop main-integration release" in cmd:
             events.append("main_integration_lock_released")
+        if command_activates_vibe_loop_skill(cmd):
+            events.append("skill_activated")
+        if task_source and command_inspects_task_source(cmd, task_source):
+            events.append("task_source_inspected")
     elif name in ("Read", "Grep", "Glob"):
         events.append("instructions_inspected")
+        if name in ("Read", "Grep") and tool_activates_vibe_loop_skill(inp):
+            events.append("skill_activated")
+        if (
+            name in ("Read", "Grep")
+            and task_source
+            and tool_inspects_task_source(inp, task_source)
+        ):
+            events.append("task_source_inspected")
     elif name in ("EnterWorktree", "enterWorktree"):
         events.append("branch_or_worktree_created")
     elif name == "Agent":
@@ -2236,7 +2253,9 @@ def _events_for_tool_use(
     return events, is_test, is_merge
 
 
-def parse_stream_json(text: str) -> tuple[str, list[str]]:
+def parse_stream_json(
+    text: str, *, task_source: Mapping[str, object] | None = None
+) -> tuple[str, list[str]]:
     result_text = ""
     events: list[str] = []
     skill_triggered = False
@@ -2267,7 +2286,7 @@ def parse_stream_json(text: str) -> tuple[str, list[str]]:
             if not isinstance(command, str):
                 continue
             tool_events, _, is_merge = _events_for_tool_use(
-                "Bash", {"command": command}, saw_merge
+                "Bash", {"command": command}, saw_merge, task_source
             )
             events.extend(tool_events)
             if is_merge:
@@ -2299,7 +2318,9 @@ def parse_stream_json(text: str) -> tuple[str, list[str]]:
                     skill_triggered = True
                 continue
 
-            tool_events, _, is_merge = _events_for_tool_use(name, inp, saw_merge)
+            tool_events, _, is_merge = _events_for_tool_use(
+                name, inp, saw_merge, task_source
+            )
             events.extend(tool_events)
             if is_merge:
                 saw_merge = True
@@ -2308,6 +2329,105 @@ def parse_stream_json(text: str) -> tuple[str, list[str]]:
         events.append("skill_activated")
 
     return result_text, unique_preserving_order(events)
+
+
+def command_activates_vibe_loop_skill(command: str) -> bool:
+    return vibe_loop_skill_path_present(command) and shell_read_command_present(command)
+
+
+def tool_activates_vibe_loop_skill(inp: Mapping[str, object]) -> bool:
+    return vibe_loop_skill_path_present(tool_input_text(inp))
+
+
+def vibe_loop_skill_path_present(text: str) -> bool:
+    return (
+        re.search(
+            r"(?:^|[/\\])(?:orchestrated-|infinite-)?vibe-loop[/\\]SKILL\.md"
+            r"(?=$|[\s'\"])",
+            text,
+        )
+        is not None
+    )
+
+
+def shell_read_command_present(command: str) -> bool:
+    return any(
+        Path(segment[0]).name
+        in {"cat", "sed", "rg", "grep", "head", "tail", "less", "more", "awk"}
+        for segment in shell_command_segments(command)
+        if segment
+    )
+
+
+def command_inspects_task_source(
+    command: str, task_source: Mapping[str, object]
+) -> bool:
+    paths, commands = task_source_evidence_tokens(task_source)
+    if any(shell_command_invokes(command, token) for token in commands):
+        return True
+    if not any(path in command for path in paths):
+        return False
+    return shell_read_command_present(command)
+
+
+def shell_command_invokes(command: str, token: str) -> bool:
+    try:
+        expected = shlex.split(token)
+    except ValueError:
+        return False
+    if not expected:
+        return False
+    return any(
+        segment[: len(expected)] == expected
+        for segment in shell_command_segments(command)
+    )
+
+
+def shell_command_segments(command: str) -> list[list[str]]:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        words = list(lexer)
+    except ValueError:
+        return []
+
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for word in words:
+        if word in {";", "&", "&&", "|", "||"}:
+            if current:
+                segments.extend(expand_shell_segment(current))
+                current = []
+        else:
+            current.append(word)
+    if current:
+        segments.extend(expand_shell_segment(current))
+    return segments
+
+
+def expand_shell_segment(segment: list[str]) -> list[list[str]]:
+    while segment and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[0]):
+        segment = segment[1:]
+    if not segment:
+        return []
+    executable = Path(segment[0]).name
+    if executable in {"bash", "dash", "sh", "zsh"}:
+        for index, argument in enumerate(segment[1:], start=1):
+            if argument in {"-c", "-lc"} and index + 1 < len(segment):
+                return shell_command_segments(segment[index + 1])
+    return [segment]
+
+
+def tool_inspects_task_source(
+    inp: Mapping[str, object], task_source: Mapping[str, object]
+) -> bool:
+    paths, _commands = task_source_evidence_tokens(task_source)
+    text = tool_input_text(inp)
+    return any(path in text for path in paths)
+
+
+def tool_input_text(inp: Mapping[str, object]) -> str:
+    return json.dumps(inp, sort_keys=True, ensure_ascii=True)
 
 
 def normalize_events(value: object) -> list[str]:
