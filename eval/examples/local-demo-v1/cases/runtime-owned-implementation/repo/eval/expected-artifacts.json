@@ -32,9 +32,9 @@
         "equals": "completed"
       },
       {
-        "role": "report_evidence",
-        "field": "latest.commit",
-        "equals": "HEAD"
+        "role": "lock_evidence",
+        "field": "before.run_id",
+        "equals": "eval-run-roi-01"
       },
       {
         "role": "lock_evidence",
@@ -67,8 +67,17 @@
       "fields": {
         "run_id": "eval-run-roi-01",
         "task_id": "ROI-01",
-        "status": "completed",
-        "commit": "HEAD"
+        "status": "completed"
+      }
+    },
+    {
+      "id": "candidate-recorded",
+      "kind": "jsonl_record_matches",
+      "path": ".vibe-loop/runs.jsonl",
+      "fields": {
+        "record_type": "candidate_recorded",
+        "run_id": "eval-run-roi-01",
+        "task_id": "ROI-01"
       }
     },
     {

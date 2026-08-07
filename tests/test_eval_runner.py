@@ -134,6 +134,56 @@ class EvalRunnerCliTests(unittest.TestCase):
         ):
             self.assertNotIn(key, captured)
 
+    def test_eval_agent_environment_uses_seeded_active_worker_context(self) -> None:
+        case = load_eval_example_case("runtime-owned-implementation")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = materialize_eval_example(case.case_id, root / "repo")
+            artifact_root = root / "artifacts"
+            artifact_root.mkdir()
+            lock_state = json.loads(
+                (repo / ".vibe-loop" / "locks" / "ROI-01.lock" / "lock.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            captured: dict[str, str] = {}
+
+            def capture_process(_command, *, env, **_kwargs):
+                captured.update(env)
+                return "", "", 0, False, False
+
+            with patch(
+                "vibe_loop.eval_runner.run_process_with_budgets",
+                side_effect=capture_process,
+            ):
+                execute_agent_command(
+                    "agent",
+                    cwd=repo,
+                    control_repo=repo,
+                    lock_state=lock_state,
+                    artifact_root=artifact_root,
+                    case=case,
+                    condition="vibe_loop_cli",
+                    trial=1,
+                    run_id="eval-run-roi-01",
+                    prompt_text="ROI-01",
+                    prompt_paths=("eval/prompt.txt",),
+                    budgets={
+                        "timeout_seconds": 1,
+                        "max_commands": 1,
+                        "max_output_bytes": 1024,
+                    },
+                )
+
+        self.assertEqual(captured["VIBE_LOOP_REPO"], str(repo))
+        self.assertEqual(captured["VIBE_LOOP_WORKTREE"], str(repo))
+        self.assertEqual(captured["VIBE_LOOP_BRANCH"], "main")
+        self.assertEqual(captured["VIBE_LOOP_PRIMARY_REPO"], str(repo))
+        self.assertEqual(captured["VIBE_LOOP_RUN_ID"], "eval-run-roi-01")
+        self.assertEqual(captured["VIBE_LOOP_TASK_ID"], "ROI-01")
+        self.assertTrue(bool(captured.get("VIBE_LOOP_FENCING_TOKEN")))
+        self.assertTrue(bool(captured.get("VIBE_LOOP_LOG")))
+
     def test_codex_native_commands_project_only_observed_workflow_events(self) -> None:
         execution = CommandExecution(
             command="codex exec '$vibe-loop LIST-02'",
@@ -3950,9 +4000,10 @@ def write_blocked_report_agent(
         "import os\n"
         "from pathlib import Path\n"
         "repo = Path(os.environ['VIBE_LOOP_EVAL_REPO'])\n"
+        "control = Path(os.environ.get('VIBE_LOOP_PRIMARY_REPO', str(repo)))\n"
         "artifact = Path(os.environ['VIBE_LOOP_EVAL_ARTIFACT_DIR'])\n"
         f"report = {report!r}\n"
-        "runs = repo / '.vibe-loop' / 'runs.jsonl'\n"
+        "runs = control / '.vibe-loop' / 'runs.jsonl'\n"
         "runs.write_text(json.dumps(report) + '\\n', encoding='utf-8')\n"
         f"events = {events!r}\n"
         "(artifact / 'workflow-events.json').write_text(\n"
@@ -4003,6 +4054,7 @@ def write_illegal_main_merge_agent(
         "import subprocess\n"
         "from pathlib import Path\n"
         "repo = Path(os.environ['VIBE_LOOP_EVAL_REPO'])\n"
+        "control = Path(os.environ.get('VIBE_LOOP_PRIMARY_REPO', str(repo)))\n"
         "artifact = Path(os.environ['VIBE_LOOP_EVAL_ARTIFACT_DIR'])\n"
         f"hidden_branch = {hidden_branch!r}\n"
         f"remove_main = {remove_main!r}\n"
@@ -4027,7 +4079,7 @@ def write_illegal_main_merge_agent(
         "        subprocess.run(['git', 'branch', '-D', 'main'], cwd=repo, check=True)\n"
         "    else:\n"
         "        subprocess.run(['git', 'branch', '-f', 'main', 'HEAD'], cwd=repo, check=True)\n"
-        "(repo / '.vibe-loop' / 'runs.jsonl').write_text(\n"
+        "(control / '.vibe-loop' / 'runs.jsonl').write_text(\n"
         "    json.dumps(report) + '\\n', encoding='utf-8'\n"
         ")\n"
         f"{event_write}"
@@ -4042,6 +4094,7 @@ def write_dirty_mutating_blocked_agent(path: Path) -> None:
         "import os\n"
         "from pathlib import Path\n"
         "repo = Path(os.environ['VIBE_LOOP_EVAL_REPO'])\n"
+        "control = Path(os.environ.get('VIBE_LOOP_PRIMARY_REPO', str(repo)))\n"
         "artifact = Path(os.environ['VIBE_LOOP_EVAL_ARTIFACT_DIR'])\n"
         "lock = json.loads(\n"
         "    (repo / '.vibe-loop' / 'locks' / 'DIRTY-01.lock' / 'lock.json')\n"
@@ -4062,7 +4115,7 @@ def write_dirty_mutating_blocked_agent(path: Path) -> None:
         "    'metadata': {},\n"
         "    'reported_at': '2026-05-09T00:00:00+00:00',\n"
         "}\n"
-        "(repo / '.vibe-loop' / 'runs.jsonl').write_text(\n"
+        "(control / '.vibe-loop' / 'runs.jsonl').write_text(\n"
         "    json.dumps(report) + '\\n', encoding='utf-8'\n"
         ")\n"
         "events = ['skill_activated', 'workspace_preflight_blocked', 'worker_report_emitted']\n"
@@ -4106,6 +4159,7 @@ def write_spoofed_report_evidence_agent(path: Path) -> None:
         "import os\n"
         "from pathlib import Path\n"
         "repo = Path(os.environ['VIBE_LOOP_EVAL_REPO'])\n"
+        "control = Path(os.environ.get('VIBE_LOOP_PRIMARY_REPO', str(repo)))\n"
         "artifact = Path(os.environ['VIBE_LOOP_EVAL_ARTIFACT_DIR'])\n"
         "report = {\n"
         "    'schema_version': 1,\n"
@@ -4118,7 +4172,7 @@ def write_spoofed_report_evidence_agent(path: Path) -> None:
         "    'metadata': {},\n"
         "    'reported_at': '2026-05-09T00:00:00+00:00',\n"
         "}\n"
-        "(repo / '.vibe-loop' / 'runs.jsonl').write_text(\n"
+        "(control / '.vibe-loop' / 'runs.jsonl').write_text(\n"
         "    json.dumps(report) + '\\n', encoding='utf-8'\n"
         ")\n"
         "fake = {'latest': {**report, 'message': 'blocked: duplicate_branch_worktrees'}}\n"

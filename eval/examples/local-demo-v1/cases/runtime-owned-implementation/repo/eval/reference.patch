@@ -2,7 +2,8 @@ diff --git a/.vibe-loop/runs.jsonl b/.vibe-loop/runs.jsonl
 new file mode 100644
 --- /dev/null
 +++ b/.vibe-loop/runs.jsonl
-@@ -0,0 +1 @@
+@@ -0,0 +1,2 @@
++{"schema_version": 1, "record_type": "candidate_recorded", "run_id": "eval-run-roi-01", "task_id": "ROI-01", "head_commit": "HEAD", "base_main": "HEAD", "changed_paths": ["src/runtime_demo/reports.py"], "occurred_at": "2026-05-09T00:00:00+00:00"}
 +{"schema_version": 1, "record_type": "worker_report", "run_id": "eval-run-roi-01", "task_id": "ROI-01", "status": "completed", "commit": "HEAD", "message": "implementation candidate ready", "metadata": {}, "reported_at": "2026-05-09T00:00:00+00:00"}
 diff --git a/src/runtime_demo/reports.py b/src/runtime_demo/reports.py
 --- a/src/runtime_demo/reports.py

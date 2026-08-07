@@ -8,7 +8,13 @@ from hook_events import record_event
 
 def main() -> int:
     tasks = json.loads(Path("tasks.json").read_text(encoding="utf-8"))["tasks"]
-    runnable = [item["id"] for item in tasks if item["status"] == "Planned"]
+    statuses = {item["id"]: item["status"] for item in tasks}
+    runnable = [
+        item["id"]
+        for item in tasks
+        if item["status"] == "Planned"
+        and all(statuses.get(task_id) == "Done" for task_id in item["dependencies"])
+    ]
     record_event("planning", "")
     print(json.dumps({"hook": "planning", "runnable_task_ids": runnable}))
     return 0

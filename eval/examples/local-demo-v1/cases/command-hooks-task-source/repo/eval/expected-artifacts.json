@@ -20,6 +20,7 @@
         "type": "command",
         "list_command": "python scripts/task_adapter.py list",
         "probe_command": "python scripts/task_adapter.py probe {task_id}",
+        "activate_command": "python scripts/task_adapter.py activate {task_id} {run_id}",
         "runnable_statuses": ["Planned"]
       },
       "task_ids": ["HOOK-01", "HOOK-02", "HOOK-03"],

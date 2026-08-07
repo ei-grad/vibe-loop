@@ -237,6 +237,203 @@ class EvalExampleTests(unittest.TestCase):
         self.assertEqual(lock["pid"], os.getpid())
         self.assertEqual(lock["pid_source"], "fixture-live-holder")
 
+    def test_command_cli_fixtures_seed_one_coherent_active_worker(self) -> None:
+        expected_branches = {
+            "command-hooks-task-source": ("HOOK-02", "eval-run-command-hooks", "main"),
+            "integration-lock-unavailable": ("BUSY-01", "eval-run-busy-01", "main"),
+            "main-integration-lock": ("MIL-01", "eval-run-mil-01", "main"),
+            "runtime-owned-implementation": ("ROI-01", "eval-run-roi-01", "main"),
+            "supervised-worker-report": ("WRK-01", "eval-run-wrk-01", "main"),
+            "workspace-duplicate-worktree": (
+                "DUP-01",
+                "eval-run-dup-01",
+                "vibe-loop/DUP-01",
+            ),
+            "workspace-merged-branch": (
+                "MERGED-01",
+                "eval-run-merged-01",
+                "vibe-loop/MERGED-01",
+            ),
+            "workspace-missing-worktree": (
+                "MISS-01",
+                "eval-run-miss-01",
+                "vibe-loop/MISS-01",
+            ),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for case_id, (task_id, run_id, branch) in expected_branches.items():
+                with self.subTest(case=case_id):
+                    repo = materialize_eval_example(case_id, root / case_id)
+                    config = load_config(repo)
+                    manager = build_lock_manager(
+                        repo,
+                        config.state_path / "locks",
+                        config.locks,
+                    )
+                    lock = manager.status(task_id)
+                    workspace = lock["workspace"]
+
+                    self.assertEqual(lock["task_id"], task_id)
+                    self.assertEqual(lock["run_id"], run_id)
+                    self.assertTrue(
+                        isinstance(lock.get("fencing_token"), str)
+                        and bool(lock["fencing_token"])
+                    )
+                    self.assertEqual(workspace["task_id"], task_id)
+                    self.assertEqual(workspace["run_id"], run_id)
+                    self.assertEqual(workspace["branch"], branch)
+
+    def test_seeded_worker_context_accepts_exact_report_and_rejects_wrong_run(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = materialize_eval_example(
+                "supervised-worker-report",
+                Path(directory) / "worker-report",
+            )
+            config = load_config(repo)
+            manager = build_lock_manager(
+                repo,
+                config.state_path / "locks",
+                config.locks,
+            )
+            lock = manager.status("WRK-01")
+            runtime_environment = {
+                "VIBE_LOOP_REPO": str(repo),
+                "VIBE_LOOP_WORKTREE": str(repo),
+                "VIBE_LOOP_BRANCH": "main",
+                "VIBE_LOOP_RUN_ID": "eval-run-wrk-01",
+                "VIBE_LOOP_TASK_ID": "WRK-01",
+                "VIBE_LOOP_STATE_DIR": str(repo / ".vibe-loop"),
+                "VIBE_LOOP_FENCING_TOKEN": lock["fencing_token"],
+            }
+            with (
+                patch.dict(os.environ, runtime_environment),
+                redirect_stdout(StringIO()),
+                redirect_stderr(StringIO()),
+            ):
+                accepted = main(
+                    [
+                        "report",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "eval-run-wrk-01",
+                        "--task-id",
+                        "WRK-01",
+                        "--status",
+                        "completed",
+                        "--commit",
+                        "HEAD",
+                        "--message",
+                        "implementation candidate ready",
+                    ]
+                )
+                rejected = main(
+                    [
+                        "report",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "stale-run",
+                        "--task-id",
+                        "WRK-01",
+                        "--status",
+                        "completed",
+                        "--commit",
+                        "HEAD",
+                    ]
+                )
+            reports = [
+                record
+                for record in RunStore(
+                    repo / ".vibe-loop" / "runs.jsonl"
+                ).read_records()
+                if record.get("record_type") == "worker_report"
+            ]
+
+        self.assertEqual(accepted, 0)
+        self.assertEqual(rejected, 2)
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0]["run_id"], "eval-run-wrk-01")
+        self.assertEqual(reports[0]["task_id"], "WRK-01")
+        self.assertNotIn("fencing_token", reports[0])
+
+    def test_runtime_owned_fixture_records_candidate_from_clean_worker_checkout(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = materialize_eval_example(
+                "runtime-owned-implementation",
+                Path(directory) / "runtime-owned",
+            )
+            report_source = repo / "src" / "runtime_demo" / "reports.py"
+            report_source.write_text(
+                "from __future__ import annotations\n\n\n"
+                "def count_lines(value: str) -> int:\n"
+                "    return sum(1 for line in value.splitlines() if line.strip())\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "add", "src/runtime_demo/reports.py"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "implement candidate"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            config = load_config(repo)
+            manager = build_lock_manager(
+                repo,
+                config.state_path / "locks",
+                config.locks,
+            )
+            lock = manager.status("ROI-01")
+            runtime_environment = {
+                "VIBE_LOOP_REPO": str(repo),
+                "VIBE_LOOP_WORKTREE": str(repo),
+                "VIBE_LOOP_BRANCH": "main",
+                "VIBE_LOOP_RUN_ID": "eval-run-roi-01",
+                "VIBE_LOOP_TASK_ID": "ROI-01",
+                "VIBE_LOOP_STATE_DIR": str(repo / ".vibe-loop"),
+                "VIBE_LOOP_FENCING_TOKEN": lock["fencing_token"],
+            }
+            with (
+                patch.dict(os.environ, runtime_environment),
+                redirect_stdout(StringIO()),
+                redirect_stderr(StringIO()),
+            ):
+                candidate_code = main(
+                    [
+                        "worker",
+                        "candidate",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "eval-run-roi-01",
+                        "--task-id",
+                        "ROI-01",
+                        "--head",
+                        "HEAD",
+                    ]
+                )
+            records = RunStore(repo / ".vibe-loop" / "runs.jsonl").read_records()
+            candidate_records = [
+                record
+                for record in records
+                if record.get("record_type") == "candidate_recorded"
+            ]
+
+        self.assertEqual(candidate_code, 0)
+        self.assertEqual(len(candidate_records), 1)
+        self.assertEqual(candidate_records[0]["run_id"], "eval-run-roi-01")
+        self.assertEqual(candidate_records[0]["task_id"], "ROI-01")
+
     def test_materialize_workspace_case_overwrite_cleans_seed_workspaces(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "duplicate"

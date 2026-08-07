@@ -5,6 +5,7 @@ command = "python scripts/agent_stub.py {prompt}"
 type = "command"
 list = "python scripts/task_adapter.py list"
 probe = "python scripts/task_adapter.py probe {task_id}"
+activate = "python scripts/task_adapter.py activate {task_id} {run_id}"
 runnable_statuses = ["Planned"]
 
 [locks]

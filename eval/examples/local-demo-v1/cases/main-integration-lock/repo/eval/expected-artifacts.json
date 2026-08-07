@@ -25,6 +25,16 @@
     "artifact_json_fields": [
       {
         "role": "lock_evidence",
+        "field": "before.task_id",
+        "equals": "MIL-01"
+      },
+      {
+        "role": "lock_evidence",
+        "field": "before.run_id",
+        "equals": "eval-run-mil-01"
+      },
+      {
+        "role": "lock_evidence",
         "field": "acquire.owner_task_id",
         "equals": "MIL-01"
       },

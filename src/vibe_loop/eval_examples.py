@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import sysconfig
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,8 @@ from vibe_loop.locks import (
     MAIN_INTEGRATION_LOCK_NAME,
     MAIN_INTEGRATION_LOCK_RECORD_TYPE,
     MAIN_INTEGRATION_LOCK_SCHEMA_VERSION,
+    next_fencing_token,
+    record_acquired_fencing_token,
 )
 from vibe_loop.runs import WORKSPACE_CLAIM_RECORD_TYPE, WORKSPACE_CLAIMED_EVENT_TYPE
 
@@ -152,6 +155,7 @@ def materialize_eval_example(
     apply_seed_user_state(target)
     apply_seed_coordination_state(target)
     apply_seed_command_lock_state(target)
+    apply_seed_active_worker_context(target)
     refresh_active_lock_metadata(target)
     return target
 
@@ -353,6 +357,84 @@ def apply_seed_command_lock_state(target: Path) -> None:
     )
 
 
+def apply_seed_active_worker_context(target: Path) -> None:
+    seed_path = target / "eval" / "seed-active-worker.json"
+    if not seed_path.is_file():
+        return
+    seed = read_json_file(seed_path)
+    task_id = required_seed_string(seed, "task_id")
+    run_id = required_seed_string(seed, "run_id")
+    branch = required_seed_string(seed, "branch")
+    metadata, write_metadata, state_path = active_lock_metadata_writer(target, task_id)
+    if metadata.get("task_id") != task_id or metadata.get("run_id") != run_id:
+        raise ValueError(
+            "seed active worker identity does not match the fixture task lock"
+        )
+    exclude_path = target / ".git" / "info" / "exclude"
+    with exclude_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            ".vibe-loop/locks/.fencing-tokens/\n"
+            ".vibe-loop/locks/main-integration.lock/\n"
+            ".vibe-loop/command-locks.json\n"
+        )
+    lock_root = target / ".vibe-loop" / "locks"
+    fencing_token = next_fencing_token(lock_root, task_id)
+    record_acquired_fencing_token(lock_root, task_id, fencing_token)
+    metadata["fencing_token"] = fencing_token
+    workspace = metadata.get("workspace")
+    claim_uses_fixture_checkout = workspace is None
+    if workspace is None:
+        base_commit = run_git_output(target, "rev-parse", "--verify", "HEAD")
+        current_branch = run_git_output(target, "branch", "--show-current")
+        if branch != current_branch:
+            raise ValueError(
+                "seed active worker branch does not match the fixture checkout"
+            )
+        metadata["workspace"] = workspace_claim_payload(
+            task_id=task_id,
+            run_id=run_id,
+            branch=branch,
+            worktree=target,
+            base_commit=base_commit,
+        )
+    elif not isinstance(workspace, dict) or any(
+        workspace.get(key) != value
+        for key, value in (("task_id", task_id), ("run_id", run_id), ("branch", branch))
+    ):
+        raise ValueError(
+            "seed active worker workspace does not match the fixture task lock"
+        )
+    write_metadata(metadata)
+    if claim_uses_fixture_checkout and state_path.is_relative_to(target):
+        relative_state_path = state_path.relative_to(target)
+        tracked = run_git_output(target, "ls-files", "--", str(relative_state_path))
+        if tracked:
+            run_git(target, "update-index", "--skip-worktree", str(relative_state_path))
+
+
+def active_lock_metadata_writer(
+    target: Path, task_id: str
+) -> tuple[dict[str, object], Callable[[dict[str, object]], None], Path]:
+    lock_path = target / ".vibe-loop" / "locks" / f"{task_id}.lock" / "lock.json"
+    if lock_path.is_file():
+        return (
+            read_json_file(lock_path),
+            lambda payload: write_json_file(lock_path, payload),
+            lock_path,
+        )
+    command_lock_path = target / ".vibe-loop" / "command-locks.json"
+    command_locks = read_json_file(command_lock_path)
+    metadata = command_locks.get(task_id)
+    if not isinstance(metadata, dict):
+        raise ValueError(f"seed active worker lock is missing: {task_id}")
+
+    def write_command_lock(payload: dict[str, object]) -> None:
+        command_locks[task_id] = payload
+        write_json_file(command_lock_path, command_locks)
+
+    return metadata, write_command_lock, command_lock_path
+
+
 def apply_seed_workspace_state(target: Path, seed: dict[str, object]) -> None:
     task_id = required_seed_string(seed, "task_id")
     run_id = required_seed_string(seed, "run_id")
@@ -434,6 +516,24 @@ def update_workspace_claim(
 ) -> None:
     lock_path = target / ".vibe-loop" / "locks" / f"{task_id}.lock" / "lock.json"
     metadata = read_json_file(lock_path)
+    metadata["workspace"] = workspace_claim_payload(
+        task_id=task_id,
+        run_id=run_id,
+        branch=branch,
+        worktree=worktree,
+        base_commit=base_commit,
+    )
+    write_json_file(lock_path, metadata)
+
+
+def workspace_claim_payload(
+    *,
+    task_id: str,
+    run_id: str,
+    branch: str,
+    worktree: Path,
+    base_commit: str,
+) -> dict[str, object]:
     head_commit = ""
     current_branch = ""
     dirty_summary: tuple[str, ...] = ()
@@ -441,9 +541,13 @@ def update_workspace_claim(
         head_commit = run_git_output(worktree, "rev-parse", "--verify", "HEAD")
         current_branch = run_git_output(worktree, "branch", "--show-current")
         status = run_git_output(worktree, "status", "--short")
-        dirty_summary = tuple(line for line in status.splitlines() if line)
+        dirty_summary = tuple(
+            line
+            for line in status.splitlines()
+            if line and not line[3:].startswith(".vibe-loop/")
+        )
     claimed_at = utc_now()
-    metadata["workspace"] = {
+    return {
         "schema_version": 1,
         "record_type": WORKSPACE_CLAIM_RECORD_TYPE,
         "event_type": WORKSPACE_CLAIMED_EVENT_TYPE,
@@ -459,12 +563,14 @@ def update_workspace_claim(
         "dirty_summary": list(dirty_summary),
         "claimed_at": claimed_at,
     }
-    write_json_file(lock_path, metadata)
 
 
 def seed_main_integration_lock(target: Path, seed: dict[str, object]) -> None:
-    lock_path = target / ".vibe-loop" / "locks" / f"{MAIN_INTEGRATION_LOCK_NAME}.lock"
+    lock_root = target / ".vibe-loop" / "locks"
+    lock_path = lock_root / f"{MAIN_INTEGRATION_LOCK_NAME}.lock"
     lock_path.mkdir(parents=True, exist_ok=True)
+    fencing_token = next_fencing_token(lock_root, MAIN_INTEGRATION_LOCK_NAME)
+    record_acquired_fencing_token(lock_root, MAIN_INTEGRATION_LOCK_NAME, fencing_token)
     metadata = {
         "schema_version": MAIN_INTEGRATION_LOCK_SCHEMA_VERSION,
         "record_type": MAIN_INTEGRATION_LOCK_RECORD_TYPE,
@@ -476,6 +582,7 @@ def seed_main_integration_lock(target: Path, seed: dict[str, object]) -> None:
         "pid_source": "fixture-live-holder",
         "host": socket.gethostname(),
         "started_at": utc_now(),
+        "fencing_token": fencing_token,
     }
     write_json_file(lock_path / "lock.json", metadata)
 

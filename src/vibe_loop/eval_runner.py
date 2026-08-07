@@ -28,7 +28,7 @@ from vibe_loop.config import (
     load_config,
     prepare_shell_command,
 )
-from vibe_loop.locks import LockManager, build_lock_manager
+from vibe_loop.locks import LockManager, build_lock_manager, fencing_token_value
 
 from vibe_loop.eval_examples import (
     EXAMPLE_SUITE_ID,
@@ -70,7 +70,7 @@ from vibe_loop.runner import (
     shell_command_payload,
 )
 from vibe_loop.tasks import build_task_source, runnable_tasks
-from vibe_loop.workers import build_worker_views
+from vibe_loop.workers import ActiveRunState, build_worker_views
 
 
 HARNESS_NAME = "vibe-loop-eval"
@@ -706,29 +706,36 @@ def run_trial(
                 onerror=lambda f, p, ei: _rmtree_make_writable(f, p, ei[1]),
             )
     trial_root.mkdir(parents=True)
-    repo = trial_root / "repo"
+    control_repo = trial_root / "repo"
     materialize_eval_example(
         case.case_id,
-        repo,
+        control_repo,
         examples_root=config.examples_root,
         overwrite=False,
         include_grader_internals=False,
     )
+    control_config = load_config(control_repo)
+    lock_manager = build_lock_manager(
+        control_repo,
+        control_config.state_path / "locks",
+        control_config.locks,
+    )
+    lock_before = collect_lock_state(lock_manager, case.task_id)
+    repo = active_worker_repo(control_repo, lock_before)
+    repo_config = load_config(repo)
     prompt_text = combined_prompt(repo, case)
     write_text_artifact(trial_root, "prompt", prompt_text)
     git_before = collect_git_state(repo)
     write_json_artifact(trial_root, "git_state_before", safe_git_state(git_before))
-    repo_config = load_config(repo)
-    lock_manager = build_lock_manager(
-        repo,
-        repo_config.state_path / "locks",
-        repo_config.locks,
-    )
     if "task_source_evidence" in case.expected_artifact_roles:
         write_task_source_evidence(trial_root, repo_config)
-    lock_before = collect_lock_state(lock_manager, case.task_id)
     run_id = seeded_run_id(lock_before) or (
         f"{EXAMPLE_SUITE_ID}-{case.case_id}-{condition}-trial-{trial}"
+    )
+    activate_command_fixture_task(
+        repo_config,
+        task_id=case.task_id,
+        run_id=run_id,
     )
 
     budgets = trial_budget(case, config)
@@ -739,6 +746,8 @@ def run_trial(
         run_id=run_id,
         command_template=command_template,
         repo=repo,
+        control_repo=control_repo,
+        lock_state=lock_before,
         trial_root=trial_root,
         prompt_text=prompt_text,
         budgets=budgets,
@@ -766,7 +775,9 @@ def run_trial(
     git_after = collect_git_state(repo)
     write_json_artifact(trial_root, "git_state_after", safe_git_state(git_after))
     write_text_artifact(trial_root, "diff", fixture_diff(repo, git_before))
-    deterministic = deterministic_grader_output(repo, grader_repo=case.repo_path)
+    deterministic = deterministic_grader_output(
+        control_repo, grader_repo=case.repo_path
+    )
     if "hook_evidence" in case.expected_artifact_roles:
         write_hook_evidence(
             trial_root,
@@ -827,9 +838,9 @@ def run_trial(
         lock_after,
         lock_manager=lock_manager,
     )
-    latest_report = latest_worker_report(repo, case.task_id)
+    latest_report = latest_worker_report(control_repo, case.task_id)
     write_report_evidence(trial_root, latest_report)
-    write_workspace_evidence(trial_root, repo, lock_manager=lock_manager)
+    write_workspace_evidence(trial_root, control_repo, lock_manager=lock_manager)
     try:
         write_generated_profile_artifact(trial_root, repo)
     except EvalSafeEnvelopeError:
@@ -922,7 +933,7 @@ def run_trial(
     write_json(trial_root / "run.json", record)
 
     artifact_result = artifact_grader_output(
-        repo, trial_root, grader_repo=case.repo_path
+        control_repo, trial_root, grader_repo=case.repo_path
     )
     final_graders = [
         deterministic_grader_record(deterministic),
@@ -1053,6 +1064,8 @@ def execute_trial_agent_commands(
     run_id: str,
     command_template: str,
     repo: Path,
+    control_repo: Path,
+    lock_state: Mapping[str, object],
     trial_root: Path,
     prompt_text: str,
     budgets: Mapping[str, int],
@@ -1092,6 +1105,8 @@ def execute_trial_agent_commands(
     execution = execute_agent_command(
         command,
         cwd=repo,
+        control_repo=control_repo,
+        lock_state=lock_state,
         artifact_root=trial_root,
         case=case,
         condition=condition,
@@ -1339,6 +1354,8 @@ def execute_agent_command(
     command: str,
     *,
     cwd: Path,
+    control_repo: Path | None = None,
+    lock_state: Mapping[str, object] | None = None,
     artifact_root: Path,
     case: EvalExampleCase,
     condition: str,
@@ -1384,7 +1401,11 @@ def execute_agent_command(
         "VIBE_LOOP_WORKTREE",
     ):
         env.pop(key, None)
-    fixture_branch = git_output(cwd, "branch", "--show-current") or "HEAD"
+    runtime_context = active_worker_runtime_context(
+        control_repo or cwd,
+        cwd,
+        lock_state or {},
+    )
     env.update(
         {
             "PYTHONIOENCODING": "utf-8",
@@ -1405,10 +1426,7 @@ def execute_agent_command(
             "VIBE_LOOP_EVAL_SKILL_ID": skill_id_for_condition(condition),
             "VIBE_LOOP_RUN_ID": run_id,
             "VIBE_LOOP_TASK_ID": case.task_id or "",
-            "VIBE_LOOP_REPO": str(cwd),
-            "VIBE_LOOP_WORKTREE": str(cwd),
-            "VIBE_LOOP_BRANCH": fixture_branch,
-            "VIBE_LOOP_STATE_DIR": str(cwd / ".vibe-loop"),
+            **runtime_context,
         }
     )
     stdout, stderr, exit_code, timeout, truncated = run_process_with_budgets(
@@ -3348,6 +3366,23 @@ def write_task_source_evidence(artifact_root: Path, config: VibeConfig) -> None:
     )
 
 
+def activate_command_fixture_task(
+    config: VibeConfig,
+    *,
+    task_id: str | None,
+    run_id: str,
+) -> None:
+    task_source = config.task_source
+    if task_source.type != "command" or not task_source.activate_command or not task_id:
+        return
+    source = build_task_source(config.repo, task_source)
+    activated = source.activate(task_id, run_id)
+    if activated is None or activated.status in task_source.runnable_statuses:
+        raise RuntimeError(
+            "fixture task activation did not produce a non-runnable active task"
+        )
+
+
 def run_configured_fixture_hooks(
     config: VibeConfig,
     budgets: Mapping[str, int],
@@ -3493,6 +3528,56 @@ def collect_lock_state(
         return {}
     payload = lock_manager.status(task_id)
     return dict(payload) if isinstance(payload, Mapping) else {}
+
+
+def active_worker_repo(control_repo: Path, lock_state: Mapping[str, object]) -> Path:
+    if not fencing_token_value(lock_state.get("fencing_token")):
+        return control_repo
+    active = ActiveRunState.from_lock_metadata(dict(lock_state))
+    if active is None or active.workspace is None:
+        return control_repo
+    try:
+        return active.workspace.worktree.resolve(strict=True)
+    except OSError:
+        return control_repo
+
+
+def active_worker_runtime_context(
+    control_repo: Path,
+    execution_repo: Path,
+    lock_state: Mapping[str, object],
+) -> dict[str, str]:
+    token = fencing_token_value(lock_state.get("fencing_token"))
+    if not token:
+        branch = git_output(execution_repo, "branch", "--show-current") or "HEAD"
+        return {
+            "VIBE_LOOP_REPO": str(execution_repo),
+            "VIBE_LOOP_WORKTREE": str(execution_repo),
+            "VIBE_LOOP_BRANCH": branch,
+            "VIBE_LOOP_STATE_DIR": str(execution_repo / ".vibe-loop"),
+        }
+    active = ActiveRunState.from_lock_metadata(dict(lock_state))
+    workspace = active.workspace if active is not None else None
+    claimed_repo = workspace.worktree if workspace is not None else execution_repo
+    branch = (
+        workspace.branch
+        if workspace is not None
+        else git_output(execution_repo, "branch", "--show-current") or "HEAD"
+    )
+    context = {
+        "VIBE_LOOP_REPO": str(claimed_repo),
+        "VIBE_LOOP_WORKTREE": str(claimed_repo),
+        "VIBE_LOOP_BRANCH": branch,
+        "VIBE_LOOP_STATE_DIR": str(control_repo / ".vibe-loop"),
+        "VIBE_LOOP_PRIMARY_REPO": str(control_repo),
+    }
+    if active is not None and str(active.log_path):
+        log_path = active.log_path
+        context["VIBE_LOOP_LOG"] = str(
+            log_path if log_path.is_absolute() else control_repo / log_path
+        )
+    context["VIBE_LOOP_FENCING_TOKEN"] = token
+    return context
 
 
 def seeded_run_id(lock_state: Mapping[str, object]) -> str | None:

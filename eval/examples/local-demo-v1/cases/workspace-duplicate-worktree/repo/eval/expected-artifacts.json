@@ -16,6 +16,16 @@
   "artifact_contract": {
     "artifact_json_fields": [
       {
+        "role": "lock_evidence",
+        "field": "before.task_id",
+        "equals": "DUP-01"
+      },
+      {
+        "role": "lock_evidence",
+        "field": "before.run_id",
+        "equals": "eval-run-dup-01"
+      },
+      {
         "role": "report_evidence",
         "field": "latest.status",
         "equals": "blocked"

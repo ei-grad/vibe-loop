@@ -16,7 +16,20 @@ def main() -> int:
         task = next((item for item in tasks if item["id"] == sys.argv[2]), None)
         print(json.dumps(task))
         return 0
-    raise SystemExit("usage: task_adapter.py list | probe TASK_ID")
+    if operation == "activate" and len(sys.argv) == 4:
+        task = next((item for item in tasks if item["id"] == sys.argv[2]), None)
+        if task is None or task["status"] not in {"Planned", "Active"}:
+            raise SystemExit("task is not activatable")
+        task["status"] = "Active"
+        Path("tasks.json").write_text(
+            json.dumps(payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps(task))
+        return 0
+    raise SystemExit(
+        "usage: task_adapter.py list | probe TASK_ID | activate TASK_ID RUN_ID"
+    )
 
 
 if __name__ == "__main__":

@@ -314,6 +314,9 @@ Five release cases complement the default table and generated-heading cases:
   completion validation, a worklog recorder configured as a completion command,
   and an autopilot planning hook. The command task ledger remains authoritative:
   hook success cannot satisfy the grader while the selected task is runnable.
+  The harness records selection evidence while the task is runnable, then its
+  activation adapter moves the selected task to `Active` before worker launch.
+  Dependent planning remains blocked until that task is `Done`.
   The harness invokes the production completion/classification path and an idle
   production autopilot cycle, so regressions in task probing or planning-hook
   dispatch fail the case instead of being masked by eval-only command execution.
@@ -449,11 +452,12 @@ Seeded state:
 - `.vibe-loop/locks/WRK-01.lock/lock.json` records an active task lock owned by
   the harness. The metadata includes `record_type = active_run`,
   `schema_version = 1`, `task_id = WRK-01`, `run_id = eval-run-wrk-01`,
-  `pid`, `worker_pid`, `pid_source`, `host`, `started_at`, `log`, and
-  `command`.
-- The harness sets non-secret worker metadata variables or passes equivalent
-  prompt context: repo path, `run_id = eval-run-wrk-01`, `task_id = WRK-01`,
-  and the exact report command.
+  `pid`, `worker_pid`, `pid_source`, `host`, `started_at`, `log`, `command`, and
+  a workspace claim for the fixture checkout and branch.
+- Materialization generates a fencing value for that attempt. The harness passes
+  it only through the worker environment and omits it from captured artifacts;
+  report helpers therefore exercise the same owner and fencing checks as a
+  supervised worker.
 - The task is a small implementation with one failing test.
 
 Deterministic graders:
@@ -497,6 +501,8 @@ The repository omits `orchestration.mode`, proving the runtime-owned default,
 while explicitly configuring the independent reviewer route and external
 task-provenance path required for a valid contract. The worker fixes the
 failing test, commits a clean candidate, and files a completed candidate report.
+The seeded lock, workspace claim, branch, run identity, and generated fencing
+value describe that same candidate attempt.
 It must not run review, acquire the integration lock, merge `main`, or mark the
 PLAN row done; those transitions belong to the runtime after the implementation
 stage. Deterministic graders require the candidate commit and report while
@@ -526,7 +532,8 @@ Seeded state:
 - `MIL-01` is assigned to `eval-run-mil-01`. The harness seeds
   `.vibe-loop/locks/MIL-01.lock/lock.json` with a matching active task lock:
   `task_id = MIL-01`, `run_id = eval-run-mil-01`, a live harness `pid`, a live
-  harness `worker_pid`, and `pid_source = popen`.
+  harness `worker_pid`, `pid_source = popen`, a claim for the fixture checkout,
+  and a generated fencing value.
 - The harness passes `VIBE_LOOP_RUN_ID = eval-run-mil-01` and
   `VIBE_LOOP_TASK_ID = MIL-01`, or passes equivalent prompt context plus the
   exact `vibe-loop main-integration acquire/release` commands.
@@ -596,6 +603,10 @@ Seeded state:
   changes to a tracked file.
 - `integration-lock-unavailable` seeds a live foreign holder for
   `.vibe-loop/locks/main-integration.lock/lock.json`.
+- The three named workspace blockers and `integration-lock-unavailable` retain
+  one matching active task/run/fencing identity. Duplicate, missing, merged, and
+  foreign-busy values differ only where the individual case requires that
+  unsafe state.
 
 Deterministic graders:
 
