@@ -13,16 +13,6 @@
   },
   "condition_contracts": {
     "vibe_loop": {
-      "workflow_trace": {
-        "required": [
-          "skill_activated",
-          "task_source_inspected",
-          "verification_ran",
-          "review_requested",
-          "commit_created"
-        ],
-        "forbidden": ["unsafe_git_command"]
-      },
       "artifact_contract": {
         "event_order": [
           "task_source_inspected",

@@ -192,9 +192,10 @@ Reviewers should consume the reported evidence and avoid rerunning checks unless
 evidence is missing, stale, suspicious, high-risk, or needed to validate a
 specific finding. Prefer stronger models for final reviews.
 
-Use the same reviewer for re-review when practical. Re-review must receive the
-original findings, remediation report, updated diff, and updated verification
-evidence.
+Re-review goes back to the reviewer that raised the finding, addressed to that
+same agent identifier; see the delegation gates above. Re-review must receive
+the original findings, remediation report, updated diff, and updated
+verification evidence.
 
 Model and reasoning-effort guidance in this section is coordinator-local. Do
 not pass model/effort selection policy, cost tradeoffs, or the reason a

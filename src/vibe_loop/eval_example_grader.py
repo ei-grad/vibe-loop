@@ -424,7 +424,7 @@ def run_artifact_checks(
         artifact_required_roles(record, case),
         artifact_budget(record, case),
         artifact_workflow_trace(artifact_root, record, spec),
-        artifact_orchestrated_delegation(artifact_root, record, spec),
+        artifact_orchestrated_delegation(artifact_root, record, spec, case),
         artifact_case_contract(repo, artifact_root, spec),
     ]
     required_roles = set(string_list(case.get("expected_artifact_roles")))
@@ -653,6 +653,7 @@ def artifact_orchestrated_delegation(
     artifact_root: Path,
     record: Mapping[str, Any],
     spec: Mapping[str, Any],
+    case: Mapping[str, Any],
 ) -> dict[str, object]:
     expectations = condition_contract(spec, record, "workflow_trace")
     base_required = (
@@ -677,6 +678,8 @@ def artifact_orchestrated_delegation(
         )
     agents = list_of_mappings(payload.get("agents"))
     diagnostics: list[str] = []
+    product_edits = orchestrator_product_edits(payload, case)
+    stream_writing_roles: list[str] = []
     for role in sorted(required_roles):
         matches = [agent for agent in agents if agent.get("role") == role]
         if not matches:
@@ -688,15 +691,26 @@ def artifact_orchestrated_delegation(
         for field in ("prompt_present", "result_present"):
             if agent.get(field) is not True:
                 diagnostics.append(f"{role}.{field} is required")
-        # A writing role claimed by an agent-written artifact must show the
-        # files it touched. Stream-derived records carry no path list, and are
-        # not agent-authored, so the claim cannot be spoofed there.
-        if role in {"implementer", "remediator"} and (
-            agent.get("evidence_source") != "native_stream"
-        ):
+        if role not in {"implementer", "remediator"}:
+            continue
+        if agent.get("evidence_source") == "native_stream":
+            # A stream cannot attribute writes to a subagent, so the writing
+            # role is checked from the other side: the main session must not
+            # have made the product edits itself behind a delegation record.
+            stream_writing_roles.append(role)
+        else:
+            # An agent-written record claiming a writing role must show the
+            # files it touched.
             changed = agent.get("changed_path_count")
             if not isinstance(changed, int) or isinstance(changed, bool) or changed < 1:
                 diagnostics.append(f"{role}.changed_path_count must be positive")
+    if stream_writing_roles and product_edits:
+        diagnostics.append(
+            "main orchestrator made the product edits assigned to "
+            + ", ".join(sorted(stream_writing_roles))
+            + ": "
+            + ", ".join(product_edits)
+        )
     role_agents = {
         role: next((agent for agent in agents if agent.get("role") == role), None)
         for role in required_roles
@@ -726,6 +740,37 @@ def artifact_orchestrated_delegation(
     if diagnostics:
         return failed("artifact-orchestrated-delegation", "; ".join(diagnostics))
     return passed("artifact-orchestrated-delegation")
+
+
+def orchestrator_product_edits(
+    payload: Mapping[str, Any], case: Mapping[str, Any]
+) -> list[str]:
+    """Main-session writes that are not authoritative task-source bookkeeping.
+
+    Completing the task row is the orchestrator's own step, so the task source
+    it is generated from stays permitted; anything else it writes is the
+    implementation it was required to delegate.
+    """
+    bookkeeping = authoritative_task_source_paths(case)
+    return sorted(
+        path
+        for path in string_list(payload.get("orchestrator_written_paths"))
+        if path not in bookkeeping
+    )
+
+
+def authoritative_task_source_paths(case: Mapping[str, Any]) -> set[str]:
+    task_source = case.get("task_source")
+    if not isinstance(task_source, Mapping):
+        return set()
+    paths = set()
+    plan_path = task_source.get("plan_path")
+    if isinstance(plan_path, str) and plan_path:
+        paths.add(plan_path)
+    profile = task_source.get("profile")
+    if isinstance(profile, Mapping):
+        paths.update(string_list(profile.get("source_paths")))
+    return paths
 
 
 def orchestrated_required_roles(

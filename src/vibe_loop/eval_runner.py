@@ -47,6 +47,7 @@ from vibe_loop.evals import (
     CLI_CONDITIONS,
     EVAL_CONDITIONS,
     EVAL_FAILURE_TAXONOMY,
+    EVAL_MAX_IDENTIFIER_LENGTH,
     EVAL_MAX_STRUCTURED_BYTES,
     SKILL_CONDITIONS,
     EvalArtifactRef,
@@ -113,6 +114,12 @@ DELEGATION_WAIT_TOOLS = frozenset({"wait", "wait_agent", "wait_for_agent"})
 DELEGATION_DESCRIPTION_FIELDS = ("message", "prompt", "task_name", "description")
 DELEGATION_LABEL_FIELDS = ("task_name", "description")
 DELEGATION_AGENT_ID_FIELDS = ("target", "to", "agent_id", "name")
+# Main-session file writes. Codex reports them as item types, Claude as tool
+# names; a shell redirect is invisible to both, so absence is not proof.
+CLAUDE_FILE_WRITE_TOOLS = frozenset({"edit", "write", "notebookedit"})
+CLAUDE_FILE_WRITE_PATH_FIELDS = ("file_path", "notebook_path", "path")
+CODEX_FILE_WRITE_ITEM_TYPES = frozenset({"file_change", "patch_apply"})
+NATIVE_ORCHESTRATOR_PATH_LIMIT = 32
 DELEGATION_COMPLETED_STATES = frozenset({"completed", "done", "finished", "success"})
 # A failed agent still reports explanatory text, so result presence alone would
 # credit a delegation that produced no agent output.
@@ -161,7 +168,7 @@ STRUCTURED_ARTIFACT_TOP_LEVEL_FIELDS = {
     },
     "budget-evidence.json": {"duration_seconds", "output_bytes", "timeout"},
     "command-results.json": {"commands"},
-    "delegation-evidence.json": {"agents"},
+    "delegation-evidence.json": {"agents", "orchestrator_written_paths"},
     "final-repo-state.json": {
         "branch",
         "branch_count",
@@ -378,6 +385,7 @@ class AgentCommandBatch:
     command_results: tuple[dict[str, object], ...]
     workflow_events: tuple[str, ...] = ()
     delegation_evidence: tuple[dict[str, object], ...] = ()
+    orchestrator_written_paths: tuple[str, ...] = ()
     transcript_rejected: bool = False
     evidence_diagnostics: tuple[str, ...] = ()
 
@@ -1172,13 +1180,17 @@ def execute_trial_agent_commands(
         budgets=budgets,
     )
     stream_events: tuple[str, ...] = ()
-    delegation_evidence: tuple[dict[str, object], ...] = ()
+    delegation = NativeDelegationRecords()
     transcript_rejected = False
     if is_stream_json(execution.stdout):
         raw_stream = execution.stdout
         _, parsed_events = parse_stream_json(raw_stream)
         stream_events = tuple(parsed_events)
-        delegation_evidence = native_delegation_evidence(raw_stream)
+        delegation = native_delegation_records(
+            raw_stream,
+            repo=repo,
+            artifact_root=trial_root,
+        )
         transcript_path = artifact_path(trial_root, "transcript")
         try:
             records = project_transcript_jsonl(raw_stream)
@@ -1190,7 +1202,8 @@ def execute_trial_agent_commands(
         execution=execution,
         command_results=({"type": "agent", **execution.to_json()},),
         workflow_events=stream_events,
-        delegation_evidence=delegation_evidence,
+        delegation_evidence=delegation.agents,
+        orchestrator_written_paths=delegation.orchestrator_written_paths,
         transcript_rejected=transcript_rejected,
     )
 
@@ -2479,9 +2492,10 @@ def delegation_events_for_tool(name: str, inp: Mapping[str, object]) -> list[str
     # A short assignment label states the role directly; free-text prose is only
     # consulted when no label is given.
     role = delegation_role_from_text(label) or delegation_role_from_text(description)
-    if role == "remediator" and "remediat" not in description:
+    if role == "remediator" and not followup:
         # A spawn opens a new assignment rather than handing a finding back, so
-        # fix/address wording alone describes implementation work.
+        # fix/address wording alone describes implementation work. A follow-up
+        # reaches an agent that already ran, so the same wording is a handback.
         role = "implementer"
     if role == "reviewer":
         if followup:
@@ -2509,6 +2523,43 @@ class NativeDelegationStream:
         self.resolved_calls: set[tuple[str, str]] = set()
         self.resolved_agents: set[str] = set()
         self.pending_tool_uses: dict[str, str] = {}
+        # Files the main session edited itself. A stream cannot attribute writes
+        # to a subagent, so this is the observable that separates an orchestrator
+        # that delegated the work from one that did the work behind a decoy.
+        self.orchestrator_paths: set[str] = set()
+        self.repo: Path | None = None
+        self.artifact_root: Path | None = None
+
+    def record_written_paths(self, paths: set[str]) -> None:
+        for path in paths:
+            relative = self.repo_relative_write(path)
+            if relative is not None:
+                self.orchestrator_paths.add(relative)
+
+    def repo_relative_write(self, value: str) -> str | None:
+        """Repo-relative form of a written path, or None when out of scope.
+
+        Writes outside the trial repository are the agent's own scratch, and
+        writes under the artifact root are the structured artifacts cases ask
+        agents to produce. Neither is an edit to the product under test.
+        """
+        if self.repo is None:
+            return None
+        try:
+            resolved = Path(value.strip())
+            if not resolved.is_absolute():
+                resolved = self.repo / resolved
+            relative = resolved.resolve().relative_to(self.repo)
+        except (OSError, ValueError):
+            return None
+        if self.artifact_root is not None:
+            try:
+                resolved.resolve().relative_to(self.artifact_root)
+            except ValueError:
+                pass
+            else:
+                return None
+        return relative.as_posix()[:EVAL_MAX_IDENTIFIER_LENGTH]
 
     def record(
         self, role: str, agent_id: str, arguments: Mapping[str, object]
@@ -2538,9 +2589,29 @@ class NativeDelegationStream:
             if key in self.resolved_calls or key[1] in self.resolved_agents
         )
 
+    def written_paths(self) -> tuple[str, ...]:
+        return tuple(sorted(self.orchestrator_paths)[:NATIVE_ORCHESTRATOR_PATH_LIMIT])
 
-def native_delegation_evidence(raw: str) -> tuple[dict[str, object], ...]:
+
+@dataclasses.dataclass(frozen=True)
+class NativeDelegationRecords:
+    """What one structured stream says about who delegated and who wrote."""
+
+    agents: tuple[dict[str, object], ...] = ()
+    orchestrator_written_paths: tuple[str, ...] = ()
+
+
+def native_delegation_records(
+    raw: str,
+    *,
+    repo: Path | None = None,
+    artifact_root: Path | None = None,
+) -> NativeDelegationRecords:
     stream = NativeDelegationStream()
+    stream.repo = repo.resolve() if repo is not None else None
+    stream.artifact_root = (
+        artifact_root.resolve() if artifact_root is not None else None
+    )
     for line in raw.splitlines():
         line = line.strip()
         if not line:
@@ -2548,29 +2619,39 @@ def native_delegation_evidence(raw: str) -> tuple[dict[str, object], ...]:
         try:
             envelope = json.loads(line)
         except (json.JSONDecodeError, ValueError):
-            return ()
+            return NativeDelegationRecords()
         if not isinstance(envelope, Mapping):
-            return ()
+            return NativeDelegationRecords()
         item = envelope.get("item")
-        # An agent chooses the identifiers this reads, so a rejected one is a
-        # delegation the harness cannot attribute, not a harness error: report
-        # no native evidence rather than raising out of the trial.
+        # Backstop only: an agent-chosen value that fails a safety envelope is
+        # bad evidence, not a harness error, and must never raise out of the
+        # trial. Unusable delegate identifiers are dropped per record above.
         try:
             if isinstance(item, Mapping):
                 if not collect_codex_delegation_item(item, stream):
-                    return ()
+                    return NativeDelegationRecords()
                 continue
             if not collect_claude_delegation_envelope(envelope, stream):
-                return ()
+                return NativeDelegationRecords()
         except EvalSafeEnvelopeError:
-            return ()
-    return stream.evidence()
+            return NativeDelegationRecords()
+    return NativeDelegationRecords(
+        agents=stream.evidence(),
+        orchestrator_written_paths=stream.written_paths(),
+    )
+
+
+def native_delegation_evidence(raw: str) -> tuple[dict[str, object], ...]:
+    return native_delegation_records(raw).agents
 
 
 def collect_codex_delegation_item(
     item: Mapping[str, object], stream: NativeDelegationStream
 ) -> bool:
     item_type = item.get("type")
+    if item_type in CODEX_FILE_WRITE_ITEM_TYPES:
+        stream.record_written_paths(codex_changed_paths(item))
+        return True
     if item_type not in {"collab_tool_call", "mcp_tool_call"}:
         return True
     if item_type == "mcp_tool_call" and item.get("server") not in {
@@ -2595,7 +2676,7 @@ def collect_codex_delegation_item(
         return True
     agent_id = native_delegation_agent_id(item, arguments)
     if not agent_id:
-        return False
+        return True
     key = stream.record(role, agent_id, arguments)
     if not delegation_item_failed(item) and native_delegation_result_present(
         item.get("result")
@@ -2632,12 +2713,17 @@ def collect_claude_delegation_envelope(
             arguments = block.get("input")
             if not isinstance(arguments, Mapping):
                 arguments = {}
+            if name.casefold().replace("-", "_").replace("_", "") in (
+                CLAUDE_FILE_WRITE_TOOLS
+            ):
+                stream.record_written_paths(claude_written_paths(arguments))
+                continue
             role = delegation_role_for_tool(name, arguments)
             if role is None:
                 continue
             agent_id = claude_delegation_agent_id(block, arguments)
             if not agent_id:
-                return False
+                continue
             key = stream.record(role, agent_id, arguments)
             tool_use_id = block.get("id")
             if isinstance(tool_use_id, str) and tool_use_id:
@@ -2664,11 +2750,46 @@ def claude_delegation_agent_id(
     for field in DELEGATION_AGENT_ID_FIELDS:
         value = arguments.get(field)
         if isinstance(value, str) and value:
-            return safe_identifier(value, category="delegation agent id")
+            return attributable_agent_id(value)
     value = block.get("id")
     if isinstance(value, str) and value:
-        return safe_identifier(value, category="delegation agent id")
+        return attributable_agent_id(value)
     return ""
+
+
+def claude_written_paths(arguments: Mapping[str, object]) -> set[str]:
+    return {
+        value
+        for field in CLAUDE_FILE_WRITE_PATH_FIELDS
+        if isinstance(value := arguments.get(field), str) and value.strip()
+    }
+
+
+def codex_changed_paths(item: Mapping[str, object]) -> set[str]:
+    changes = item.get("changes")
+    if isinstance(changes, Mapping):
+        candidates: Sequence[object] = list(changes)
+    elif isinstance(changes, Sequence) and not isinstance(changes, (str, bytes)):
+        candidates = [
+            entry.get("path") if isinstance(entry, Mapping) else entry
+            for entry in changes
+        ]
+    else:
+        return set()
+    return {value for value in candidates if isinstance(value, str) and value.strip()}
+
+
+def attributable_agent_id(value: str) -> str:
+    """Normalize a delegate identifier, or return "" when it cannot be used.
+
+    Agents choose these names, so an unusable one -- anything with a space, say
+    -- means this single delegation cannot be attributed. That costs the call
+    its record; it does not make the surrounding stream untrustworthy.
+    """
+    try:
+        return safe_identifier(value, category="delegation agent id")
+    except EvalSafeEnvelopeError:
+        return ""
 
 
 def claude_tool_result_present(content: object) -> bool:
@@ -2735,7 +2856,10 @@ def persist_native_delegation_evidence(
     write_json_artifact(
         artifact_root,
         "delegation_evidence",
-        {"agents": list(agent_batch.delegation_evidence)},
+        {
+            "agents": list(agent_batch.delegation_evidence),
+            "orchestrator_written_paths": list(agent_batch.orchestrator_written_paths),
+        },
     )
 
 
@@ -2766,15 +2890,15 @@ def native_delegation_agent_id(
         result_mapping.get("target"),
     ):
         if isinstance(value, str) and value:
-            return safe_identifier(value, category="delegation agent id")
+            return attributable_agent_id(value)
     receivers = item.get("receiver_thread_ids")
     if isinstance(receivers, Sequence) and not isinstance(receivers, (str, bytes)):
         for value in receivers:
             if isinstance(value, str) and value:
-                return safe_identifier(value, category="delegation agent id")
+                return attributable_agent_id(value)
     value = item.get("id")
     if isinstance(value, str) and value:
-        return safe_identifier(value, category="delegation agent id")
+        return attributable_agent_id(value)
     return ""
 
 

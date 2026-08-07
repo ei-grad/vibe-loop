@@ -57,10 +57,9 @@ in this skill remains authoritative.
 4. Run relevant tests/checks. Prove acceptance scenarios with real assertions;
    use integration tests for external systems and UI automation/screenshots for
    UI changes.
-5. Run independent spec review, then independent code-quality review when
-   available.
-6. Address findings with code, tests, or docs; re-review, preferably with the
-   same reviewer, until no material findings remain or remediation is tracked.
+5. Run independent spec review, then independent code-quality review.
+6. Address findings with code, tests, or docs; re-review with the same reviewer
+   until no material findings remain or remediation is tracked.
 7. Commit the reviewed slice, integrate it to `main` when permitted, verify on
    `main`, apply the cleanup authorization rule below, and stop.
 

@@ -30,6 +30,7 @@ from vibe_loop.eval_runner import (
     ensure_stream_json_format,
     execute_agent_command,
     native_delegation_evidence,
+    native_delegation_records,
     parse_stream_json,
     persist_native_delegation_evidence,
     render_aggregate_markdown,
@@ -2643,30 +2644,45 @@ class EvalRunnerCliTests(unittest.TestCase):
 
         self.assertEqual(native_delegation_evidence(stream), ())
 
-    def test_native_delegation_rejects_unsafe_agent_identifier(self) -> None:
-        # The agent chooses these identifiers, so an unusable one must degrade
-        # to "no native evidence" instead of raising out of the trial.
-        stream = json.dumps(
-            {
-                "type": "item.completed",
-                "item": {
-                    "id": "call-1",
-                    "type": "collab_tool_call",
-                    "tool": "spawn_agent",
-                    "arguments": {
-                        "target": "impl agent",
-                        "task_name": "implement",
-                        "message": "Implement the change",
+    def test_unattributable_delegation_drops_only_its_own_record(self) -> None:
+        # The agent chooses these identifiers, so an unusable one must cost that
+        # one delegation its record without raising out of the trial or voiding
+        # the delegations the same run made correctly.
+        def spawn(call_id: str, target: str, task: str, message: str) -> str:
+            return json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": call_id,
+                        "type": "collab_tool_call",
+                        "tool": "spawn_agent",
+                        "arguments": {
+                            "target": target,
+                            "task_name": task,
+                            "message": message,
+                        },
+                        "result": {"output": "reported"},
+                        "status": "completed",
                     },
-                    "result": {"output": "done"},
-                    "status": "completed",
-                },
-            }
+                }
+            )
+
+        stream = "\n".join(
+            (
+                spawn("c1", "explorer-1", "explore", "Investigate the parser"),
+                spawn("c2", "impl agent", "implement", "Implement the change"),
+                spawn("c3", "reviewer-1", "review", "Review the candidate"),
+            )
         )
 
-        self.assertEqual(native_delegation_evidence(stream), ())
+        evidence = native_delegation_evidence(stream)
 
-    def test_native_claude_delegation_rejects_unsafe_agent_identifier(self) -> None:
+        self.assertEqual(
+            [(record["role"], record["agent_id"]) for record in evidence],
+            [("explorer", "explorer-1"), ("reviewer", "reviewer-1")],
+        )
+
+    def test_native_claude_delegation_drops_unsafe_agent_identifier(self) -> None:
         stream = json.dumps(
             {
                 "type": "assistant",
@@ -2730,10 +2746,16 @@ class EvalRunnerCliTests(unittest.TestCase):
                     ["implementation_delegated"],
                 )
 
+        # A follow-up reaches an agent that already ran, so remediation wording
+        # is a handback whether or not it says "finding" or "remediate".
         handbacks = (
             "Address the review finding and fix the parser.",
             "After the review, address the finding.",
             "Remediate the material finding",
+            "Address the whitespace-only gap the reviewer reported",
+            "Please fix the gap you introduced",
+            "Correct the validator so the edge case is rejected",
+            "Resolve what came back from review",
         )
         for message in handbacks:
             with self.subTest(message=message):
@@ -2744,6 +2766,22 @@ class EvalRunnerCliTests(unittest.TestCase):
                     ),
                     ["review_finding_received", "remediation_delegated"],
                 )
+                self.assertEqual(
+                    delegation_role_for_tool(
+                        "followup_task",
+                        {"target": "implementer-1", "message": message},
+                    ),
+                    "remediator",
+                )
+
+        # A follow-up that opens fresh work is still implementation.
+        self.assertEqual(
+            delegation_events_for_tool(
+                "followup_task",
+                {"target": "implementer-1", "message": "Implement the remaining rows"},
+            ),
+            ["implementation_delegated"],
+        )
 
         closures = ("Run a targeted closure review", "Re-review the change")
         for message in closures:
@@ -2905,6 +2943,77 @@ class EvalRunnerCliTests(unittest.TestCase):
 
         self.assertEqual(native_delegation_evidence(stream), ())
 
+    def test_native_stream_records_only_in_repo_orchestrator_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            artifacts = repo / "eval-artifacts"
+            artifacts.mkdir(parents=True)
+            stream = "\n".join(
+                (
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "id": "toolu_1",
+                                        "name": "Edit",
+                                        "input": {
+                                            "file_path": str(
+                                                repo / "src" / "demo" / "slugs.py"
+                                            )
+                                        },
+                                    },
+                                    {
+                                        "type": "tool_use",
+                                        "id": "toolu_2",
+                                        "name": "Write",
+                                        "input": {
+                                            "file_path": str(
+                                                artifacts / "review-evidence.json"
+                                            )
+                                        },
+                                    },
+                                    {
+                                        "type": "tool_use",
+                                        "id": "toolu_3",
+                                        "name": "Write",
+                                        "input": {
+                                            "file_path": str(root / "scratch.md")
+                                        },
+                                    },
+                                ],
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "id": "call-1",
+                                "type": "patch_apply",
+                                "status": "completed",
+                                "changes": {"PLAN.md": {"kind": "update"}},
+                            },
+                        }
+                    ),
+                )
+            )
+
+            records = native_delegation_records(
+                stream,
+                repo=repo,
+                artifact_root=artifacts,
+            )
+
+        self.assertEqual(
+            records.orchestrator_written_paths,
+            ("PLAN.md", "src/demo/slugs.py"),
+        )
+
     def test_agent_written_delegation_evidence_needs_changed_paths(self) -> None:
         record = {
             "suite_id": "local-demo-v1",
@@ -2950,20 +3059,21 @@ class EvalRunnerCliTests(unittest.TestCase):
                 "evidence_source": "artifact",
             },
         ]
+        case = {"task_source": {"type": "markdown-plan", "plan_path": "PLAN.md"}}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = root / "delegation-evidence.json"
             path.write_text(json.dumps({"agents": agents}), encoding="utf-8")
-            spoofed = artifact_orchestrated_delegation(root, record, spec)
+            spoofed = artifact_orchestrated_delegation(root, record, spec, case)
 
             agents[0]["changed_path_count"] = 2
             path.write_text(json.dumps({"agents": agents}), encoding="utf-8")
-            honest = artifact_orchestrated_delegation(root, record, spec)
+            honest = artifact_orchestrated_delegation(root, record, spec, case)
 
             agents[0]["changed_path_count"] = 0
             agents[0]["evidence_source"] = "native_stream"
             path.write_text(json.dumps({"agents": agents}), encoding="utf-8")
-            native = artifact_orchestrated_delegation(root, record, spec)
+            native = artifact_orchestrated_delegation(root, record, spec, case)
 
         self.assertFalse(spoofed["passed"])
         self.assertIn(
@@ -2972,6 +3082,66 @@ class EvalRunnerCliTests(unittest.TestCase):
         )
         self.assertTrue(honest["passed"])
         self.assertTrue(native["passed"])
+
+    def test_native_stream_implementer_fails_when_orchestrator_wrote_the_code(
+        self,
+    ) -> None:
+        # A stream cannot attribute writes to a subagent, so a decoy implementer
+        # is caught from the other side: the main session made the edits.
+        record = {
+            "suite_id": "local-demo-v1",
+            "case_id": "finite-py-plan-table",
+            "condition": "orchestrated_vibe_loop",
+            "task": {"should_trigger": True},
+            "artifacts": [
+                {"role": "delegation_evidence", "path": "delegation-evidence.json"}
+            ],
+        }
+        spec = {
+            "condition_contracts": {
+                "orchestrated_vibe_loop": {
+                    "workflow_trace": {
+                        "required": ["implementation_delegated", "review_delegated"]
+                    }
+                }
+            }
+        }
+        agents = [
+            {
+                "role": role,
+                "agent_id": f"{role}-1",
+                "prompt_present": True,
+                "result_present": True,
+                "changed_path_count": 0,
+                "evidence_source": "native_stream",
+            }
+            for role in ("implementer", "explorer", "reviewer")
+        ]
+        case = {"task_source": {"type": "markdown-plan", "plan_path": "PLAN.md"}}
+
+        def grade(written: list[str]) -> dict[str, object]:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "delegation-evidence.json").write_text(
+                    json.dumps(
+                        {"agents": agents, "orchestrator_written_paths": written}
+                    ),
+                    encoding="utf-8",
+                )
+                return artifact_orchestrated_delegation(root, record, spec, case)
+
+        delegated = grade([])
+        # Completing the task row is the orchestrator's own documented step.
+        bookkeeping_only = grade(["PLAN.md"])
+        self_implemented = grade(["PLAN.md", "src/plan_demo/slugs.py"])
+
+        self.assertTrue(delegated["passed"])
+        self.assertTrue(bookkeeping_only["passed"])
+        self.assertFalse(self_implemented["passed"])
+        self.assertIn(
+            "src/plan_demo/slugs.py",
+            str(self_implemented.get("message", "")),
+        )
 
     def test_native_stream_ignores_agent_written_workflow_event_artifact(self) -> None:
         execution = CommandExecution(
@@ -3038,7 +3208,7 @@ class EvalRunnerCliTests(unittest.TestCase):
                 (root / "delegation-evidence.json").read_text(encoding="utf-8")
             )
 
-        self.assertEqual(evidence, {"agents": []})
+        self.assertEqual(evidence, {"agents": [], "orchestrator_written_paths": []})
 
     def test_codex_modeled_inert_tool_item_preserves_command_events(self) -> None:
         stream = "\n".join(
