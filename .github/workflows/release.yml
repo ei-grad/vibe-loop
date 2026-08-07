@@ -21,10 +21,6 @@ on:
         options:
           - TestPyPI
           - PyPI
-      readiness_run_id:
-        description: Optional workflow run containing exact-head skill readiness evidence
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -194,14 +190,10 @@ jobs:
       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
       github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
     steps:
-      - name: Check out the exact release revision with full history
+      - name: Check out the exact release revision
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          fetch-depth: 0
           persist-credentials: false
           ref: ${{ github.sha }}
 
@@ -219,171 +211,9 @@ jobs:
           name: python-package-distributions
           path: dist/
 
-      - name: Classify exact release changes
-        run: >-
-          uv run vibe-loop eval release-classify --repo .
-          --output release-classification.json --json
-
-      - name: Resolve immutable exact-head readiness evidence
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REQUESTED_RUN_ID: ${{ inputs.readiness_run_id }}
-        run: |
-          if python - <<'PY'
-          import json
-
-          with open("release-classification.json", encoding="utf-8") as handle:
-              classification = json.load(handle)
-          raise SystemExit(classification["status"] != "readiness_required")
-          PY
-          then
-            uv run python - <<'PY'
-          import io
-          import json
-          import os
-          import re
-          import urllib.error
-          import urllib.parse
-          import urllib.request
-          import zipfile
-
-          from vibe_loop.release_admission import (
-              ReleaseAdmissionError,
-              build_github_readiness_provenance,
-              mapping_sha256,
-              validate_github_readiness_source,
-          )
-
-          api_headers = {
-              "Accept": "application/vnd.github+json",
-              "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
-              "X-GitHub-Api-Version": "2022-11-28",
-          }
-
-          def api_json(url):
-              request = urllib.request.Request(url, headers=api_headers)
-              with urllib.request.urlopen(request) as response:
-                  return json.load(response)
-
-          class NoRedirect(urllib.request.HTTPRedirectHandler):
-              def redirect_request(self, request, fp, code, message, headers, newurl):
-                  return None
-
-          with open("release-classification.json", encoding="utf-8") as handle:
-              head = json.load(handle)["head"]
-          requested_run_id = os.environ.get("REQUESTED_RUN_ID", "").strip()
-          if requested_run_id and not re.fullmatch(r"[1-9][0-9]*", requested_run_id):
-              raise SystemExit("the requested readiness run id is malformed")
-          repository_name = os.environ["GITHUB_REPOSITORY"]
-          repository_url = f"{os.environ['GITHUB_API_URL']}/repos/{repository_name}"
-          repository = api_json(repository_url)
-          workflow_url = f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/actions/workflows/skill-readiness-evidence.yml"
-          workflow = api_json(workflow_url)
-          if not isinstance(repository, dict) or not isinstance(workflow, dict):
-              raise SystemExit("the GitHub repository or workflow response is malformed")
-          query = f"?name=skill-release-readiness-{head}&per_page=100"
-          url = f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/actions/artifacts{query}"
-          artifact_response = api_json(url)
-          if not isinstance(artifact_response, dict) or not isinstance(
-              artifact_response.get("artifacts"), list
-          ):
-              raise SystemExit("the GitHub artifact response is malformed")
-          artifacts = artifact_response["artifacts"]
-          candidates = []
-          for artifact in artifacts:
-              if not isinstance(artifact, dict):
-                  continue
-              workflow_run = artifact.get("workflow_run") or {}
-              run_id = str(workflow_run.get("id", ""))
-              if requested_run_id and run_id != requested_run_id:
-                  continue
-              if not re.fullmatch(r"[1-9][0-9]*", run_id):
-                  continue
-              run_url = f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{run_id}"
-              run = api_json(run_url)
-              if not isinstance(run, dict):
-                  continue
-              try:
-                  validate_github_readiness_source(
-                      expected_repository=repository_name,
-                      expected_head=head,
-                      repository=repository,
-                      workflow=workflow,
-                      run=run,
-                      artifact=artifact,
-                  )
-              except ReleaseAdmissionError:
-                  continue
-              candidates.append((artifact, run))
-          if not candidates:
-              raise SystemExit("no validated exact-head readiness artifact was found")
-          artifact, run = max(candidates, key=lambda item: item[0]["id"])
-          download = urllib.request.Request(
-              artifact["archive_download_url"], headers=api_headers
-          )
-          opener = urllib.request.build_opener(NoRedirect)
-          try:
-              with opener.open(download) as response:
-                  archive_bytes = response.read()
-          except urllib.error.HTTPError as exc:
-              if exc.code not in {301, 302, 303, 307, 308}:
-                  raise
-              location = exc.headers.get("Location")
-              exc.close()
-              if not location:
-                  raise SystemExit("readiness artifact redirect is missing a location")
-              signed_url = urllib.parse.urljoin(
-                  artifact["archive_download_url"], location
-              )
-              if urllib.parse.urlsplit(signed_url).scheme != "https":
-                  raise SystemExit("readiness artifact redirect is not HTTPS")
-              try:
-                  with urllib.request.urlopen(signed_url) as response:
-                      archive_bytes = response.read()
-              except urllib.error.URLError:
-                  raise SystemExit("readiness artifact download failed") from None
-          with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
-              names = archive.namelist()
-              if names != ["release-readiness.json"]:
-                  raise SystemExit("readiness artifact must contain only release-readiness.json")
-              with open("release-readiness.json", "wb") as output:
-                  output.write(archive.read(names[0]))
-          with open("release-readiness.json", encoding="utf-8") as handle:
-              readiness = json.load(handle)
-          if not isinstance(readiness, dict):
-              raise SystemExit("readiness artifact record is malformed")
-          provenance = build_github_readiness_provenance(
-              expected_repository=repository_name,
-              expected_head=head,
-              repository=repository,
-              workflow=workflow,
-              run=run,
-              artifact=artifact,
-              readiness_sha256=mapping_sha256(readiness),
-          )
-          with open(
-              "release-readiness-provenance.json", "w", encoding="utf-8"
-          ) as output:
-              json.dump(provenance, output, indent=2, sort_keys=True)
-              output.write("\n")
-          PY
-          fi
-
-      - name: Build readiness admission
-        if: hashFiles('release-readiness.json') != ''
+      - name: Bind distributions to the exact release revision
         run: >-
           uv run vibe-loop eval release-admit --repo .
-          --classification release-classification.json
-          --readiness-record release-readiness.json
-          --readiness-provenance release-readiness-provenance.json
-          --distribution dist/*.whl --distribution dist/*.tar.gz
-          --output release-admission.json
-
-      - name: Build unrelated-release exemption admission
-        if: hashFiles('release-readiness.json') == ''
-        run: >-
-          uv run vibe-loop eval release-admit --repo .
-          --classification release-classification.json
           --distribution dist/*.whl --distribution dist/*.tar.gz
           --output release-admission.json
 
@@ -411,11 +241,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: publish-admission-${{ github.sha }}
-          path: |
-            release-classification.json
-            release-readiness.json
-            release-readiness-provenance.json
-            release-admission.json
+          path: release-admission.json
           if-no-files-found: error
           retention-days: 7
 
@@ -430,14 +256,12 @@ jobs:
       name: TestPyPI
       url: https://test.pypi.org/project/vibe-loop/
     permissions:
-      actions: read
       contents: read
       id-token: write
     steps:
-      - name: Check out exact release history for admission verification
+      - name: Check out the exact release revision for admission verification
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          fetch-depth: 0
           persist-credentials: false
           ref: ${{ github.sha }}
 
@@ -461,23 +285,12 @@ jobs:
           name: publish-admission-${{ github.sha }}
           path: admission/
 
-      - name: Verify transferred evidence and distributions
+      - name: Verify transferred admission and distributions
         shell: bash
         run: |
-          readiness=()
-          if [ -f admission/release-readiness.json ]; then
-            readiness+=(--readiness-record admission/release-readiness.json)
-          fi
-          if [ -f admission/release-readiness-provenance.json ]; then
-            readiness+=(
-              --readiness-provenance admission/release-readiness-provenance.json
-            )
-          fi
           uv run --no-project --with dist/*.whl vibe-loop eval release-admit \
-            --repo . --classification admission/release-classification.json \
-            "${readiness[@]}" --distribution dist/*.whl \
-            --distribution dist/*.tar.gz --output admission/release-admission.json \
-            --verify
+            --repo . --distribution dist/*.whl --distribution dist/*.tar.gz \
+            --output admission/release-admission.json --verify
 
       - name: Publish distributions to TestPyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
@@ -502,14 +315,12 @@ jobs:
       name: PyPI
       url: https://pypi.org/project/vibe-loop/
     permissions:
-      actions: read
       contents: read
       id-token: write
     steps:
-      - name: Check out exact release history for admission verification
+      - name: Check out the exact release revision for admission verification
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          fetch-depth: 0
           persist-credentials: false
           ref: ${{ github.sha }}
 
@@ -533,23 +344,12 @@ jobs:
           name: publish-admission-${{ github.sha }}
           path: admission/
 
-      - name: Verify transferred evidence and distributions
+      - name: Verify transferred admission and distributions
         shell: bash
         run: |
-          readiness=()
-          if [ -f admission/release-readiness.json ]; then
-            readiness+=(--readiness-record admission/release-readiness.json)
-          fi
-          if [ -f admission/release-readiness-provenance.json ]; then
-            readiness+=(
-              --readiness-provenance admission/release-readiness-provenance.json
-            )
-          fi
           uv run --no-project --with dist/*.whl vibe-loop eval release-admit \
-            --repo . --classification admission/release-classification.json \
-            "${readiness[@]}" --distribution dist/*.whl \
-            --distribution dist/*.tar.gz --output admission/release-admission.json \
-            --verify
+            --repo . --distribution dist/*.whl --distribution dist/*.tar.gz \
+            --output admission/release-admission.json --verify
 
       - name: Publish distributions to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0

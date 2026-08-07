@@ -216,6 +216,6 @@ publishing.
 
 Acceptance must cover supported Python version, install commands, release
 workflow behavior, TestPyPI/PyPI target distinction, tag/version matching, and
-release-readiness evidence requirements for bundled skill changes.
+the exact-revision admission requirement for published distributions.
 
 Related implementation IDs: `EVAL-06`.

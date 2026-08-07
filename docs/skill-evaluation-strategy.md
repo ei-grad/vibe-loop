@@ -87,10 +87,10 @@ Each trial needs a clean worktree or fresh fixture checkout. Do not reuse a
 modified repository, `.vibe-loop/` state directory, lock file, transcript, or
 skill cache across conditions unless that state is explicitly part of the task.
 
-Release-readiness matrix requirements are defined only by
-[PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate). Paired
+Release-matrix requirements are defined only by
+[PRD-EVL-005](prd/evals-release.md#prd-evl-005-pre-release-eval-usability). Paired
 no-skill evidence remains useful when measuring uplift or investigating
-regressions outside that release contract.
+regressions outside that pre-release check.
 
 ## Task Suite Design
 
@@ -245,21 +245,21 @@ Self-generated skills are not a substitute for curated skills. SkillsBench's
 results make this a separate research condition, not a release replacement for
 the bundled skills.
 
-## Release Readiness Gate
+## Pre-Release Release Matrix
 
-The authoritative release contract, including the current matrix size and
-blocking conditions, is
-[PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate). The gate
-uses a compact curated matrix because release evidence should emphasize
+The authoritative contract, including the current matrix size and blocking
+conditions, is
+[PRD-EVL-005](prd/evals-release.md#prd-evl-005-pre-release-eval-usability). The
+matrix is compact and curated because a pre-release check should emphasize
 workflow-contract regressions and representative task-source/workspace paths
 rather than rerun every exploratory comparison. Cost, latency, and broad
 external benchmark comparisons remain useful research evidence without
-substituting for that local contract.
+substituting for that local check.
 
 ## Command Entry Points
 
 `vibe-loop eval local-demo` runs the paired local fixture suite,
-`vibe-loop eval release-gate` creates or validates release-readiness evidence,
+`vibe-loop eval release-gate` runs or checks the curated release matrix,
 and `vibe-loop eval benchmark` runs an explicitly selected external adapter.
 Their flag-level invocation is documented in the
 [CLI reference](cli-reference.md#evaluation-commands). The

@@ -239,8 +239,8 @@ make install-hooks
 ```
 
 The [checklist](docs/release-checklist.md) owns versions, tags, and installed
-hooks; the [evals PRD](docs/prd/evals-release.md) owns readiness, admission, and
-publishing policy.
+hooks; the [evals PRD](docs/prd/evals-release.md) owns eval checks, admission,
+and publishing policy.
 
 ## License
 

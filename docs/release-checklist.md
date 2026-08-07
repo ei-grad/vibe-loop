@@ -1,9 +1,9 @@
 # Release Checklist
 
-Use this checklist to produce evidence and start publishing. It documents the
-operator procedure; [PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate)
-is the sole authority for release classification, readiness, admission, and
-publishing policy.
+Use this checklist to check a candidate and start publishing. It documents the
+operator procedure; [PRD-EVL-005](prd/evals-release.md#prd-evl-005-pre-release-eval-usability)
+is the sole authority for pre-release eval usability, admission, and publishing
+policy.
 
 ## Versioning And Repository Hooks
 
@@ -23,12 +23,13 @@ prepare-commit-msg hook preserves that provenance path when `--no-verify`
 bypasses commit-msg. Installation refuses to overwrite unmanaged hooks except
 for a compatible existing provenance hook.
 
-## Bundled Skill Gate
+## Check The Bundled Skills
 
-Use [PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate) to
-determine whether the candidate classification requires readiness evidence and
-which matrix, trial, and blocking conditions apply. When readiness evidence is
-required, run the local release gate from a clean repository state:
+When a release candidate changes bundled skills, the eval harness, or the
+runtime behavior they exercise, run the curated release matrix from a clean
+repository state and read the result before publishing. This is an operator
+step: nothing in the publishing path waits on it, and the record it writes
+stays on the local machine.
 
 ```bash
 uv run vibe-loop eval release-gate --repo . --overwrite \
@@ -74,7 +75,7 @@ uv run vibe-loop eval release-gate --repo . --dry-run \
 
 This diagnostic path may run from a dirty worktree because it does not execute
 new trials. Exact commit and bundled-skill fingerprint checks still determine
-whether its record is publishable.
+whether its record describes the candidate revision or only an older aggregate.
 
 If a workflow-contract regression is intentionally parked, use the regression id
 from the release-readiness record:
@@ -90,7 +91,7 @@ workflow-contract regression is covered by the same follow-up task.
 
 ## External Smoke Evidence
 
-[PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate) owns
+[PRD-EVL-005](prd/evals-release.md#prd-evl-005-pre-release-eval-usability) owns
 release attachment policy, and
 [PRD-EVL-006](prd/evals-release.md#prd-evl-006-external-benchmark-adapters) owns
 the external-adapter contract and its evidentiary limits. To attach a compact
@@ -120,21 +121,16 @@ evidence, and optional external smoke evidence.
 
 ## Publish
 
-After the
-[PRD-EVL-005 admission prerequisites](prd/evals-release.md#prd-evl-005-release-readiness-gate)
-are satisfied:
+Nothing is uploaded to GitHub to authorize a release. The eval record stays on
+the machine that produced it; publishing is gated only on the built
+distributions matching the commit being published.
 
-1. Upload its compact JSON for the exact commit through the `Skill Release
-   Readiness Evidence` workflow. The immutable artifact name includes the full
-   commit. A dry-run is accepted only when it carries the same exact revision
-   and trial fingerprint contract.
-2. Do not construct the release-note evidence link manually. After admission,
-   copy the stable GitHub evidence reference printed by `release-admit` and the
-   release job summary. If regressions were parked, include the task ids.
-3. Run the release workflow for TestPyPI, optionally supplying the evidence run
-   id to select among exact-head artifacts. PyPI remains restricted to a
-   matching `v<version>` tag.
-4. Let the release workflow apply the classification, exact-revision admission,
-   evidence transport, and pre-publishing checks defined by
-   [PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate). Do not
+1. Decide, from the matrix result you just read, whether the candidate is worth
+   releasing. If regressions were parked, cite the task ids in the release
+   notes and keep the record locally for reference.
+2. Run the release workflow for TestPyPI. PyPI remains restricted to a matching
+   `v<version>` tag.
+3. Let the release workflow apply the exact-revision admission and
+   pre-publishing checks defined by
+   [PRD-EVL-005](prd/evals-release.md#prd-evl-005-pre-release-eval-usability). Do not
    bypass or manually reconstruct that admission path.

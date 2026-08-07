@@ -1,7 +1,8 @@
 # Evals And Release PRD
 
 This PRD owns Level 2 contracts for bundled skill evaluation, artifact records,
-aggregate reporting, external benchmark adapters, and release-readiness gates.
+aggregate reporting, external benchmark adapters, pre-release eval usability,
+and release admission.
 The [skill evaluation strategy](../skill-evaluation-strategy.md) explains the
 methodology and research rationale; it defers to this PRD for product behavior
 and release policy.
@@ -64,53 +65,53 @@ artifact-root links for each count or delta.
 
 Related implementation IDs: `EVAL-03`, `EVAL-05`.
 
-## PRD-EVL-005 Release Readiness Gate
+## PRD-EVL-005 Pre-Release Eval Usability
 
-Bundled skill releases must require compact, release-relevant local-demo
-evidence and block unresolved workflow-contract regressions unless they are
-explicitly parked with task IDs.
+The eval harness must be usable for checking a bundled skill release before it
+is published: an operator must be able to run a curated release matrix on
+demand against an exact revision and read honest per-pair results. Running that
+matrix and acting on its result is an operator step in the
+[release checklist](../release-checklist.md), not a machine precondition of
+publishing.
 
-Every publishing event classifies the canonical full commit being built against
-the prior reachable `v*` release tag. The code-owned path boundary includes
-bundled skills, the eval harness and fixtures, release schemas and contracts,
-package manifests and lockfiles, and release workflows. Rename and deletion
-paths are classified on both sides. Missing or non-ancestor history, shallow
-history, malformed commits, and unknown diff statuses are fail-closed; only a
-complete exact-base/head path set containing no owned path can produce an
-unrelated-release exemption.
+A matrix run binds the canonical full commit being checked and the prior
+reachable `v*` release tag, records the complete bundled-skill fingerprint set,
+and reports per-pair pass and fail counts. Required-trial failures, missing
+matrix coverage, unresolved workflow-contract regressions, invalid parked
+regression IDs, and trial evidence whose skill fingerprints do not match the
+checked revision are reported as record blockers and as a non-zero exit status.
+Regressions parked with task IDs are reported as parked rather than as
+failures. A record that is not bound to exact commits and fingerprints stays
+diagnostically useful but must report that gap instead of claiming
+exact-revision coverage.
 
-Required readiness records bind the base and head commits, each required
-trial's skill source fingerprint, and the complete bundled-skill fingerprint
-set. Admission compares those fingerprints with every built wheel and source
-distribution. For readiness-required admission, GitHub discovery also persists
-strict provenance binding the selected GitHub evidence to the exact
-classification and canonical readiness record. The
+No eval record, and no other statement about a local environment or the skills
+installed in it, is published to GitHub or any other remote service, and no
+remotely hosted artifact is a precondition of publishing. Correspondence
+between a local environment and its installed skills is a local-run concern
+owned by [recorded skill deployment](../skill-deployment.md).
+
+Publishing must still bind what is published to what was built. Every
+publishing event resolves the canonical full commit being built, verifies that
+the bundled skill sources present are the ones committed at that revision,
+records their fingerprint set and each distribution's name, size, and SHA-256,
+and blocks when a distribution's packaged skills differ from that commit. The
 [release-evidence schema](../skill-eval-schema.md#release-evidence-records) is
-the sole authority for its persisted field set. The provenance is derived only
-from mutually consistent GitHub repository, workflow, run, and artifact
-responses and exposes their canonical stable GitHub HTTPS evidence reference.
-A manual run id may narrow discovery but cannot supply or override provenance.
-API download URLs, redirects, signed URLs, tokens, local paths, and
-operator-supplied links are never provenance.
-
-The classification, optional readiness record, required readiness provenance,
-admission record, and distributions are hashed and revalidated after transfer
-before either publisher exercises trusted publishing. Missing, malformed,
-mismatched, substituted, or tampered readiness provenance blocks publication.
-A complete unrelated-release exemption requires neither readiness record nor
-provenance. Tag-triggered PyPI and manual TestPyPI/PyPI publication share this
-contract. Admission command output and the GitHub job summary expose the stable
-evidence reference, or explicitly identify an unrelated-release exemption,
-without secret-bearing or expiring values. Non-publishing `workflow_run`
-build/test executions produce no admission, exemption, readiness-evidence
-reference, or publish-readiness claim.
+the sole authority for the persisted admission field set. The admission record
+is revalidated against the repository and the distributions after transfer and
+before either publisher exercises trusted publishing, so a substituted,
+tampered, or extended record blocks publication. Tag-triggered PyPI and manual
+TestPyPI/PyPI publication share this contract. Admission command output and the
+GitHub job summary are deterministic and carry no secret-bearing or expiring
+values. Non-publishing `workflow_run` build/test executions produce no
+admission or publish-readiness claim.
 
 Acceptance must cover a curated release matrix distinct from the full paired
-eval suite, no required `no_skill` baseline for release readiness, required
-trial pass/fail blocking, dry-run over existing aggregates, release-readiness
-records, parked regression flags, optional external benchmark summaries, and
-release-note references to evidence. The full local-demo suite must still
-support paired `no_skill` comparisons for broader analysis.
+eval suite, no required `no_skill` baseline for the release matrix, per-pair
+pass/fail reporting, dry-run over existing aggregates, exact-revision records,
+parked regression flags, optional external benchmark summaries, and
+release-note references to locally held evidence. The full local-demo suite
+must still support paired `no_skill` comparisons for broader analysis.
 
 The shipped matrix currently contains 20 cases and 22 required case/condition
 pairs. The default minimum is one trial per pair. It covers table and generated
@@ -119,7 +120,7 @@ adapters, runtime-owned orchestration, review remediation, worktree safety, and
 integration failure paths.
 
 Related implementation IDs: `EVAL-06`,
-`publish-gate-exact-revision-skill-readiness-evidence`.
+`prd-evl-005-reframe-as-eval-usability`.
 
 ## PRD-EVL-006 External Benchmark Adapters
 

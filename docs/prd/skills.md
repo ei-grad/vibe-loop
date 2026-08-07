@@ -67,18 +67,20 @@ documentation that direct skill use and CLI-launched workers are both supported.
 
 Related implementation IDs: `PAR-05`, `SKILL-01`, `EVAL-06`.
 
-## PRD-SKL-006 Skill Release Readiness
+## PRD-SKL-006 Skill Release Checking
 
-Bundled skill changes must depend on the eval release gate before release, and
-workflow-contract regressions must be fixed or explicitly parked with task IDs.
+Bundled skill changes must be checked with the eval release matrix before
+release, and workflow-contract regressions must be fixed or explicitly parked
+with task IDs. The check is an operator step, not a machine precondition of
+publishing.
 
-Acceptance must cover the skill publishing dependency on `PRD-EVL-005`, release
-note evidence links, and documentation that skill readiness is proven by eval
-records rather than by manual inspection alone.
+Acceptance must cover the operator procedure defined by `PRD-EVL-005`, release
+note references to the locally held eval record, and documentation that skill
+behavior is proven by eval records rather than by manual inspection alone.
 
-The exact revision, owned-path classification, evidence transport, artifact
-fingerprint, and pre-credential admission contract is authoritative in
-[PRD-EVL-005](evals-release.md#prd-evl-005-release-readiness-gate).
+The exact revision, bundled-skill fingerprint, and pre-credential admission
+contract is authoritative in
+[PRD-EVL-005](evals-release.md#prd-evl-005-pre-release-eval-usability).
 
 Related implementation IDs: `EVAL-05`, `EVAL-06`, `EVAL-09`,
-`publish-gate-exact-revision-skill-readiness-evidence`.
+`prd-evl-005-reframe-as-eval-usability`.

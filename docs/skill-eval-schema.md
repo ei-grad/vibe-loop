@@ -353,30 +353,20 @@ state evidence.
 SHA-256. For an exact-revision record, `release_provenance` reports whether the
 aggregate's recorded head and required trial skill fingerprints match those
 fields. A dry-run record without these bindings remains useful diagnostically
-but has blocked readiness and provenance status and cannot satisfy publishing
-admission.
+but reports that gap and does not claim exact-revision coverage. The record is
+a local artifact: it is never uploaded to GitHub and is not an input to
+publishing.
 
-`skill_release_classification` records the ownership-contract version, canonical
-base/head commits, all Git name-status entries (including both rename paths),
-owned paths, uncertainty, and either `readiness_required` or
-`unrelated_exemption`.
-
-This section is authoritative for the persisted provenance field set.
-`skill_release_readiness_provenance` schema version 1 has exactly these fields:
-`schema_version`; `record_type`; `classification_head`; `readiness_sha256`, the
-canonical JSON hash of the selected readiness record; `repository.full_name`
-and canonical `repository.html_url`; numeric `workflow.id` and the fixed
-repository `workflow.path`; numeric `run.id`, exact `run.head`, and successful
-`run.conclusion`; numeric `artifact.id` and its exact-head immutable
-`artifact.name`; and `evidence_reference`. The reference is the canonical
-GitHub HTTPS artifact page derived from the repository, run id, and artifact
-id. Extra fields are invalid so API/download/redirect URLs, signed values,
-tokens, and local paths cannot enter the record.
-
-`skill_release_admission` schema version 2 embeds and hashes that provenance in
-`readiness_provenance` and `readiness_provenance_sha256`, hashes the
-classification and readiness record, records each distribution's name, size,
-and SHA-256, and has status `passed` only when the selected evidence path and
-packaged skill bytes validate. Both provenance fields are null for an unrelated
-exemption. Exact publishing behavior is owned by
-[PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate).
+This section is authoritative for the persisted admission field set.
+`skill_release_admission` schema version 3 has exactly these fields:
+`schema_version`; `record_type`; `status`; `head`, the canonical full commit
+being published; `bundled_skills`, the packaged-source-path to SHA-256 map read
+at that commit; `distributions`, each with `name`, `sha256`, and `size`, sorted
+by name; and `diagnostics`. Status is `passed` only when the bundled skill
+sources match the built commit, every distribution is readable, and every
+distribution's packaged skill bytes match `bundled_skills`. Extra fields are
+invalid, so signed URLs, tokens, and local paths cannot enter the record.
+Verification rebuilds the record from the repository and the distributions on
+hand, so a substituted record or distribution is rejected. Exact publishing
+behavior is owned by
+[PRD-EVL-005](prd/evals-release.md#prd-evl-005-pre-release-eval-usability).

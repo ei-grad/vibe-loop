@@ -543,7 +543,7 @@ Artifact and aggregate behavior is defined by
 
 ### `vibe-loop eval release-gate`
 
-Run or validate bundled-skill release readiness:
+Run the curated release matrix, or check an aggregate it already produced:
 
 ```bash
 vibe-loop eval release-gate --repo . --overwrite \
@@ -566,54 +566,40 @@ release-gate accepts:
 The command resolves the current full commit and prior reachable `v*` release
 tag, requires a clean worktree for newly executed evals, and emits
 schema-version-2 revision and bundled-skill bindings. Existing aggregates that
-lack matching trial source evidence are diagnostic dry runs, not publishable
-records. Checking an existing aggregate does not require a clean worktree;
-dirty skill sources still cause fingerprint or later distribution validation
-to block admission. If the source revision changes while a new suite runs, the
+lack matching trial source evidence are diagnostic dry runs and say so in the
+record. Checking an existing aggregate does not require a clean worktree;
+dirty skill sources still show up as fingerprint gaps. The record stays local
+and is not an input to publishing. Exit status is `1` when the record reports
+blockers. If the source revision changes while a new suite runs, the
 command retains trial artifacts, emits no readiness record, and tells the
 operator to restore the exact clean revision before rerunning.
 
-### `vibe-loop eval release-classify`
-
-Write the exact-base/head change classification used by publishing:
-
-```bash
-vibe-loop eval release-classify --repo . \
-  --output release-classification.json --json
-```
-
-The base is discovered from reachable release-tag provenance; there is no
-operator-supplied base option. `--output` is required and `--json` also prints
-the record.
-
 ### `vibe-loop eval release-admit`
 
-Build or verify the final distribution-bound admission record:
+Bind the built distributions to the exact commit being published:
 
 ```bash
 vibe-loop eval release-admit --repo . \
-  --classification release-classification.json \
-  --readiness-record release-readiness.json \
-  --readiness-provenance release-readiness-provenance.json \
   --distribution dist/vibe_loop.whl \
   --output release-admission.json
 ```
 
-`--classification`, repeatable `--distribution`, and `--output` are required.
-`--readiness-record` and `--readiness-provenance` are required by a
-readiness-required classification and omitted for a validated unrelated
-exemption. The provenance input is the strict GitHub-derived record defined by
-the [skill eval schema](skill-eval-schema.md#release-evidence-records).
-`--verify` re-hashes every transferred input and rejects admission,
-classification, readiness, provenance, or distribution substitution.
+Repeatable `--distribution` and `--output` are required. The command resolves
+the repository's current full commit, checks that the bundled skill sources are
+the ones committed at that revision, and blocks when a distribution's packaged
+skills differ from them. The record shape is defined by the
+[skill eval schema](skill-eval-schema.md#release-evidence-records). `--verify`
+rebuilds the record from the repository and the distributions on hand and
+rejects a substituted or extended admission record, a substituted distribution,
+or a blocked status.
 
-Successful non-JSON output is deterministic. Readiness-required admission
-prints its exact head and stable GitHub evidence reference on separate lines;
-an exemption prints `unrelated_release_exemption` and its exact head. Blocked
-output contains diagnostics but never emits a publish-readiness claim.
+Successful non-JSON output is deterministic: the exact head, then one line per
+distribution with its name and SHA-256. Blocked output contains diagnostics but
+never emits a publish-readiness claim. No eval record and no local-environment
+state is uploaded anywhere.
 
-Release-readiness behavior is defined by
-[PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate).
+Release-matrix and admission behavior is defined by
+[PRD-EVL-005](prd/evals-release.md#prd-evl-005-pre-release-eval-usability).
 
 ### `vibe-loop eval benchmark`
 

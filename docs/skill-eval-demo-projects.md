@@ -50,8 +50,8 @@ no skill activation and no finite-slice workflow. Future suites can add
 `candidate_skill` and `infinite_vibe_loop` conditions without changing these
 case IDs.
 
-The release-readiness matrix contract is authoritative in
-[PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate). Its
+The release-matrix contract is authoritative in
+[PRD-EVL-005](prd/evals-release.md#prd-evl-005-pre-release-eval-usability). Its
 concrete case/condition mapping is implementation data in
 [`RELEASE_GATE_CASE_CONDITIONS`](../src/vibe_loop/eval_release.py); this fixture
 specification does not redefine either.
@@ -338,7 +338,7 @@ completion/worklog events without command strings.
 All five cases remain offline and paired across the standard conditions. The
 compact release matrix selects one release-relevant skill condition per case.
 Raw user-authored hook commands remain available in the fixture and raw trial
-audit evidence, but aggregate and release-readiness records contain only compact
+audit evidence, but aggregate and release-matrix records contain only compact
 run references and normalized outcomes.
 
 ### `review-remediation`
