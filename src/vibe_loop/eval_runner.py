@@ -35,6 +35,7 @@ from vibe_loop.eval_examples import (
     EvalExampleCase,
     list_eval_example_cases,
     materialize_eval_example,
+    refresh_active_worker_workspace_claim,
     run_eval_example_grader,
 )
 from vibe_loop.eval_reporting import (
@@ -725,18 +726,22 @@ def run_trial(
     repo_config = load_config(repo)
     prompt_text = combined_prompt(repo, case)
     write_text_artifact(trial_root, "prompt", prompt_text)
-    git_before = collect_git_state(repo)
-    write_json_artifact(trial_root, "git_state_before", safe_git_state(git_before))
     if "task_source_evidence" in case.expected_artifact_roles:
         write_task_source_evidence(trial_root, repo_config)
     run_id = seeded_run_id(lock_before) or (
         f"{EXAMPLE_SUITE_ID}-{case.case_id}-{condition}-trial-{trial}"
     )
-    activate_command_fixture_task(
+    task_activated = activate_command_fixture_task(
         repo_config,
         task_id=case.task_id,
         run_id=run_id,
     )
+    if task_activated and case.task_id:
+        refresh_active_worker_workspace_claim(control_repo, case.task_id)
+        lock_before = collect_lock_state(lock_manager, case.task_id)
+    git_before = collect_git_state(repo)
+    git_before["worktree_tree"] = snapshot_worktree_tree(repo)
+    write_json_artifact(trial_root, "git_state_before", safe_git_state(git_before))
 
     budgets = trial_budget(case, config)
     agent_batch = execute_trial_agent_commands(
@@ -839,7 +844,12 @@ def run_trial(
         lock_manager=lock_manager,
     )
     latest_report = latest_worker_report(control_repo, case.task_id)
-    write_report_evidence(trial_root, latest_report)
+    write_report_evidence(
+        trial_root,
+        latest_report,
+        repo=repo,
+        expected_commit=git_after.get("head"),
+    )
     write_workspace_evidence(trial_root, control_repo, lock_manager=lock_manager)
     try:
         write_generated_profile_artifact(trial_root, repo)
@@ -3371,16 +3381,17 @@ def activate_command_fixture_task(
     *,
     task_id: str | None,
     run_id: str,
-) -> None:
+) -> bool:
     task_source = config.task_source
     if task_source.type != "command" or not task_source.activate_command or not task_id:
-        return
+        return False
     source = build_task_source(config.repo, task_source)
     activated = source.activate(task_id, run_id)
     if activated is None or activated.status in task_source.runnable_statuses:
         raise RuntimeError(
             "fixture task activation did not produce a non-runnable active task"
         )
+    return True
 
 
 def run_configured_fixture_hooks(
@@ -3571,8 +3582,9 @@ def active_worker_runtime_context(
         "VIBE_LOOP_STATE_DIR": str(control_repo / ".vibe-loop"),
         "VIBE_LOOP_PRIMARY_REPO": str(control_repo),
     }
-    if active is not None and str(active.log_path):
-        log_path = active.log_path
+    log_value = lock_state.get("log") or lock_state.get("log_path")
+    if active is not None and isinstance(log_value, str) and log_value:
+        log_path = Path(log_value)
         context["VIBE_LOOP_LOG"] = str(
             log_path if log_path.is_absolute() else control_repo / log_path
         )
@@ -3667,6 +3679,9 @@ def safe_scalar_mapping(
 def write_report_evidence(
     artifact_root: Path,
     latest: Mapping[str, object] | None,
+    *,
+    repo: Path,
+    expected_commit: object,
 ) -> None:
     safe_latest = None
     if latest is not None:
@@ -3683,6 +3698,15 @@ def write_report_evidence(
             )
             if key in latest
         }
+        reported_commit = latest.get("commit")
+        safe_latest["commit_matches_head"] = (
+            isinstance(expected_commit, str)
+            and bool(expected_commit)
+            and isinstance(reported_commit, str)
+            and bool(reported_commit)
+            and git_output(repo, "rev-parse", "--verify", reported_commit)
+            == expected_commit
+        )
         safe_latest["reason"] = worker_report_reason(latest.get("message"))
     write_json_artifact(artifact_root, "report_evidence", {"latest": safe_latest})
 
@@ -3894,6 +3918,9 @@ def safe_workspace_file(worktree: Path, relative_path: str) -> Path | None:
 
 
 def fixture_diff(repo: Path, git_before: Mapping[str, object]) -> str:
+    worktree_tree = git_before.get("worktree_tree")
+    if isinstance(worktree_tree, str) and worktree_tree:
+        return git_output(repo, "diff", "--binary", worktree_tree)
     base = git_before.get("head")
     committed = ""
     if isinstance(base, str) and base:
@@ -3902,6 +3929,41 @@ def fixture_diff(repo: Path, git_before: Mapping[str, object]) -> str:
     staged = git_output(repo, "diff", "--binary", "--cached")
     chunks = [chunk for chunk in (committed, staged, worktree) if chunk]
     return "\n".join(chunks)
+
+
+def snapshot_worktree_tree(repo: Path) -> str:
+    with tempfile.TemporaryDirectory(prefix="vibe-loop-eval-index-") as directory:
+        index_path = Path(directory) / "index"
+        env = os.environ.copy()
+        env["GIT_INDEX_FILE"] = str(index_path)
+        for args in (("read-tree", "HEAD"), ("add", "-u")):
+            completed = subprocess.run(
+                ["git", *args],
+                cwd=repo,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    f"failed to snapshot fixture worktree: git {args[0]}"
+                )
+        completed = subprocess.run(
+            ["git", "write-tree"],
+            cwd=repo,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if completed.returncode != 0:
+            raise RuntimeError("failed to snapshot fixture worktree: git write-tree")
+        return completed.stdout.strip()
 
 
 def git_output(repo: Path, *args: str) -> str:

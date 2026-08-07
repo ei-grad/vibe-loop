@@ -603,10 +603,11 @@ Seeded state:
   changes to a tracked file.
 - `integration-lock-unavailable` seeds a live foreign holder for
   `.vibe-loop/locks/main-integration.lock/lock.json`.
-- The three named workspace blockers and `integration-lock-unavailable` retain
-  one matching active task/run/fencing identity. Duplicate, missing, merged, and
-  foreign-busy values differ only where the individual case requires that
-  unsafe state.
+- The three in-scope workspace blockers and `integration-lock-unavailable`
+  retain one matching active task/run/fencing identity. Duplicate, missing,
+  merged, and foreign-busy values differ only where the individual case
+  requires that unsafe state. `workspace-foreign-dirty` remains an
+  instrumentation-only case outside this active-worker fixture contract.
 
 Deterministic graders:
 

@@ -18,6 +18,7 @@ from vibe_loop.cli import main
 from vibe_loop.eval_runner import (
     CommandExecution,
     TrialResult,
+    active_worker_runtime_context,
     archive_previous_aggregate_artifacts,
     build_aggregate,
     build_eval_prompt,
@@ -183,6 +184,20 @@ class EvalRunnerCliTests(unittest.TestCase):
         self.assertEqual(captured["VIBE_LOOP_TASK_ID"], "ROI-01")
         self.assertTrue(bool(captured.get("VIBE_LOOP_FENCING_TOKEN")))
         self.assertTrue(bool(captured.get("VIBE_LOOP_LOG")))
+
+    def test_active_worker_context_omits_absent_log_path(self) -> None:
+        case = load_eval_example_case("runtime-owned-implementation")
+        with tempfile.TemporaryDirectory() as directory:
+            repo = materialize_eval_example(case.case_id, Path(directory) / "repo")
+            lock_state = json.loads(
+                (repo / ".vibe-loop" / "locks" / "ROI-01.lock" / "lock.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            lock_state.pop("log")
+            context = active_worker_runtime_context(repo, repo, lock_state)
+
+        self.assertNotIn("VIBE_LOOP_LOG", context)
 
     def test_codex_native_commands_project_only_observed_workflow_events(self) -> None:
         execution = CommandExecution(
@@ -908,10 +923,26 @@ class EvalRunnerCliTests(unittest.TestCase):
             hook_evidence = json.loads(
                 (trial_root / "hook-evidence.json").read_text(encoding="utf-8")
             )
+            git_before = json.loads(
+                (trial_root / "git-state-before.json").read_text(encoding="utf-8")
+            )
+            diff = (trial_root / "diff.patch").read_text(encoding="utf-8")
+            command_locks = json.loads(
+                (trial_root / "repo" / ".vibe-loop" / "command-locks.json").read_text(
+                    encoding="utf-8"
+                )
+            )
 
         self.assertEqual(payload["conditions"]["vibe_loop_cli"]["pass_rate"], 1.0)
         self.assertEqual(lock_evidence["before"]["task_id"], "HOOK-02")
         self.assertEqual(lock_evidence["before"]["run_id"], "eval-run-command-hooks")
+        self.assertTrue(git_before["dirty"])
+        self.assertEqual(git_before["changed_path_count"], 1)
+        workspace = command_locks["HOOK-02"]["workspace"]
+        self.assertTrue(workspace["dirty"])
+        self.assertEqual(workspace["dirty_summary"], ["M tasks.json"])
+        self.assertIn('-      "status": "Active"', diff)
+        self.assertNotIn('-      "status": "Planned"', diff)
         selected = task_source_evidence["selected_task"]
         self.assertEqual(selected["id"], "HOOK-02")
         self.assertEqual(selected["status"], "Planned")
@@ -1403,6 +1434,47 @@ class EvalRunnerCliTests(unittest.TestCase):
         self.assertEqual(payload["conditions"]["vibe_loop"]["pass_rate"], 1.0)
         self.assertEqual(record["run_id"], "eval-run-wrk-01")
         self.assertEqual(record["structured_result"]["run_id"], "eval-run-wrk-01")
+
+    def test_worker_report_without_commit_fails_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "worker_report_agent.py"
+            write_worker_agent_with_report(agent, report_commit="")
+
+            payload = run_eval(
+                root,
+                "--case",
+                "supervised-worker-report",
+                "--condition",
+                "vibe_loop",
+                "--agent-command",
+                f"vibe_loop={agent}",
+            )
+            trial_root = (
+                root
+                / "eval-runs"
+                / "local-demo-v1"
+                / "cases"
+                / "supervised-worker-report"
+                / "vibe_loop"
+                / "trial-1"
+            )
+            graders = json.loads(
+                (trial_root / "grader-outputs.json").read_text(encoding="utf-8")
+            )
+            report_evidence = json.loads(
+                (trial_root / "report-evidence.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(payload["conditions"]["vibe_loop"]["pass_rate"], 0.0)
+        self.assertFalse(report_evidence["latest"]["commit_matches_head"])
+        artifact_checks = graders["graders"][1]["checks"]
+        contract = next(
+            check
+            for check in artifact_checks
+            if check["id"] == "artifact-case-contract"
+        )
+        self.assertFalse(contract["passed"])
 
     def test_main_integration_lock_evidence_from_agent_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3923,7 +3995,7 @@ def write_worker_agent_without_report(path: Path) -> None:
     )
 
 
-def write_worker_agent_with_report(path: Path) -> None:
+def write_worker_agent_with_report(path: Path, *, report_commit: str = "HEAD") -> None:
     write_python_executable(
         path,
         "import json\n"
@@ -3952,7 +4024,7 @@ def write_worker_agent_with_report(path: Path) -> None:
         "    'run_id': 'eval-run-wrk-01',\n"
         "    'task_id': 'WRK-01',\n"
         "    'status': 'completed',\n"
-        "    'commit': 'HEAD',\n"
+        f"    'commit': {report_commit!r},\n"
         "    'message': 'completed',\n"
         "    'metadata': {},\n"
         "    'reported_at': '2026-05-09T00:00:00+00:00',\n"

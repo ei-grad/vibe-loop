@@ -435,6 +435,25 @@ def active_lock_metadata_writer(
     return metadata, write_command_lock, command_lock_path
 
 
+def refresh_active_worker_workspace_claim(target: Path, task_id: str) -> None:
+    metadata, write_metadata, _state_path = active_lock_metadata_writer(target, task_id)
+    workspace = metadata.get("workspace")
+    if not isinstance(workspace, dict):
+        raise ValueError(f"active worker workspace claim is missing: {task_id}")
+    run_id = required_seed_string(metadata, "run_id")
+    branch = required_seed_string(workspace, "branch")
+    worktree = Path(required_seed_string(workspace, "worktree"))
+    base_commit = required_seed_string(workspace, "base_commit")
+    metadata["workspace"] = workspace_claim_payload(
+        task_id=task_id,
+        run_id=run_id,
+        branch=branch,
+        worktree=worktree,
+        base_commit=base_commit,
+    )
+    write_metadata(metadata)
+
+
 def apply_seed_workspace_state(target: Path, seed: dict[str, object]) -> None:
     task_id = required_seed_string(seed, "task_id")
     run_id = required_seed_string(seed, "run_id")

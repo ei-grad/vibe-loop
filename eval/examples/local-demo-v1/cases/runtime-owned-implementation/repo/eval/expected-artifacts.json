@@ -32,6 +32,11 @@
         "equals": "completed"
       },
       {
+        "role": "report_evidence",
+        "field": "latest.commit_matches_head",
+        "equals": true
+      },
+      {
         "role": "lock_evidence",
         "field": "before.run_id",
         "equals": "eval-run-roi-01"
