@@ -99,6 +99,57 @@ class SkillEvalSchemaTests(unittest.TestCase):
         self.assertEqual(projected[5]["output_tokens"], 7)
         self.assertNotIn("CANARY", encoded)
 
+    def test_transcript_projection_accepts_native_codex_tool_envelopes(self) -> None:
+        canary = "NATIVE_CODEX_SECRET_CANARY"
+        raw = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "item.started",
+                        "item": {
+                            "id": "item-1",
+                            "type": "command_execution",
+                            "command": f"printf {canary}",
+                            "status": "in_progress",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "item-2",
+                            "type": "mcp_tool_call",
+                            "server": "collaboration",
+                            "tool": "spawn_agent",
+                            "arguments": {"message": canary},
+                            "result": {"content": canary},
+                            "status": "completed",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "item-3",
+                            "type": "agent_message",
+                            "text": canary,
+                        },
+                    }
+                ),
+            )
+        )
+
+        projected = project_transcript_jsonl(raw)
+        encoded = json.dumps(projected)
+
+        self.assertEqual(
+            [record["kind"] for record in projected],
+            ["command", "tool_result", "assistant"],
+        )
+        self.assertNotIn(canary, encoded)
+
     def test_structured_byte_budget_covers_shipped_case_output_budgets(self) -> None:
         cases_root = Path(__file__).parents[1] / "eval/examples/local-demo-v1/cases"
         budgets = [

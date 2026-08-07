@@ -403,7 +403,22 @@ def _project_transcript_record(
         "thread.started": {"type", "thread_id", "timestamp"},
         "turn.started": {"type", "turn_id", "timestamp"},
         "item.started": {"type", "timestamp", "item"},
+        "item.updated": {"type", "timestamp", "item"},
         "item.completed": {"type", "timestamp", "item"},
+        "response.output_item.added": {
+            "type",
+            "timestamp",
+            "item",
+            "output_index",
+            "sequence_number",
+        },
+        "response.output_item.done": {
+            "type",
+            "timestamp",
+            "item",
+            "output_index",
+            "sequence_number",
+        },
         "turn.completed": {"type", "turn_id", "timestamp", "usage", "message"},
     }
     allowed = raw_allowed.get(raw_kind)
@@ -426,21 +441,74 @@ def _project_transcript_record(
             if block_type == "tool_use":
                 projected.append(_transcript_record("tool_call"))
         return projected or [_transcript_record("assistant")]
-    if raw_kind in {"item.started", "item.completed"}:
+    if raw_kind in {
+        "item.started",
+        "item.updated",
+        "item.completed",
+        "response.output_item.added",
+        "response.output_item.done",
+    }:
         item = value.get("item")
         if not isinstance(item, Mapping):
             raise EvalSafeEnvelopeError(
                 f"transcript rejected: wrong field type at index {index}"
             )
+        item_type = item.get("type")
         allowed_item_fields = {
-            "item.started": {"id", "type", "command", "arguments"},
-            "item.completed": {"id", "type", "aggregated_output", "exit_code"},
+            "agent_message": {"id", "type", "text"},
+            "collab_tool_call": {
+                "id",
+                "type",
+                "tool",
+                "arguments",
+                "prompt",
+                "sender_thread_id",
+                "receiver_thread_ids",
+                "result",
+                "error",
+                "status",
+            },
+            "command_execution": {
+                "id",
+                "type",
+                "command",
+                "arguments",
+                "aggregated_output",
+                "exit_code",
+                "status",
+            },
+            "error": {"id", "type", "message"},
+            "file_change": {"id", "type", "changes", "status"},
+            "mcp_tool_call": {
+                "id",
+                "type",
+                "server",
+                "tool",
+                "arguments",
+                "result",
+                "error",
+                "status",
+                "duration_ms",
+            },
+            "reasoning": {"id", "type", "text"},
+            "todo_list": {"id", "type", "items"},
+            "web_search": {"id", "type", "query", "status"},
         }
-        if set(item) - allowed_item_fields[raw_kind]:
+        allowed = allowed_item_fields.get(item_type)
+        if allowed is None or set(item) - allowed:
             raise EvalSafeEnvelopeError(
                 f"transcript rejected: unknown field at index {index}"
             )
-        kind = "command" if raw_kind == "item.started" else "tool_result"
+        if item_type in {"collab_tool_call", "command_execution", "mcp_tool_call"}:
+            kind = (
+                "command"
+                if raw_kind in {"item.started", "response.output_item.added"}
+                else "tool_result"
+            )
+        elif item_type in {"agent_message", "reasoning"}:
+            kind = "assistant"
+        else:
+            kind = "system"
         record = _transcript_record(kind)
         if "exit_code" in item:
             record["exit_code"] = bounded_integer(item["exit_code"])
@@ -486,6 +554,7 @@ def _project_transcript_record(
                 f"transcript rejected: wrong field type at index {index}"
             )
         allowed_usage = {
+            "cached_input_tokens",
             "input_tokens",
             "output_tokens",
             "cache_creation_input_tokens",

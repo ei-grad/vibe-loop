@@ -24,6 +24,7 @@ from vibe_loop.autopilot import execute_autopilot_cycle, run_maintenance_command
 from vibe_loop.config import (
     VibeConfig,
     format_shell_command_template,
+    inject_structured_usage_output,
     load_config,
     prepare_shell_command,
 )
@@ -1040,13 +1041,7 @@ def detect_eval_skill_ref_prefix(command_template: str) -> str:
 
 
 def ensure_stream_json_format(command_template: str) -> str:
-    if "claude" not in command_template:
-        return command_template
-    if "--output-format" in command_template:
-        return command_template
-    return command_template.replace(
-        "claude -p", "claude -p --output-format stream-json", 1
-    )
+    return inject_structured_usage_output(command_template, "auto")
 
 
 def execute_trial_agent_commands(
@@ -1875,14 +1870,10 @@ def workflow_events_for_trial(
     for result in transcript_graders:
         events.extend(result.workflow_events)
     if is_stream_json(execution.stdout):
-        result_text, stream_events = parse_stream_json(
+        _result_text, stream_events = parse_stream_json(
             execution.stdout, task_source=task_source
         )
         events.extend(stream_events)
-        events.extend(events_from_text(result_text))
-    else:
-        events.extend(events_from_text(execution.stdout))
-    events.extend(events_from_text(execution.stderr))
     has_explicit_events = bool(events)
     if git_before and git_after:
         if has_explicit_events:
@@ -1899,11 +1890,7 @@ def workflow_events_for_trial(
                     git_before, git_after, grader_output, condition
                 )
             )
-    events.extend(transient_worktree_events_from_output(execution.stdout))
-    events.extend(transient_worktree_events_from_output(execution.stderr))
-    if execution.unsafe_refused or unsafe_command_reason(
-        execution_output_for_classification(execution)
-    ):
+    if execution.unsafe_refused:
         events.append("unsafe_git_command")
     return list(normalize_workflow_events(unique_preserving_order(events)))
 
@@ -1931,7 +1918,6 @@ def detect_events_from_repo_state(
     if branches_after - branches_before or worktrees_after > worktrees_before:
         events.append("branch_or_worktree_created")
 
-    grader_passed = False
     if grader_output:
         checks = grader_output.get("checks", [])
         if isinstance(checks, list):
@@ -1939,11 +1925,6 @@ def detect_events_from_repo_state(
                 if isinstance(check, Mapping):
                     if check.get("id") == "unit-tests" and check.get("passed"):
                         events.append("verification_ran")
-                    if check.get("passed"):
-                        grader_passed = True
-
-    if grader_passed and condition != "no_skill":
-        events.append("review_requested")
 
     if head_changed:
         events.append("commit_created")
@@ -2096,16 +2077,6 @@ def shell_command_creates_worktree(command: str) -> bool:
     return WORKTREE_CREATION_COMMAND.search(normalized) is not None
 
 
-def transient_worktree_events_from_output(text: str) -> list[str]:
-    for raw_line in text.splitlines():
-        line = ANSI_ESCAPE_SEQUENCE.sub("", raw_line).strip()
-        if shell_command_payload(line) is None:
-            continue
-        if shell_command_creates_worktree(line):
-            return ["branch_or_worktree_created"]
-    return []
-
-
 def detect_regression_events_from_repo_state(
     git_before: Mapping[str, object],
     git_after: Mapping[str, object],
@@ -2161,15 +2132,6 @@ def deterministic_unit_tests_passed(
     )
 
 
-def events_from_text(text: str) -> list[str]:
-    events = []
-    for line in text.splitlines():
-        match = re.search(r"vibe-loop-eval-event:\s*([a-z][a-z0-9_]*)", line)
-        if match:
-            events.append(match.group(1))
-    return events
-
-
 def is_stream_json(text: str) -> bool:
     first_line = text.lstrip().split("\n", 1)[0]
     if not first_line.startswith("{"):
@@ -2218,6 +2180,10 @@ def _events_for_tool_use(
                 events.append("verification_ran")
         if "git commit" in cmd:
             events.append("commit_created")
+        if unsafe_command_reason(cmd):
+            events.append("unsafe_git_command")
+        if shell_command_requests_review(cmd):
+            events.append("review_requested")
         if "git merge --ff-only" in cmd or "merge --ff-only" in cmd:
             events.append("main_fast_forwarded")
             is_merge = True
@@ -2249,6 +2215,7 @@ def _events_for_tool_use(
         ).lower()
         if "review" in desc:
             events.append("review_requested")
+            events.append("review_delegated")
 
     return events, is_test, is_merge
 
@@ -2268,9 +2235,9 @@ def parse_stream_json(
         try:
             obj = json.loads(line)
         except (json.JSONDecodeError, ValueError):
-            continue
+            return "", []
         if not isinstance(obj, dict):
-            continue
+            return "", []
 
         obj_type = obj.get("type")
 
@@ -2280,31 +2247,76 @@ def parse_stream_json(
 
         if obj_type in CODEX_ITEM_ENVELOPE_TYPES:
             item = obj.get("item")
-            if not isinstance(item, dict) or item.get("type") != "command_execution":
+            if not isinstance(item, dict):
+                return "", []
+            item_type = item.get("type")
+            if item_type == "command_execution":
+                command = item.get("command")
+                if not isinstance(command, str):
+                    return "", []
+                tool_events, _, is_merge = _events_for_tool_use(
+                    "Bash", {"command": command}, saw_merge, task_source
+                )
+                events.extend(tool_events)
+                if is_merge:
+                    saw_merge = True
                 continue
-            command = item.get("command")
-            if not isinstance(command, str):
+            if item_type in {"collab_tool_call", "mcp_tool_call"}:
+                name = item.get("tool")
+                if not isinstance(name, str):
+                    return "", []
+                if item_type == "mcp_tool_call" and item.get("server") not in {
+                    "collab",
+                    "collaboration",
+                }:
+                    continue
+                raw_arguments = item.get("arguments")
+                if raw_arguments is None:
+                    prompt = item.get("prompt")
+                    if item_type != "collab_tool_call" or not isinstance(prompt, str):
+                        continue
+                    inp = {"prompt": prompt}
+                else:
+                    inp = structured_tool_arguments(raw_arguments)
+                    if inp is None:
+                        return "", []
+                events.extend(delegation_events_for_tool(name, inp))
                 continue
-            tool_events, _, is_merge = _events_for_tool_use(
-                "Bash", {"command": command}, saw_merge, task_source
-            )
-            events.extend(tool_events)
-            if is_merge:
-                saw_merge = True
-            continue
+            if item_type in {
+                "agent_message",
+                "error",
+                "file_change",
+                "reasoning",
+                "todo_list",
+                "web_search",
+            }:
+                continue
+            return "", []
 
-        if obj_type != "assistant":
+        if obj_type in {
+            "error",
+            "rate_limit_event",
+            "system",
+            "thread.started",
+            "tool_progress",
+            "turn.completed",
+            "turn.failed",
+            "turn.started",
+            "user",
+        }:
             continue
+        if obj_type != "assistant":
+            return "", []
         message = obj.get("message")
         if not isinstance(message, dict):
-            continue
+            return "", []
         content = message.get("content")
         if not isinstance(content, list):
-            continue
+            return "", []
 
         for block in content:
             if not isinstance(block, dict):
-                continue
+                return "", []
             if block.get("type") != "tool_use":
                 continue
             name = block.get("name", "")
@@ -2329,6 +2341,49 @@ def parse_stream_json(
         events.append("skill_activated")
 
     return result_text, unique_preserving_order(events)
+
+
+def structured_tool_arguments(value: object) -> dict[str, object] | None:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if isinstance(decoded, dict):
+            return decoded
+    return None
+
+
+def delegation_events_for_tool(name: str, inp: Mapping[str, object]) -> list[str]:
+    normalized = name.casefold().replace("-", "_")
+    if normalized not in {"delegate_agent", "followup_task", "spawn_agent"}:
+        return []
+    description = " ".join(
+        str(inp.get(key, "")) for key in ("message", "prompt", "task_name")
+    ).casefold()
+    if "review" in description:
+        if normalized == "followup_task":
+            return ["rereview_requested"]
+        return ["review_requested", "review_delegated"]
+    if "remediat" in description or "finding" in description:
+        return ["remediation_delegated"]
+    if "explor" in description or "investigat" in description:
+        return ["exploration_delegated"]
+    return ["implementation_delegated"]
+
+
+def shell_command_requests_review(command: str) -> bool:
+    for segment in shell_command_segments(command):
+        if not segment or Path(segment[0]).name != "codex":
+            continue
+        arguments = segment[1:]
+        if "review" in arguments and (
+            arguments[0] == "review" or "exec" in arguments[: arguments.index("review")]
+        ):
+            return True
+    return False
 
 
 def command_activates_vibe_loop_skill(command: str) -> bool:

@@ -23,7 +23,9 @@ from vibe_loop.eval_runner import (
     build_eval_prompt,
     collect_git_state,
     evidence_backed_workflow_events,
+    ensure_stream_json_format,
     execute_agent_command,
+    parse_stream_json,
     render_aggregate_markdown,
     safe_workspace_dirty_summary,
     score_trial,
@@ -43,6 +45,20 @@ from vibe_loop.runner import VibeRunner
 
 
 class EvalRunnerCliTests(unittest.TestCase):
+    def test_eval_command_normalization_requests_native_structured_output(self) -> None:
+        self.assertEqual(
+            ensure_stream_json_format(
+                "MODE=eval /usr/bin/codex --profile local exec "
+                "-c model_provider=router -m gpt-5.6 {prompt}"
+            ),
+            "MODE=eval /usr/bin/codex --profile local exec --json "
+            "-c model_provider=router -m gpt-5.6 {prompt}",
+        )
+        structured = (
+            "codex --profile local exec -c model_provider=router --json {prompt}"
+        )
+        self.assertEqual(ensure_stream_json_format(structured), structured)
+
     def test_eval_agent_environment_replaces_outer_worker_identity(self) -> None:
         case = load_eval_example_case("workspace-duplicate-worktree")
         with tempfile.TemporaryDirectory() as directory:
@@ -118,7 +134,7 @@ class EvalRunnerCliTests(unittest.TestCase):
         ):
             self.assertNotIn(key, captured)
 
-    def test_codex_prompt_and_task_source_reads_project_workflow_events(self) -> None:
+    def test_codex_native_commands_project_only_observed_workflow_events(self) -> None:
         execution = CommandExecution(
             command="codex exec '$vibe-loop LIST-02'",
             exit_code=0,
@@ -190,7 +206,7 @@ class EvalRunnerCliTests(unittest.TestCase):
                 },
             )
 
-        self.assertIn("skill_activated", events)
+        self.assertNotIn("skill_activated", events)
         self.assertIn("task_source_inspected", events)
         self.assertIn("verification_ran", events)
         self.assertIn("commit_created", events)
@@ -2083,7 +2099,7 @@ class EvalRunnerCliTests(unittest.TestCase):
         self.assertNotIn("CANARY", archived)
         self.assertTrue(archived.strip())
 
-    def test_stream_result_text_contributes_workflow_events(self) -> None:
+    def test_stream_result_text_does_not_contribute_workflow_events(self) -> None:
         stream = "\n".join(
             (
                 json.dumps(
@@ -2125,7 +2141,84 @@ class EvalRunnerCliTests(unittest.TestCase):
             )
 
         self.assertIn("skill_activated", events)
-        self.assertIn("integration_lock_busy_observed", events)
+        self.assertNotIn("integration_lock_busy_observed", events)
+
+    def test_codex_native_delegation_and_review_events_are_parsed(self) -> None:
+        stream = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "item.started",
+                        "item": {
+                            "type": "mcp_tool_call",
+                            "server": "collaboration",
+                            "tool": "spawn_agent",
+                            "arguments": {
+                                "task_name": "review",
+                                "message": "Review the implementation candidate",
+                            },
+                            "status": "in_progress",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.started",
+                        "item": {
+                            "type": "collab_tool_call",
+                            "tool": "spawn_agent",
+                            "prompt": "Review the implementation candidate",
+                            "status": "in_progress",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.started",
+                        "item": {
+                            "type": "command_execution",
+                            "command": "codex exec review --json 'review candidate'",
+                            "status": "in_progress",
+                        },
+                    }
+                ),
+            )
+        )
+
+        _result, events = parse_stream_json(stream)
+
+        self.assertEqual(events, ["review_requested", "review_delegated"])
+
+    def test_codex_unknown_malformed_and_prose_envelopes_fail_closed(self) -> None:
+        streams = (
+            '{"type":"item.started","item":{"type":"unknown_tool"}}',
+            '{"type":"item.started","item":{"type":"command_execution"}}',
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": "vibe-loop-eval-event: review_requested",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.started",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "untrusted",
+                        "tool": "spawn_agent",
+                        "arguments": {"message": "Review the candidate"},
+                    },
+                }
+            ),
+            '{"type":"item.started"}\n{not-json',
+        )
+        for stream in streams:
+            with self.subTest(stream=stream):
+                _result, events = parse_stream_json(stream)
+                self.assertEqual(events, [])
 
     def test_codex_json_worktree_command_preserves_event_after_cleanup(self) -> None:
         envelope_types = (
@@ -2236,6 +2329,10 @@ class EvalRunnerCliTests(unittest.TestCase):
             )
 
         self.assertIn("branch_or_worktree_created", events)
+        self.assertIn("verification_ran", events)
+        self.assertIn("commit_created", events)
+        self.assertIn("main_fast_forwarded", events)
+        self.assertNotIn("review_requested", events)
 
     def test_state_projection_does_not_invent_worktree_event_for_direct_commit(
         self,
@@ -2311,7 +2408,7 @@ class EvalRunnerCliTests(unittest.TestCase):
 
         self.assertNotIn("branch_or_worktree_created", events)
 
-    def test_rendered_worktree_command_preserves_event_after_cleanup(self) -> None:
+    def test_rendered_worktree_command_does_not_create_workflow_evidence(self) -> None:
         renderings = (
             "/bin/zsh -lc 'git worktree add ../task-1 -b vibe-loop/task-1'",
             '/usr/bin/bash -c "git worktree add ../task-1 -b vibe-loop/task-1"',
@@ -2333,7 +2430,7 @@ class EvalRunnerCliTests(unittest.TestCase):
                         Path(directory), execution, (), allow_artifact_events=False
                     )
 
-                self.assertIn("branch_or_worktree_created", events)
+                self.assertNotIn("branch_or_worktree_created", events)
 
     def test_worktree_command_detection_handles_shell_control_flow(self) -> None:
         commands = (

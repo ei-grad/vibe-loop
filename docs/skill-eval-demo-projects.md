@@ -62,6 +62,11 @@ The harness records the run artifacts required by
 transcript, diff, final repo state, structured result, and grader outputs.
 Additional case artifacts are listed below.
 
+The [structured retention envelope](skill-eval-schema.md#structured-retention-envelope)
+is authoritative for provider command normalization and workflow-event evidence;
+this fixture specification does not add terminal-text or state-derived review
+signals.
+
 No case requires network access, Docker, external credentials, or a public
 benchmark harness. Fixtures may use `uv` for Python package commands because
 this repository already uses it, but the demo repositories must vendor or pin
@@ -940,7 +945,7 @@ it does not widen their schemas.
 Each case declares which schema-known workflow events matter and applies
 case-specific predicates. The grader derives them from in-process evidence or
 the [safe trace envelope](skill-eval-schema.md#structured-retention-envelope);
-it does not require exact natural-language phrasing.
+it does not inspect natural-language phrasing.
 
 The trace envelope exists because workflow quality is not fully represented by a
 final repository tree. It should be narrow enough to avoid brittle trajectory

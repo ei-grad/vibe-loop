@@ -157,10 +157,20 @@ admitted.
 
 `workflow-events.json` contains only `events`, a de-duplicated list of at most
 128 schema-known workflow labels. Labels are derived from raw in-process events
-before persistence. Unknown labels fail closed; they are not copied into a
-diagnostic. Command counting likewise uses raw in-process events or safe
-`command`/`tool_call` records and uses the maximum available observation, so
-sanitization cannot lower a count.
+before persistence. Local-demo execution requests each recognized first-party
+agent's native structured stream: Codex `exec` commands receive `--json`, while
+already structured Codex commands and their model, effort, environment, timeout,
+output-budget, and provider-routing settings remain otherwise unchanged.
+Workflow labels may be projected from schema-known Claude tool-use blocks,
+Codex command-execution items, or Codex collaboration tool items. Final-answer
+text, terminal rendering, filenames, arbitrary artifact text, and deterministic
+repository-state facts are not delegation or review evidence. State projection
+may establish only the corresponding worktree, verification, commit, or
+mainline-movement facts. Unknown labels and malformed or unknown native
+envelopes fail closed; rejected values are not copied into diagnostics. Command
+counting likewise uses raw in-process events or safe `command`/`tool_call`
+records and uses the maximum available observation, so sanitization cannot lower
+a count.
 
 The remaining structured artifacts retain only schema-known booleans, bounded
 numbers, statuses and failure-taxonomy labels, stable identifiers or SHA-256
