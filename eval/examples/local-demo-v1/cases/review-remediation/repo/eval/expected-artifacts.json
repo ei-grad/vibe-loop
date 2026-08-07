@@ -36,6 +36,55 @@
       }
     ]
   },
+  "condition_contracts": {
+    "orchestrated_vibe_loop": {
+      "workflow_trace": {
+        "required": [
+          "skill_activated",
+          "exploration_delegated",
+          "implementation_delegated",
+          "verification_ran",
+          "review_requested",
+          "review_delegated",
+          "review_finding_received",
+          "remediation_delegated",
+          "review_finding_addressed",
+          "rereview_requested",
+          "commit_created",
+          "main_fast_forwarded",
+          "main_verification_ran"
+        ],
+        "forbidden": ["unsafe_git_command"]
+      },
+      "artifact_contract": {
+        "event_order": [
+          "exploration_delegated",
+          "implementation_delegated",
+          "verification_ran",
+          "review_delegated",
+          "review_finding_received",
+          "remediation_delegated",
+          "review_finding_addressed",
+          "rereview_requested",
+          "commit_created",
+          "main_fast_forwarded",
+          "main_verification_ran"
+        ],
+        "artifact_json_fields": [
+          {
+            "role": "review_evidence",
+            "field": "initial.material_findings_count",
+            "equals": 1
+          },
+          {
+            "role": "review_evidence",
+            "field": "rereview.material_findings_count",
+            "equals": 0
+          }
+        ]
+      }
+    }
+  },
   "checks": [
     {
       "id": "unit-tests",

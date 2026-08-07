@@ -29,4 +29,13 @@ PROFILE = {
 
 
 if __name__ == "__main__":
-    print(json.dumps(PROFILE, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "status": "profile",
+                "confidence": 0.95,
+                "profile": PROFILE,
+            },
+            sort_keys=True,
+        )
+    )

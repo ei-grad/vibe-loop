@@ -5,6 +5,25 @@ description: Use when the user asks for an orchestrated vibe loop, main-agent-on
 
 # Orchestrated Vibe Loop
 
+## Non-Negotiable Delegation Gates
+
+When the harness exposes native subagent tools, use them. Before making any
+product edit, the main agent must have completed an explorer delegation and
+must have spawned an implementation agent with the write assignment. The main
+agent must not fall back to implementing the change itself. Before creating any
+candidate commit, it must have spawned an independent reviewer and waited for
+that review result. Empty wait calls, agent prose, self-review, and files that
+claim delegation or review do not satisfy these gates. If a required native
+delegation cannot be launched or completed, stop as blocked without editing or
+committing.
+
+For Codex collaboration tools, use `spawn_agent` for the explorer,
+implementation agent, and independent reviewer; use `wait_agent` to collect
+their results. Keep the implementation agent available. If review finds a
+material issue, use `followup_task` with that same implementation agent for the
+fix, then `followup_task` with the same reviewer for the targeted closure check.
+Do not start a replacement agent for either continuation.
+
 Use for bounded or unattended software work where the main agent is an
 orchestrator. The main agent owns task framing, agent assignment, handoffs,
 integration gates, status, blockers, and final reporting. Exploration,
@@ -200,6 +219,39 @@ agent configuration.
 11. Finalize only after implementation evidence, review status, integration
     result, and cleanup status are known. Report completed work, agents used,
     verification evidence, review result, unresolved risks, and any blocker.
+
+## Candidate, Remediation, And Completion Sequence
+
+For each candidate, preserve this role-separated sequence in actual tool and
+repository state; agent prose and agent-written workflow artifacts are not
+evidence that a step occurred:
+
+1. Delegate bounded exploration, then delegate implementation with the
+   explorer's relevant findings and the assigned write scope. The main
+   orchestrator must not make the implementation edits.
+2. After the implementer reports focused verification, spawn an independent
+   reviewer with the raw diff, acceptance criteria, and verification evidence.
+   The reviewer must not be the implementation agent.
+3. If the reviewer reports no material finding, record that result and do not
+   invent a remediation or re-review cycle.
+4. If the reviewer reports a material finding, use the harness continuation
+   operation for the existing implementer (for example `followup_task`) to send
+   back the finding and request focused remediation. After the implementer
+   verifies the remediation, use the continuation operation for the existing
+   reviewer to request a targeted closure review of the recorded finding,
+   changed hunks, and directly affected tests. Do not substitute a new reviewer
+   or remediate in the main orchestrator.
+5. Only after review closure, inspect the candidate state and create the
+   candidate commit through the repository-permitted Git workflow. A claimed
+   completion, diff artifact, or review summary does not substitute for the
+   commit.
+6. Enter the repository's integration gate, refresh against the current base,
+   perform the permitted integration, and verify the landed revision. Do not
+   claim integration from a local candidate branch or from prose.
+7. When the task-source contract permits completion, update or invoke the
+   authoritative task source only after the reviewed work is integrated, then
+   verify that the task is completed or otherwise non-runnable. A run record is
+   not authoritative task completion.
 
 ## Parallelism And Independence
 

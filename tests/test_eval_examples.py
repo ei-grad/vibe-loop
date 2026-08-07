@@ -70,6 +70,40 @@ REQUIRED_ARTIFACT_ROLES = {
 
 
 class EvalExampleTests(unittest.TestCase):
+    def test_candidate_checkout_contracts_cover_exact_shipped_skill_pairs(
+        self,
+    ) -> None:
+        focused_pairs = set()
+        for case in list_eval_example_cases():
+            spec = json.loads(
+                (case.repo_path / "eval" / "expected-artifacts.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            for condition in spec.get("condition_contracts", {}):
+                focused_pairs.add((case.case_id, condition))
+
+        self.assertEqual(
+            focused_pairs,
+            {
+                ("generated-roadmap-profile", "vibe_loop"),
+                ("finite-py-plan-table", "orchestrated_vibe_loop"),
+                ("review-remediation", "orchestrated_vibe_loop"),
+            },
+        )
+        remediation_case = next(
+            case
+            for case in list_eval_example_cases()
+            if case.case_id == "review-remediation"
+        )
+        remediation_plan = (remediation_case.repo_path / "PLAN.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "Initial implementation changes only the validator", remediation_plan
+        )
+        self.assertIn("the same implementer adds it", remediation_plan)
+
     def test_manifest_exposes_offline_paired_cases(self) -> None:
         cases = list_eval_example_cases()
 
@@ -558,6 +592,35 @@ class EvalExampleTests(unittest.TestCase):
         self.assertEqual(cache["source_fingerprints"][0]["path"], "docs/roadmap.md")
         self.assertEqual([task.task_id for task in tasks], ["ROAD-01", "ROAD-02"])
 
+    def test_generated_roadmap_completion_requires_product_cache_refresh(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = materialize_eval_example(
+                "generated-roadmap-profile",
+                Path(directory) / "roadmap",
+                include_reference_patch=True,
+            )
+            apply_reference_patch(repo)
+            cache = json.loads(
+                (repo / ".vibe-loop" / "generated-task-source.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            roadmap = repo / "docs" / "roadmap.md"
+
+            result = run_eval_example_grader(repo)
+            roadmap_content = roadmap.read_text(encoding="utf-8")
+            roadmap_sha256 = hashlib.sha256(roadmap.read_bytes()).hexdigest()
+
+        self.assertTrue(result.passed, result.stdout + result.stderr)
+        self.assertIn("- State: Accepted", roadmap_content)
+        self.assertEqual(cache["source_fingerprints"][0]["path"], "docs/roadmap.md")
+        self.assertEqual(
+            cache["source_fingerprints"][0]["sha256"],
+            roadmap_sha256,
+        )
+
     def test_release_user_story_sources_select_expected_runnable_task(self) -> None:
         expected = {
             "explicit-list-profile": ("LIST-02", ("PRD-TSK-001", "PRD-TSK-002")),
@@ -715,6 +778,39 @@ class EvalExampleTests(unittest.TestCase):
             "generated profile source path is unsafe: ../outside.md",
             result.stdout,
         )
+
+    def test_generated_roadmap_cache_rejects_command_fields_and_malformed_json(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command_repo = materialize_eval_example(
+                "generated-roadmap-profile",
+                root / "command-field",
+            )
+            command_cache = command_repo / ".vibe-loop" / "generated-task-source.json"
+            payload = json.loads(command_cache.read_text(encoding="utf-8"))
+            payload["profile"]["command"] = "python unsafe.py"
+            command_cache.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            command_result = run_eval_example_grader(command_repo)
+
+            malformed_repo = materialize_eval_example(
+                "generated-roadmap-profile",
+                root / "malformed",
+            )
+            malformed_cache = (
+                malformed_repo / ".vibe-loop" / "generated-task-source.json"
+            )
+            malformed_cache.write_text("{not-json\n", encoding="utf-8")
+            malformed_result = run_eval_example_grader(malformed_repo)
+
+        self.assertFalse(command_result.passed)
+        self.assertIn("generated cache has forbidden fields", command_result.stdout)
+        self.assertFalse(malformed_result.passed)
+        self.assertIn("JSONDecodeError", malformed_result.stdout)
 
     def test_negative_trigger_fixture_grades_clean_initial_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1049,6 +1145,26 @@ def apply_reference_patch(repo: Path) -> None:
         capture_output=True,
         text=True,
     )
+    if (repo / ".vibe-loop" / "generated-task-source.json").is_file():
+        stdout = StringIO()
+        stderr = StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = main(
+                [
+                    "tasks",
+                    "configure",
+                    "--repo",
+                    str(repo),
+                    "--force-refresh",
+                    "--json",
+                ]
+            )
+        if exit_code != 0:
+            raise AssertionError(
+                "generated task-source refresh failed: "
+                + stdout.getvalue()
+                + stderr.getvalue()
+            )
 
 
 def git_output(repo: Path, *args: str) -> str:

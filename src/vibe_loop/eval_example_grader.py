@@ -303,7 +303,7 @@ def generated_cache(
             check_id,
             f"generated profile source path is unsafe: {unsafe_profile_path}",
         )
-    forbidden = sorted(find_forbidden_generated_command_keys(profile))
+    forbidden = sorted(find_forbidden_generated_command_keys(cache))
     if forbidden:
         return failed(
             check_id, "generated cache has forbidden fields: " + ", ".join(forbidden)
@@ -311,6 +311,7 @@ def generated_cache(
     fingerprints = cache.get("source_fingerprints")
     if not isinstance(fingerprints, list) or not fingerprints:
         return failed(check_id, "generated cache source_fingerprints must be non-empty")
+    fingerprints_by_path: dict[str, Mapping[str, Any]] = {}
     for entry in fingerprints:
         if not isinstance(entry, Mapping):
             return failed(
@@ -319,6 +320,12 @@ def generated_cache(
         source_path = entry.get("path")
         if not isinstance(source_path, str):
             return failed(check_id, "generated cache fingerprint path is required")
+        if source_path in fingerprints_by_path:
+            return failed(
+                check_id,
+                f"generated cache fingerprint path is duplicated: {source_path}",
+            )
+        fingerprints_by_path[source_path] = entry
         current = safe_repo_file(repo, source_path)
         if current is None or not current.is_file():
             return failed(check_id, f"generated source missing: {source_path}")
@@ -326,6 +333,19 @@ def generated_cache(
             return failed(
                 check_id, f"generated source fingerprint stale: {source_path}"
             )
+        if entry.get("size") != current.stat().st_size:
+            return failed(
+                check_id, f"generated source fingerprint size stale: {source_path}"
+            )
+    missing_fingerprints = sorted(
+        set(string_list(profile.get("source_paths"))) - set(fingerprints_by_path)
+    )
+    if missing_fingerprints:
+        return failed(
+            check_id,
+            "generated cache source_fingerprints missing authoritative paths: "
+            + ", ".join(missing_fingerprints),
+        )
     task_ids = string_list(check.get("task_ids"))
     if task_ids:
         source = build_task_source(
@@ -584,7 +604,7 @@ def artifact_workflow_trace(
     record: Mapping[str, Any],
     spec: Mapping[str, Any],
 ) -> dict[str, object]:
-    expectations = spec.get("workflow_trace")
+    expectations = condition_contract(spec, record, "workflow_trace")
     if not isinstance(expectations, Mapping):
         return passed("artifact-workflow-trace")
     ordered_events = load_ordered_workflow_events(artifact_root, record)
@@ -634,7 +654,7 @@ def artifact_orchestrated_delegation(
     record: Mapping[str, Any],
     spec: Mapping[str, Any],
 ) -> dict[str, object]:
-    expectations = spec.get("workflow_trace")
+    expectations = condition_contract(spec, record, "workflow_trace")
     base_required = (
         set(string_list(expectations.get("required")))
         if isinstance(expectations, Mapping)
@@ -668,11 +688,32 @@ def artifact_orchestrated_delegation(
         for field in ("prompt_present", "result_present"):
             if agent.get(field) is not True:
                 diagnostics.append(f"{role}.{field} is required")
-        if role in {"implementer", "remediator"} and not (
-            isinstance(agent.get("changed_path_count"), int)
-            and agent["changed_path_count"] > 0
-        ):
-            diagnostics.append(f"{role}.changed_path_count is required")
+    role_agents = {
+        role: next((agent for agent in agents if agent.get("role") == role), None)
+        for role in required_roles
+    }
+    implementer = role_agents.get("implementer")
+    reviewer = role_agents.get("reviewer")
+    if (
+        isinstance(implementer, Mapping)
+        and isinstance(reviewer, Mapping)
+        and implementer.get("agent_id") == reviewer.get("agent_id")
+    ):
+        diagnostics.append("reviewer must be independent from implementer")
+    remediator = role_agents.get("remediator")
+    if (
+        isinstance(remediator, Mapping)
+        and isinstance(implementer, Mapping)
+        and remediator.get("agent_id") != implementer.get("agent_id")
+    ):
+        diagnostics.append("material findings must return to the implementer")
+    rereviewer = role_agents.get("rereviewer")
+    if (
+        isinstance(rereviewer, Mapping)
+        and isinstance(reviewer, Mapping)
+        and rereviewer.get("agent_id") != reviewer.get("agent_id")
+    ):
+        diagnostics.append("closure review must return to the independent reviewer")
     if diagnostics:
         return failed("artifact-orchestrated-delegation", "; ".join(diagnostics))
     return passed("artifact-orchestrated-delegation")
@@ -689,7 +730,7 @@ def orchestrated_required_roles(
         "review_finding_addressed" in base_required
         or "rereview_requested" in base_required
     ):
-        required.add("remediator")
+        required.update({"remediator", "rereviewer"})
     return required
 
 
@@ -739,20 +780,32 @@ def artifact_case_contract(
     artifact_root: Path,
     spec: Mapping[str, Any],
 ) -> dict[str, object]:
-    contract = spec.get("artifact_contract")
+    record = safe_load_json(artifact_root / "run.json")
+    if not isinstance(record, Mapping):
+        return failed("artifact-case-contract", "run.json must contain an object")
+    contract = condition_contract(spec, record, "artifact_contract")
     if not isinstance(contract, Mapping):
         return passed("artifact-case-contract")
     diagnostics: list[str] = []
     diagnostics.extend(check_preserved_files(repo, contract))
-    record = safe_load_json(artifact_root / "run.json")
-    if not isinstance(record, Mapping):
-        diagnostics.append("run.json must contain an object")
-        return failed("artifact-case-contract", "; ".join(diagnostics))
     diagnostics.extend(check_event_order(artifact_root, record, contract))
     diagnostics.extend(check_artifact_json_fields(artifact_root, record, contract))
     if diagnostics:
         return failed("artifact-case-contract", "; ".join(diagnostics))
     return passed("artifact-case-contract")
+
+
+def condition_contract(
+    spec: Mapping[str, Any], record: Mapping[str, Any], key: str
+) -> Mapping[str, Any] | None:
+    conditions = spec.get("condition_contracts")
+    if isinstance(conditions, Mapping):
+        condition = conditions.get(record.get("condition"))
+        if isinstance(condition, Mapping) and key in condition:
+            value = condition.get(key)
+            return value if isinstance(value, Mapping) else None
+    value = spec.get(key)
+    return value if isinstance(value, Mapping) else None
 
 
 def check_preserved_files(repo: Path, contract: Mapping[str, Any]) -> list[str]:

@@ -11,6 +11,28 @@
     ],
     "forbidden": ["unsafe_git_command"]
   },
+  "condition_contracts": {
+    "vibe_loop": {
+      "workflow_trace": {
+        "required": [
+          "skill_activated",
+          "task_source_inspected",
+          "verification_ran",
+          "review_requested",
+          "commit_created"
+        ],
+        "forbidden": ["unsafe_git_command"]
+      },
+      "artifact_contract": {
+        "event_order": [
+          "task_source_inspected",
+          "verification_ran",
+          "review_requested",
+          "commit_created"
+        ]
+      }
+    }
+  },
   "checks": [
     {
       "id": "generated-cache-parses-roadmap",
@@ -23,6 +45,12 @@
       "id": "secret-like-example-present",
       "kind": "files_exist",
       "paths": [".env.example"]
+    },
+    {
+      "id": "authoritative-roadmap-task-completed",
+      "kind": "file_contains",
+      "path": "docs/roadmap.md",
+      "text": "## ROAD-02: Collapse repeated separators\n\n- State: Accepted"
     },
     {
       "id": "unit-tests",

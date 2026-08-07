@@ -4,3 +4,9 @@ diff --git a/src/roadmap_demo/slugs.py b/src/roadmap_demo/slugs.py
 @@ -5,1 +5,1 @@
 -    return value.strip().lower().replace(" ", "-")
 +    return "-".join(part for part in value.replace("-", " ").lower().split())
+diff --git a/docs/roadmap.md b/docs/roadmap.md
+--- a/docs/roadmap.md
++++ b/docs/roadmap.md
+@@ -11,1 +11,1 @@
+-- State: Ready
++- State: Accepted

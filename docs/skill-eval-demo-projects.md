@@ -224,6 +224,10 @@ Expected workflow evidence:
 - Independent spec or code-quality review requested.
 - Commit created after checks and review remediation.
 - Local `main` fast-forward integration performed when repo policy permits.
+- Under `orchestrated_vibe_loop`, exploration and implementation are delegated,
+  review uses an independent agent, the reviewed candidate is committed and
+  integrated, and the authoritative plan row is completed. Because this case
+  has no material finding, remediation and re-review evidence are forbidden.
 
 Trace-envelope rationale:
 
@@ -267,6 +271,9 @@ Deterministic graders:
 - The generated task-source cache exists under the configured state directory
   and validates as a current profile.
 - The cache includes source fingerprints and provenance for `docs/roadmap.md`.
+- `docs/roadmap.md` remains authoritative and records `ROAD-02` as accepted;
+  the product-owned refresh path regenerates the cache after that mutation so
+  its fingerprint matches the roadmap.
 - The cache does not include executable adapter fields such as `command`,
   `commands`, `list`, `next`, `probe`, or `selection_command`.
 - `vibe-loop tasks list --repo <fixture>` can parse `ROAD-02` from the generated
@@ -279,6 +286,8 @@ Expected workflow evidence:
   needed.
 - Evidence collection is bounded and avoids secret-like paths.
 - Runtime read-only commands reuse the cache instead of launching the agent.
+- Under `vibe_loop`, task selection uses the CLI-validated cache and its
+  authoritative source paths; cache content is neither edited nor executed.
 - The implementation slice still follows review, check, commit, and integration
   expectations.
 
@@ -368,6 +377,10 @@ Expected workflow evidence:
 - The material review finding is addressed with code and tests.
 - Re-review is requested from the same reviewer or same review gate before
   commit/integration.
+- Under `orchestrated_vibe_loop`, exploration and implementation are delegated;
+  the material finding returns to that implementer, and targeted closure review
+  returns to the independent reviewer before candidate commit, integration,
+  main verification, and authoritative plan completion.
 
 Trace-envelope rationale:
 

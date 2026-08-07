@@ -139,6 +139,7 @@ _CODEX_SAFE_ITEM_FIELDS = {
             "type",
             "tool",
             "arguments",
+            "agents_states",
             "prompt",
             "sender_thread_id",
             "receiver_thread_ids",
@@ -603,9 +604,11 @@ def _project_transcript_record(
                 f"transcript rejected: wrong field type at index {index}"
             )
         allowed_usage = {
+            "cache_write_input_tokens",
             "cached_input_tokens",
             "input_tokens",
             "output_tokens",
+            "reasoning_output_tokens",
             "cache_creation_input_tokens",
             "cache_read_input_tokens",
             "server_tool_use",

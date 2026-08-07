@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from _test_bootstrap import TEST_ENVIRONMENT_CONFIGURED as TEST_ENVIRONMENT_CONFIGURED
 
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -91,6 +92,53 @@ class SkillDeploymentTests(unittest.TestCase):
             {"in-sync"},
         )
         self.assertFalse(any(report.drifted for report in reports))
+
+    def test_installed_skill_candidate_checkout_uses_current_contracts(
+        self,
+    ) -> None:
+        candidate_home = self.root / "candidate-home"
+        installed = install_skills(
+            True,
+            False,
+            candidate_home,
+            allow_unmerged=True,
+        )
+        source_root = (
+            Path(__file__).resolve().parents[1] / "src" / "vibe_loop" / "skills"
+        )
+        expected_phrases = {
+            "vibe-loop": (
+                "--force-refresh --json",
+                "Never hand-edit the cache",
+            ),
+            "orchestrated-vibe-loop": (
+                "Non-Negotiable Delegation Gates",
+                "Candidate, Remediation, And Completion Sequence",
+                "targeted closure review",
+            ),
+        }
+
+        self.assertIn(
+            candidate_home / ".codex" / "skills" / "vibe-loop",
+            installed,
+        )
+        manifest = json.loads(
+            (candidate_home / ".codex" / "skills" / MANIFEST_NAME).read_text(
+                encoding="utf-8"
+            )
+        )
+        for skill_name, phrases in expected_phrases.items():
+            source = source_root / skill_name / "SKILL.md"
+            deployed = candidate_home / ".codex" / "skills" / skill_name / "SKILL.md"
+            source_bytes = source.read_bytes()
+            self.assertEqual(deployed.read_bytes(), source_bytes)
+            self.assertEqual(
+                manifest["entries"][f"{skill_name}/SKILL.md"]["sha256"],
+                hashlib.sha256(source_bytes).hexdigest(),
+            )
+            content = deployed.read_text(encoding="utf-8")
+            for phrase in phrases:
+                self.assertIn(phrase, content)
 
     def test_non_git_package_source_uses_immutable_release_provenance(self) -> None:
         package_source = self.root / "installed-package" / "skills"

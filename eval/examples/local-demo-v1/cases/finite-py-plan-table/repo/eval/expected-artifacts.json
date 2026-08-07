@@ -26,6 +26,46 @@
       "main_verification_ran"
     ]
   },
+  "condition_contracts": {
+    "orchestrated_vibe_loop": {
+      "workflow_trace": {
+        "required": [
+          "skill_activated",
+          "instructions_inspected",
+          "worktree_state_inspected",
+          "exploration_delegated",
+          "branch_or_worktree_created",
+          "implementation_delegated",
+          "verification_ran",
+          "review_requested",
+          "review_delegated",
+          "commit_created",
+          "main_fast_forwarded",
+          "main_verification_ran"
+        ],
+        "forbidden": [
+          "remediation_delegated",
+          "review_finding_received",
+          "review_finding_addressed",
+          "rereview_requested",
+          "unsafe_git_command"
+        ]
+      },
+      "artifact_contract": {
+        "event_order": [
+          "worktree_state_inspected",
+          "exploration_delegated",
+          "branch_or_worktree_created",
+          "implementation_delegated",
+          "verification_ran",
+          "review_delegated",
+          "commit_created",
+          "main_fast_forwarded",
+          "main_verification_ran"
+        ]
+      }
+    }
+  },
   "checks": [
     {
       "id": "required-fixture-files",

@@ -64,7 +64,39 @@ in this skill remains authoritative.
 7. Commit the reviewed slice, integrate it to `main` when permitted, verify on
    `main`, apply the cleanup authorization rule below, and stop.
 
+The review steps require an actual independent reviewer invocation after
+implementation evidence exists. Spawn or invoke the separate reviewer with the
+raw diff, acceptance criteria, and verification evidence, wait for its result,
+and record whether material findings exist before creating the candidate
+commit. Reading review instructions, running more tests, inspecting the diff
+yourself, or writing a review artifact is not independent review. If there is no
+material finding, proceed without inventing remediation. If there is one, send
+it back to the implementer and request targeted closure review from the same
+reviewer before committing.
+
 ## Task Source State
+
+Before selecting or editing a task, determine the active task-source origin with
+the product's read-only task commands. When generated discovery is active, use
+`vibe-loop tasks configure --repo <workspace> --json` to validate and inspect
+the existing cache, then inspect the authoritative repo-relative paths reported
+by its parser profile and confirm the requested task through `vibe-loop tasks
+inspect --repo <workspace> <task-id> --json`. Do not select work from cache JSON
+that the CLI has not validated.
+
+The generated cache is parser state, never task authority. Do not edit it, copy
+task status into it, execute any cache field, or treat prose and generated
+artifacts as proof of task completion. Reject and report unsafe source paths,
+malformed cache content, or executable/command fields instead of working around
+the validator. Apply task-status changes to the authoritative source path, such
+as `docs/roadmap.md`.
+
+After changing an authoritative source used by a generated profile, invoke the
+product-owned cache generator with `vibe-loop tasks configure --repo
+<workspace> --force-refresh --json`. Require a successful validation, current
+`source_fingerprints` for every reported source path, and a read-only task parse
+before continuing to final reporting. Never hand-edit the cache to repair a
+stale fingerprint.
 
 For CLI-supervised runs, completion is reflected through the repository's active
 task source, not through the supervisor run record alone. Before reporting a
@@ -80,6 +112,12 @@ project-owned, so agents and humans working without the `vibe-loop` CLI can
 manage the same backlog through the normal plan, tracker, or adapter.
 
 ## Review
+
+Before running any `git commit`, invoke a separate reviewer through an actual
+review mechanism such as a reviewer subagent or `codex review`, and wait for its
+result. If no independent reviewer mechanism is available, stop with a precise
+review blocker; do not commit. This is a hard gate, including small or obvious
+changes.
 
 Spec review checks requested behavior and evidence. Code-quality review checks
 implementation, tests, security, performance, UX, maintainability, and repo fit.

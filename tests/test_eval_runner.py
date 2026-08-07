@@ -16,6 +16,7 @@ from unittest.mock import patch
 from vibe_loop.autopilot import MaintenanceCommandResult
 from vibe_loop.cli import main
 from vibe_loop.eval_runner import (
+    AgentCommandBatch,
     CommandExecution,
     TrialResult,
     active_worker_runtime_context,
@@ -26,7 +27,9 @@ from vibe_loop.eval_runner import (
     evidence_backed_workflow_events,
     ensure_stream_json_format,
     execute_agent_command,
+    native_delegation_evidence,
     parse_stream_json,
+    persist_native_delegation_evidence,
     render_aggregate_markdown,
     safe_workspace_dirty_summary,
     score_trial,
@@ -41,7 +44,11 @@ from vibe_loop.eval_examples import (
     materialize_eval_example,
 )
 from vibe_loop.config import load_config
-from vibe_loop.evals import EVAL_FAILURE_TAXONOMY, EvalSafeEnvelopeError
+from vibe_loop.evals import (
+    EVAL_FAILURE_TAXONOMY,
+    EvalSafeEnvelopeError,
+    project_transcript_jsonl,
+)
 from vibe_loop.runner import VibeRunner
 
 
@@ -1115,7 +1122,7 @@ class EvalRunnerCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 2)
         self.assertIn("refusing nested vibe-loop eval", stderr.getvalue())
 
-    def test_orchestrated_condition_rejects_labels_without_evidence(self) -> None:
+    def test_finite_py_plan_table_rejects_labels_without_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             agent = root / "orchestrated_labels_only_agent.py"
@@ -1154,7 +1161,7 @@ class EvalRunnerCliTests(unittest.TestCase):
         self.assertEqual(record["task"]["expected_skill"], "orchestrated-vibe-loop")
         self.assertTrue(prompt.startswith("$orchestrated-vibe-loop "))
 
-    def test_orchestrated_condition_rejects_wrong_delegation_order(self) -> None:
+    def test_finite_py_plan_table_rejects_wrong_delegation_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             agent = root / "orchestrated_wrong_order_agent.py"
@@ -1186,7 +1193,7 @@ class EvalRunnerCliTests(unittest.TestCase):
         )
         self.assertIn("workflow_contract", record["failure_taxonomy"])
 
-    def test_orchestrated_condition_passes_with_delegation_evidence(self) -> None:
+    def test_finite_py_plan_table_passes_with_delegation_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             agent = root / "orchestrated_agent.py"
@@ -2318,6 +2325,223 @@ class EvalRunnerCliTests(unittest.TestCase):
         _result, events = parse_stream_json(stream)
 
         self.assertEqual(events, ["review_requested", "review_delegated"])
+
+    def test_codex_native_agent_states_are_admitted_but_not_persisted(self) -> None:
+        stream = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "call-1",
+                            "type": "collab_tool_call",
+                            "tool": "wait",
+                            "prompt": "",
+                            "sender_thread_id": "thread-1",
+                            "receiver_thread_ids": [],
+                            "agents_states": {
+                                "reviewer-1": {
+                                    "status": "completed",
+                                    "message": "private",
+                                }
+                            },
+                            "status": "completed",
+                        },
+                    },
+                ),
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {
+                            "cache_write_input_tokens": 4,
+                            "cached_input_tokens": 3,
+                            "input_tokens": 2,
+                            "output_tokens": 1,
+                            "reasoning_output_tokens": 1,
+                        },
+                    }
+                ),
+            )
+        )
+
+        projected = project_transcript_jsonl(stream)
+
+        self.assertEqual(len(projected), 2)
+        self.assertEqual(projected[0]["kind"], "tool_result")
+        self.assertNotIn("agents_states", projected[0])
+
+    def test_native_delegation_evidence_tracks_role_separation_and_handoffs(
+        self,
+    ) -> None:
+        calls = (
+            (
+                "spawn_agent",
+                {"task_name": "exploration", "message": "Explore task scope"},
+                "explorer-1",
+            ),
+            (
+                "spawn_agent",
+                {"task_name": "implementation", "message": "Implement the change"},
+                "implementer-1",
+            ),
+            (
+                "spawn_agent",
+                {"task_name": "review", "message": "Review the candidate"},
+                "reviewer-1",
+            ),
+            (
+                "followup_task",
+                {
+                    "target": "implementer-1",
+                    "message": "Remediate the material finding",
+                },
+                "implementer-1",
+            ),
+            (
+                "followup_task",
+                {
+                    "target": "reviewer-1",
+                    "message": "Run a targeted closure review",
+                },
+                "reviewer-1",
+            ),
+        )
+        stream = "\n".join(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": f"call-{index}",
+                        "type": "collab_tool_call",
+                        "tool": tool,
+                        "arguments": arguments,
+                        "result": {
+                            "agent_id": agent_id,
+                            "output": "completed assigned role",
+                        },
+                        "status": "completed",
+                    },
+                }
+            )
+            for index, (tool, arguments, agent_id) in enumerate(calls)
+        )
+
+        evidence = native_delegation_evidence(stream)
+        _result, events = parse_stream_json(stream)
+
+        by_role = {record["role"]: record for record in evidence}
+        self.assertEqual(
+            set(by_role),
+            {"explorer", "implementer", "reviewer", "remediator", "rereviewer"},
+        )
+        self.assertNotEqual(
+            by_role["implementer"]["agent_id"],
+            by_role["reviewer"]["agent_id"],
+        )
+        self.assertEqual(
+            by_role["remediator"]["agent_id"],
+            by_role["implementer"]["agent_id"],
+        )
+        self.assertEqual(
+            by_role["rereviewer"]["agent_id"],
+            by_role["reviewer"]["agent_id"],
+        )
+        for event in (
+            "review_finding_received",
+            "remediation_delegated",
+            "review_finding_addressed",
+            "rereview_requested",
+        ):
+            self.assertIn(event, events)
+
+    def test_native_delegation_requires_agent_output_not_only_spawn_receipt(
+        self,
+    ) -> None:
+        stream = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "call-1",
+                    "type": "collab_tool_call",
+                    "tool": "spawn_agent",
+                    "arguments": {
+                        "task_name": "review",
+                        "message": "Review the candidate",
+                    },
+                    "result": {"agent_id": "reviewer-1"},
+                    "status": "completed",
+                },
+            }
+        )
+
+        self.assertEqual(native_delegation_evidence(stream), ())
+
+    def test_native_stream_ignores_agent_written_workflow_event_artifact(self) -> None:
+        execution = CommandExecution(
+            command="codex exec --json task",
+            exit_code=0,
+            stdout=json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+            stderr="",
+            started_at="2026-05-09T00:00:00+00:00",
+            finished_at="2026-05-09T00:00:01+00:00",
+            duration_seconds=1.0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "workflow-events.json").write_text(
+                json.dumps(
+                    {
+                        "events": [
+                            "exploration_delegated",
+                            "implementation_delegated",
+                            "review_delegated",
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            events = workflow_events_for_trial(
+                root,
+                execution,
+                (),
+                allow_artifact_events=True,
+            )
+
+        self.assertEqual(events, [])
+
+    def test_native_stream_overwrites_agent_written_delegation_evidence(self) -> None:
+        execution = CommandExecution(
+            command="codex exec --json task",
+            exit_code=0,
+            stdout=json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+            stderr="",
+            started_at="2026-05-09T00:00:00+00:00",
+            finished_at="2026-05-09T00:00:01+00:00",
+            duration_seconds=1.0,
+        )
+        batch = AgentCommandBatch(execution=execution, command_results=())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "delegation-evidence.json").write_text(
+                json.dumps(
+                    {
+                        "agents": [
+                            {
+                                "role": "reviewer",
+                                "agent_id": "spoofed-reviewer",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            persist_native_delegation_evidence(root, batch)
+            evidence = json.loads(
+                (root / "delegation-evidence.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(evidence, {"agents": []})
 
     def test_codex_modeled_inert_tool_item_preserves_command_events(self) -> None:
         stream = "\n".join(
@@ -3884,6 +4108,12 @@ def write_orchestrated_review_agent(path: Path) -> None:
                 "changed_paths": ["tests/test_codes.py"],
                 "result": "added whitespace-only regression test",
             },
+            {
+                "role": "rereviewer",
+                "agent_id": "reviewer-1",
+                "prompt": "Run a targeted closure review after remediation.",
+                "result": "no material findings remain",
+            },
         ]
     }
     review_evidence = {
@@ -3906,6 +4136,7 @@ def write_orchestrated_review_agent(path: Path) -> None:
         "rereview_requested",
         "commit_created",
         "main_fast_forwarded",
+        "main_verification_ran",
     ]
     write_python_executable(
         path,

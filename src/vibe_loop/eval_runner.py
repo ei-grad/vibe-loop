@@ -334,6 +334,7 @@ class AgentCommandBatch:
     execution: CommandExecution
     command_results: tuple[dict[str, object], ...]
     workflow_events: tuple[str, ...] = ()
+    delegation_evidence: tuple[dict[str, object], ...] = ()
     transcript_rejected: bool = False
     evidence_diagnostics: tuple[str, ...] = ()
 
@@ -859,6 +860,7 @@ def run_trial(
         sanitize_delegation_evidence(trial_root)
     except EvalSafeEnvelopeError:
         evidence_diagnostics.append("delegation evidence rejected")
+    persist_native_delegation_evidence(trial_root, agent_batch)
     try:
         sanitize_review_evidence(trial_root)
     except EvalSafeEnvelopeError:
@@ -1127,11 +1129,13 @@ def execute_trial_agent_commands(
         budgets=budgets,
     )
     stream_events: tuple[str, ...] = ()
+    delegation_evidence: tuple[dict[str, object], ...] = ()
     transcript_rejected = False
     if is_stream_json(execution.stdout):
         raw_stream = execution.stdout
         _, parsed_events = parse_stream_json(raw_stream)
         stream_events = tuple(parsed_events)
+        delegation_evidence = native_delegation_evidence(raw_stream)
         transcript_path = artifact_path(trial_root, "transcript")
         try:
             records = project_transcript_jsonl(raw_stream)
@@ -1143,6 +1147,7 @@ def execute_trial_agent_commands(
         execution=execution,
         command_results=({"type": "agent", **execution.to_json()},),
         workflow_events=stream_events,
+        delegation_evidence=delegation_evidence,
         transcript_rejected=transcript_rejected,
     )
 
@@ -1888,7 +1893,11 @@ def workflow_events_for_trial(
     existing = artifact_path(artifact_root, "workflow_events")
     events: list[str] = []
     events.extend(extra_events)
-    if allow_artifact_events and existing.is_file():
+    if (
+        allow_artifact_events
+        and not is_stream_json(execution.stdout)
+        and existing.is_file()
+    ):
         loaded = load_json(existing)
         raw_events = loaded.get("events") if isinstance(loaded, Mapping) else loaded
         try:
@@ -2392,12 +2401,19 @@ def delegation_events_for_tool(name: str, inp: Mapping[str, object]) -> list[str
     description = " ".join(
         str(inp.get(key, "")) for key in ("message", "prompt", "task_name")
     ).casefold()
+    if normalized == "followup_task" and any(
+        marker in description
+        for marker in ("closure review", "closure check", "re-review", "rereview")
+    ):
+        return ["review_finding_addressed", "rereview_requested"]
+    if "remediat" in description or "finding" in description:
+        if normalized == "followup_task":
+            return ["review_finding_received", "remediation_delegated"]
+        return ["remediation_delegated"]
     if "review" in description:
         if normalized == "followup_task":
             return ["rereview_requested"]
         return ["review_requested", "review_delegated"]
-    if "remediat" in description or "finding" in description:
-        return ["remediation_delegated"]
     if "explor" in description or "investigat" in description:
         return ["exploration_delegated"]
     if any(
@@ -2406,6 +2422,136 @@ def delegation_events_for_tool(name: str, inp: Mapping[str, object]) -> list[str
     ):
         return ["implementation_delegated"]
     return []
+
+
+def native_delegation_evidence(raw: str) -> tuple[dict[str, object], ...]:
+    records: dict[tuple[str, str], dict[str, object]] = {}
+    for line in raw.splitlines():
+        try:
+            envelope = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            return ()
+        if not isinstance(envelope, Mapping):
+            return ()
+        item = envelope.get("item")
+        if not isinstance(item, Mapping):
+            continue
+        item_type = item.get("type")
+        if item_type not in {"collab_tool_call", "mcp_tool_call"}:
+            continue
+        if item_type == "mcp_tool_call" and item.get("server") not in {
+            "collab",
+            "collaboration",
+        }:
+            continue
+        name = item.get("tool")
+        if not isinstance(name, str):
+            return ()
+        arguments = structured_tool_arguments(item.get("arguments"))
+        if arguments is None:
+            arguments = {}
+        prompt = item.get("prompt")
+        if isinstance(prompt, str):
+            arguments = {**arguments, "prompt": prompt}
+        role = delegation_role_for_tool(name, arguments)
+        if role is None:
+            continue
+        agent_id = native_delegation_agent_id(item, arguments)
+        if not agent_id:
+            return ()
+        result = item.get("result")
+        result_present = native_delegation_result_present(result)
+        if not result_present:
+            continue
+        key = (role, agent_id)
+        previous = records.get(key)
+        records[key] = {
+            "role": role,
+            "agent_id": agent_id,
+            "prompt_present": bool(previous and previous.get("prompt_present") is True)
+            or any(
+                isinstance(arguments.get(field), str) and bool(arguments[field])
+                for field in ("message", "prompt", "task_name")
+            ),
+            "result_present": bool(previous and previous.get("result_present") is True)
+            or result_present,
+            "changed_path_count": 0,
+        }
+    return tuple(records.values())
+
+
+def native_delegation_result_present(result: object) -> bool:
+    if isinstance(result, str):
+        return bool(result.strip())
+    if not isinstance(result, Mapping):
+        return False
+    for key in ("output", "result", "message", "final_answer", "summary"):
+        value = result.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+        if isinstance(value, Mapping) and value:
+            return True
+        if (
+            isinstance(value, Sequence)
+            and not isinstance(value, (str, bytes))
+            and value
+        ):
+            return True
+    return False
+
+
+def persist_native_delegation_evidence(
+    artifact_root: Path, agent_batch: AgentCommandBatch
+) -> None:
+    if not is_stream_json(agent_batch.execution.stdout):
+        return
+    write_json_artifact(
+        artifact_root,
+        "delegation_evidence",
+        {"agents": list(agent_batch.delegation_evidence)},
+    )
+
+
+def delegation_role_for_tool(name: str, arguments: Mapping[str, object]) -> str | None:
+    normalized = name.casefold().replace("-", "_")
+    events = delegation_events_for_tool(name, arguments)
+    if "remediation_delegated" in events:
+        return "remediator"
+    if "rereview_requested" in events:
+        return "rereviewer"
+    if "review_delegated" in events:
+        return "reviewer"
+    if "exploration_delegated" in events:
+        return "explorer"
+    if "implementation_delegated" in events:
+        return "implementer"
+    if normalized == "delegate_agent":
+        return None
+    return None
+
+
+def native_delegation_agent_id(
+    item: Mapping[str, object], arguments: Mapping[str, object]
+) -> str:
+    result = item.get("result")
+    result_mapping = result if isinstance(result, Mapping) else {}
+    for value in (
+        arguments.get("target"),
+        arguments.get("agent_id"),
+        result_mapping.get("agent_id"),
+        result_mapping.get("target"),
+    ):
+        if isinstance(value, str) and value:
+            return safe_identifier(value, category="delegation agent id")
+    receivers = item.get("receiver_thread_ids")
+    if isinstance(receivers, Sequence) and not isinstance(receivers, (str, bytes)):
+        for value in receivers:
+            if isinstance(value, str) and value:
+                return safe_identifier(value, category="delegation agent id")
+    value = item.get("id")
+    if isinstance(value, str) and value:
+        return safe_identifier(value, category="delegation agent id")
+    return ""
 
 
 def shell_command_requests_review(command: str) -> bool:
