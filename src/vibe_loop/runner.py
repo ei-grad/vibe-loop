@@ -163,7 +163,9 @@ from vibe_loop.skill_deployment import (
     SkillDeploymentError,
     render_verification_reports,
     verify_worker_skill_deployments,
+    worker_launch_verdict,
 )
+from vibe_loop.skills import refresh_stale_skill_deployments
 from vibe_loop.spec_diagnostics import ensure_spec_execution_gate
 from vibe_loop.telemetry import (
     ATTRIBUTION_DIAGNOSTIC_LIMIT,
@@ -1857,6 +1859,7 @@ class VibeRunner:
         self.budget_project = resolve_budget_project(config)
         self.phase_budget = PhaseBudget(self.budget_store, self.budget_project)
         self._record_lock = threading.Lock()
+        self._skill_refresh_lock = threading.Lock()
         self._restart_context = threading.local()
         self._conflict_enforcement_context = threading.local()
         self.last_analysis_usage = unavailable_usage(
@@ -2438,18 +2441,50 @@ class VibeRunner:
         context_task_id, enforce = value
         return context_task_id == task_id and enforce is True
 
+    def refresh_skill_deployments(self) -> tuple[Path, ...]:
+        """Reinstall this host's bundled skills after `main` moved.
+
+        A slice that edits a bundled skill leaves every recorded deployment on
+        the host behind its source the moment it merges. Refreshing here bounds
+        that window to the integrating run instead of leaving the host on skill
+        text one slice behind until an operator notices the advisory.
+        """
+        with self._skill_refresh_lock:
+            try:
+                refreshed = refresh_stale_skill_deployments(
+                    Path.home(),
+                    source_repo=self.config.repo,
+                )
+            except (OSError, SkillDeploymentError) as exc:
+                report_status(
+                    "skill deployment refresh failed: "
+                    f"{type(exc).__name__}: {exc}; "
+                    "run `vibe-loop verify-skills` and reinstall explicitly"
+                )
+                return ()
+        for path in refreshed:
+            report_status(f"refreshed installed skill after integration: {path}")
+        return refreshed
+
     def run_task(
         self,
         task: Task,
         *,
         recovery: RecoveryContext | None = None,
     ) -> RunResult:
-        skill_reports = verify_worker_skill_deployments(Path.home())
-        blocking_reports = tuple(report for report in skill_reports if report.blocking)
+        blocking_reports, skill_advisories = worker_launch_verdict(
+            verify_worker_skill_deployments(Path.home())
+        )
         if blocking_reports:
             raise SkillDeploymentError(
                 "installed skills failed provenance verification",
                 diagnostics=render_verification_reports(blocking_reports),
+            )
+        for advisory in skill_advisories:
+            report_status(
+                f"installed skill deployment lags its source: {advisory}; "
+                "it is refreshed after the next integration, or by "
+                "`vibe-loop install-skills`"
             )
         self.ensure_spec_execution_gate()
         agent_selection = task_agent_operation(
@@ -3756,6 +3791,8 @@ class VibeRunner:
             ):
                 message = classification.detail
             end_main = git_rev_parse(self.config.repo, "HEAD")
+            if end_main != start_main:
+                self.refresh_skill_deployments()
             if (
                 classification.status == "completed"
                 and self.config.autopilot.require_upstream_sync

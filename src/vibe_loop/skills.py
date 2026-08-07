@@ -8,6 +8,8 @@ from vibe_loop.skill_deployment import (
     SkillDeploymentError,
     deploy_skill_bundle,
     deployment_drift_advisories,
+    stale_deployment_entries,
+    verify_worker_skill_deployments,
 )
 
 
@@ -41,6 +43,34 @@ def install_skills(
         source_repository="https://github.com/ei-grad/vibe-loop",
         report_diagnostic=report_diagnostic,
     )
+
+
+def bundled_skill_source_root() -> Path:
+    return Path(str(importlib.resources.files("vibe_loop") / "skills")).resolve()
+
+
+def refresh_stale_skill_deployments(
+    home: Path,
+    *,
+    source_repo: Path,
+) -> tuple[Path, ...]:
+    """Reinstall recorded deployments whose source moved ahead of the install.
+
+    Only a repository that supplies the running bundle can refresh it, and only
+    an existing recorded deployment is refreshed: a host that never installed
+    the skills must not acquire one as a side effect of integrating a slice.
+    """
+    source_root = bundled_skill_source_root()
+    repo = source_repo.resolve()
+    if repo != source_root and repo not in source_root.parents:
+        return ()
+    stale = stale_deployment_entries(
+        verify_worker_skill_deployments(home),
+        skill_names=SKILL_NAMES,
+    )
+    if not stale:
+        return ()
+    return tuple(install_skills(False, False, home))
 
 
 def installed_skill_drift_advisories(home: Path) -> tuple[dict[str, object], ...]:

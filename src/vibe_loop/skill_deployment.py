@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import uuid
 from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime, timezone
 from importlib.metadata import (
@@ -20,6 +21,14 @@ MANIFEST_NAME = ".skill-manifest.json"
 MANIFEST_VERSION = 1
 RUNTIME_TARGETS = (".codex", ".claude")
 BLOCKING_STATES = frozenset({"stale", "runtime-edited", "branch-sourced"})
+# A stale deployment still matches its manifest; only the recorded source moved
+# on. That is the expected state between merging a bundled-skill change and
+# refreshing the deployment, and it is repaired by the post-integration refresh
+# rather than by an operator. Blocking worker launch on it would halt every
+# board on the host until someone reinstalls by hand, so preflight blocks only
+# where the installed content or its provenance is unknown.
+WORKER_BLOCKING_STATES = frozenset({"runtime-edited", "branch-sourced"})
+WORKER_ADVISORY_STATES = BLOCKING_STATES - WORKER_BLOCKING_STATES
 
 
 class SkillDeploymentError(RuntimeError):
@@ -76,6 +85,13 @@ class VerificationReport:
             or any(entry.state in BLOCKING_STATES for entry in self.entries)
         )
 
+    @property
+    def worker_blocking(self) -> bool:
+        return bool(
+            self.manifest_error
+            or any(entry.state in WORKER_BLOCKING_STATES for entry in self.entries)
+        )
+
     def to_json(self) -> dict[str, object]:
         return {
             "target_root": str(self.target_root),
@@ -85,6 +101,7 @@ class VerificationReport:
             "unmanaged": list(self.unmanaged),
             "drifted": self.drifted,
             "blocking": self.blocking,
+            "worker_blocking": self.worker_blocking,
         }
 
 
@@ -245,9 +262,12 @@ def deploy_skill_bundle(
         for relative_path, source in source_files.items():
             target = root / relative_path
             target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_name(f".{target.name}.skill-deploy-new")
-            shutil.copy2(source, temporary)
-            os.replace(temporary, target)
+            temporary = target.with_name(f".{target.name}.{_scratch_suffix()}")
+            try:
+                shutil.copy2(source, temporary)
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
             entries[relative_path] = {
                 "source_repo": str(source_state.repo),
                 "source_commit": source_state.commit,
@@ -292,6 +312,40 @@ def verify_worker_skill_deployments(home: Path) -> tuple[VerificationReport, ...
             continue
         reports.append(report)
     return tuple(reports)
+
+
+def worker_launch_verdict(
+    reports: Sequence[VerificationReport],
+) -> tuple[tuple[VerificationReport, ...], tuple[str, ...]]:
+    """Split worker preflight reports into blocking reports and advisory lines.
+
+    Callers must refuse to launch when the blocking tuple is non-empty and
+    surface the advisory lines otherwise; see `WORKER_BLOCKING_STATES`.
+    """
+    blocking = tuple(report for report in reports if report.worker_blocking)
+    advisories = tuple(
+        f"{entry.target_root / entry.relative_path}: {entry.state}"
+        + (f": {entry.detail}" if entry.detail else "")
+        for report in reports
+        for entry in report.entries
+        if entry.state in WORKER_ADVISORY_STATES
+    )
+    return blocking, advisories
+
+
+def stale_deployment_entries(
+    reports: Sequence[VerificationReport],
+    *,
+    skill_names: Iterable[str],
+) -> tuple[VerificationEntry, ...]:
+    """Entries whose installed copy still matches a manifest the source left."""
+    names = frozenset(skill_names)
+    return tuple(
+        entry
+        for report in reports
+        for entry in report.entries
+        if entry.state == "stale" and entry.relative_path.split("/", 1)[0] in names
+    )
 
 
 def deployment_drift_advisories(
@@ -599,12 +653,22 @@ def _manifest_entries(manifest: dict[str, object]) -> dict[str, dict[str, object
 
 def _write_manifest(target_root: Path, payload: dict[str, object]) -> None:
     path = target_root / MANIFEST_NAME
-    temporary = target_root / f".{MANIFEST_NAME}.new"
-    temporary.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    temporary = target_root / f".{MANIFEST_NAME}.{_scratch_suffix()}"
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _scratch_suffix() -> str:
+    # Deployment is now also driven automatically after integration, so two
+    # runtimes can install concurrently. A shared scratch name would let one
+    # writer publish the other's partially copied file.
+    return f"{os.getpid()}.{uuid.uuid4().hex}.skill-deploy-new"
 
 
 def _owned_path(

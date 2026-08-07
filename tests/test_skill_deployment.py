@@ -6,7 +6,7 @@ import json
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -19,8 +19,9 @@ from vibe_loop.skill_deployment import (
     deploy_skill_bundle,
     verify_skill_deployments,
     verify_worker_skill_deployments,
+    worker_launch_verdict,
 )
-from vibe_loop.skills import install_skills
+from vibe_loop.skills import install_skills, refresh_stale_skill_deployments
 
 
 class SkillDeploymentTests(unittest.TestCase):
@@ -50,6 +51,21 @@ class SkillDeploymentTests(unittest.TestCase):
             check=True,
         )
         return completed.stdout.strip()
+
+    @contextmanager
+    def bundled_source(self):
+        """Make this fixture's repository the running `vibe_loop` skill bundle."""
+        with ExitStack() as stack:
+            stack.enter_context(
+                mock.patch(
+                    "vibe_loop.skills.importlib.resources.files",
+                    return_value=self.repo,
+                )
+            )
+            stack.enter_context(
+                mock.patch("vibe_loop.skills.SKILL_NAMES", ("example",))
+            )
+            yield
 
     def deploy(self, **kwargs: object) -> list[Path]:
         return deploy_skill_bundle(
@@ -282,6 +298,106 @@ class SkillDeploymentTests(unittest.TestCase):
         unmanaged.write_text("mutable\n", encoding="utf-8")
 
         self.assertEqual(verify_worker_skill_deployments(self.home), ())
+
+    def test_worker_launch_advises_stale_and_blocks_unknown_provenance(self) -> None:
+        self.deploy()
+        source = self.repo / "skills" / "example" / "SKILL.md"
+        source.write_text("version two\n", encoding="utf-8")
+
+        stale_reports = verify_worker_skill_deployments(self.home)
+        blocking, advisories = worker_launch_verdict(stale_reports)
+
+        # `verify-skills` keeps calling a lagging deployment blocking drift; only
+        # worker launch treats it as advisory.
+        self.assertTrue(all(report.blocking for report in stale_reports))
+        self.assertFalse(any(report.worker_blocking for report in stale_reports))
+        self.assertEqual(blocking, ())
+        self.assertEqual(
+            set(advisories),
+            {
+                f"{self.home / runtime / 'skills' / 'example' / 'SKILL.md'}: "
+                "stale: source changed"
+                for runtime in (".codex", ".claude")
+            },
+        )
+
+        installed = self.home / ".codex" / "skills" / "example" / "script.py"
+        installed.write_text("VALUE = 2\n", encoding="utf-8")
+        edited_blocking, _ = worker_launch_verdict(
+            verify_worker_skill_deployments(self.home)
+        )
+        self.assertEqual(
+            [report.target_root for report in edited_blocking],
+            [self.home / ".codex" / "skills"],
+        )
+
+    def test_refresh_reinstalls_a_stale_deployment_from_this_repository(self) -> None:
+        with self.bundled_source():
+            install_skills(False, False, self.home)
+            source = self.repo / "skills" / "example" / "SKILL.md"
+            source.write_text("version two\n", encoding="utf-8")
+            self.git("commit", "--all", "-m", "Edit the bundled skill")
+
+            refreshed = refresh_stale_skill_deployments(
+                self.home,
+                source_repo=self.repo,
+            )
+
+        self.assertEqual(
+            set(refreshed),
+            {
+                self.home / runtime / "skills" / "example"
+                for runtime in (".codex", ".claude")
+            },
+        )
+        for runtime in (".codex", ".claude"):
+            self.assertEqual(
+                (self.home / runtime / "skills" / "example" / "SKILL.md").read_text(
+                    encoding="utf-8"
+                ),
+                "version two\n",
+            )
+        reports = verify_worker_skill_deployments(self.home)
+        self.assertTrue(reports)
+        self.assertFalse(any(report.drifted for report in reports))
+
+    def test_refresh_skips_an_in_sync_host_and_a_foreign_bundle(self) -> None:
+        with self.bundled_source():
+            install_skills(False, False, self.home)
+
+            self.assertEqual(
+                refresh_stale_skill_deployments(self.home, source_repo=self.repo),
+                (),
+            )
+
+            source = self.repo / "skills" / "example" / "SKILL.md"
+            source.write_text("version two\n", encoding="utf-8")
+            self.git("commit", "--all", "-m", "Edit the bundled skill")
+            # A repository that does not supply the running bundle must not
+            # rewrite the host's deployment.
+            self.assertEqual(
+                refresh_stale_skill_deployments(
+                    self.home,
+                    source_repo=self.root / "other-repo",
+                ),
+                (),
+            )
+        self.assertEqual(
+            (self.home / ".codex" / "skills" / "example" / "SKILL.md").read_text(
+                encoding="utf-8"
+            ),
+            "version one\n",
+        )
+
+    def test_refresh_leaves_a_host_without_a_recorded_deployment_alone(self) -> None:
+        with self.bundled_source():
+            self.assertEqual(
+                refresh_stale_skill_deployments(self.home, source_repo=self.repo),
+                (),
+            )
+
+        self.assertFalse((self.home / ".codex").exists())
+        self.assertFalse((self.home / ".claude").exists())
 
     def test_deployment_drift_advisory_reports_stale_bundled_skill(self) -> None:
         self.deploy()
