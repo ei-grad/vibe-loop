@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from _test_bootstrap import TEST_ENVIRONMENT_CONFIGURED as TEST_ENVIRONMENT_CONFIGURED
 
+import ast
 import io
 import json
 import subprocess
@@ -37,6 +38,26 @@ FORBIDDEN_WORKFLOW_FRAGMENTS = (
     "GH_TOKEN",
     "api.github.com",
 )
+
+# A transport the runtime could carry local state out over. `urllib.parse` is
+# string handling, and `socket` is admissible only for the local hostname
+# recorded in lock and run metadata, so both are constrained by attribute rather
+# than excluded outright.
+FORBIDDEN_TRANSPORT_MODULES = (
+    "urllib.request",
+    "urllib.error",
+    "http",
+    "http.client",
+    "httpx",
+    "requests",
+    "aiohttp",
+    "ssl",
+    "ftplib",
+    "smtplib",
+    "xmlrpc",
+)
+ALLOWED_SOCKET_ATTRIBUTES = frozenset({"gethostname"})
+FORBIDDEN_COMMAND_NAMES = frozenset({"gh", "curl", "wget"})
 
 
 class ReleaseAdmissionTests(unittest.TestCase):
@@ -75,6 +96,44 @@ class ReleaseAdmissionTests(unittest.TestCase):
                 publish_job.index("Verify transferred admission and distributions"),
                 publish_job.index("Publish distributions"),
             )
+
+    def test_runtime_sources_carry_no_outbound_transport(self) -> None:
+        sources = sorted((repository_root() / "src/vibe_loop").rglob("*.py"))
+        self.assertTrue(sources)
+        transports: list[str] = []
+        socket_uses: list[str] = []
+        commands: list[str] = []
+        for path in sources:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            location = str(path.relative_to(repository_root()))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported = tuple(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                    imported = (node.module,) if node.module else ()
+                else:
+                    imported = ()
+                transports.extend(
+                    f"{location}:{node.lineno} {module}"
+                    for module in imported
+                    if module in FORBIDDEN_TRANSPORT_MODULES
+                )
+                if (
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "socket"
+                    and node.attr not in ALLOWED_SOCKET_ATTRIBUTES
+                ):
+                    socket_uses.append(f"{location}:{node.lineno} socket.{node.attr}")
+                if (
+                    isinstance(node, ast.Constant)
+                    and node.value in FORBIDDEN_COMMAND_NAMES
+                ):
+                    commands.append(f"{location}:{node.lineno} {node.value!r}")
+
+        self.assertEqual(transports, [])
+        self.assertEqual(socket_uses, [])
+        self.assertEqual(commands, [])
 
     def test_eval_provenance_rejects_untracked_sources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
