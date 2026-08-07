@@ -65,6 +65,7 @@ from vibe_loop.evals import (
 from vibe_loop.runs import RunStore, WORKER_REPORT_STATUSES
 from vibe_loop.runner import (
     CODEX_ITEM_ENVELOPE_TYPES,
+    CODEX_TOOL_ITEM_TYPES,
     VibeRunner,
     shell_command_payload,
 )
@@ -2184,6 +2185,7 @@ def _events_for_tool_use(
             events.append("unsafe_git_command")
         if shell_command_requests_review(cmd):
             events.append("review_requested")
+            events.append("review_delegated")
         if "git merge --ff-only" in cmd or "merge --ff-only" in cmd:
             events.append("main_fast_forwarded")
             is_merge = True
@@ -2271,24 +2273,23 @@ def parse_stream_json(
                 }:
                     continue
                 raw_arguments = item.get("arguments")
-                if raw_arguments is None:
-                    prompt = item.get("prompt")
-                    if item_type != "collab_tool_call" or not isinstance(prompt, str):
-                        continue
-                    inp = {"prompt": prompt}
-                else:
+                inp: dict[str, object] = {}
+                if raw_arguments is not None:
                     inp = structured_tool_arguments(raw_arguments)
                     if inp is None:
                         return "", []
+                prompt = item.get("prompt")
+                if item_type == "collab_tool_call" and isinstance(prompt, str):
+                    inp = {**inp, "prompt": prompt}
+                if not inp:
+                    continue
                 events.extend(delegation_events_for_tool(name, inp))
                 continue
-            if item_type in {
+            if item_type in CODEX_TOOL_ITEM_TYPES or item_type in {
                 "agent_message",
                 "error",
-                "file_change",
                 "reasoning",
                 "todo_list",
-                "web_search",
             }:
                 continue
             return "", []
@@ -2371,7 +2372,12 @@ def delegation_events_for_tool(name: str, inp: Mapping[str, object]) -> list[str
         return ["remediation_delegated"]
     if "explor" in description or "investigat" in description:
         return ["exploration_delegated"]
-    return ["implementation_delegated"]
+    if any(
+        marker in description
+        for marker in ("build", "change", "fix", "implement", "modify")
+    ):
+        return ["implementation_delegated"]
+    return []
 
 
 def shell_command_requests_review(command: str) -> bool:

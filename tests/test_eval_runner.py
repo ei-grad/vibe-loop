@@ -435,6 +435,13 @@ class EvalRunnerCliTests(unittest.TestCase):
                 "(artifact / 'transcript.jsonl').write_bytes("
                 'b\'{"type": "result", "result": "\\xff\\xfe"}\\n\')\n'
             ),
+            "transcript_unhashable_item_type": (
+                "(artifact / 'transcript.jsonl').write_text("
+                "json.dumps({'type': 'item.started', 'item': {'type': ['"
+                + canary
+                + "']}}) "
+                "+ '\\n', encoding='utf-8')\n"
+            ),
             "workflow": (
                 "(artifact / 'workflow-events.json').write_text("
                 "json.dumps({'events': ['" + canary.lower() + "']}) + '\\n', "
@@ -2167,6 +2174,7 @@ class EvalRunnerCliTests(unittest.TestCase):
                         "item": {
                             "type": "collab_tool_call",
                             "tool": "spawn_agent",
+                            "arguments": {"agent_id": "reviewer-1"},
                             "prompt": "Review the implementation candidate",
                             "status": "in_progress",
                         },
@@ -2188,6 +2196,76 @@ class EvalRunnerCliTests(unittest.TestCase):
         _result, events = parse_stream_json(stream)
 
         self.assertEqual(events, ["review_requested", "review_delegated"])
+
+    def test_codex_modeled_inert_tool_item_preserves_command_events(self) -> None:
+        stream = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "item.started",
+                        "item": {
+                            "type": "command_execution",
+                            "command": "git commit -m x",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "item-1",
+                            "type": "patch_apply",
+                            "status": "completed",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.started",
+                        "item": {
+                            "type": "command_execution",
+                            "command": "uv run -m pytest",
+                        },
+                    }
+                ),
+            )
+        )
+
+        _result, events = parse_stream_json(stream)
+
+        self.assertEqual(events, ["commit_created", "verification_ran"])
+
+    def test_codex_review_command_is_review_delegation_evidence(self) -> None:
+        stream = json.dumps(
+            {
+                "type": "item.started",
+                "item": {
+                    "type": "command_execution",
+                    "command": "codex review 'review candidate'",
+                },
+            }
+        )
+
+        _result, events = parse_stream_json(stream)
+
+        self.assertEqual(events, ["review_requested", "review_delegated"])
+
+    def test_codex_delegation_without_role_evidence_is_not_classified(self) -> None:
+        stream = json.dumps(
+            {
+                "type": "item.started",
+                "item": {
+                    "type": "collab_tool_call",
+                    "tool": "spawn_agent",
+                    "arguments": {"agent_id": "agent-1"},
+                    "status": "in_progress",
+                },
+            }
+        )
+
+        _result, events = parse_stream_json(stream)
+
+        self.assertEqual(events, [])
 
     def test_codex_unknown_malformed_and_prose_envelopes_fail_closed(self) -> None:
         streams = (

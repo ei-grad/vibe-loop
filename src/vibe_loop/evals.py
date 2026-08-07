@@ -131,6 +131,91 @@ REQUIRED_EVAL_ARTIFACT_ROLES = frozenset(
 )
 _SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 _WINDOWS_ABSOLUTE_PATTERN = re.compile(r"^[A-Za-z]:[\\/]")
+_CODEX_SAFE_ITEM_FIELDS = {
+    "agent_message": frozenset({"id", "type", "text"}),
+    "collab_tool_call": frozenset(
+        {
+            "id",
+            "type",
+            "tool",
+            "arguments",
+            "prompt",
+            "sender_thread_id",
+            "receiver_thread_ids",
+            "result",
+            "error",
+            "status",
+        }
+    ),
+    "command_execution": frozenset(
+        {
+            "id",
+            "type",
+            "command",
+            "arguments",
+            "aggregated_output",
+            "exit_code",
+            "status",
+        }
+    ),
+    "custom_tool_call": frozenset(
+        {
+            "id",
+            "type",
+            "call_id",
+            "name",
+            "input",
+            "result",
+            "error",
+            "status",
+        }
+    ),
+    "error": frozenset({"id", "type", "message"}),
+    "file_change": frozenset({"id", "type", "changes", "status"}),
+    "function_call": frozenset(
+        {"id", "type", "call_id", "name", "arguments", "status"}
+    ),
+    "local_shell_call": frozenset(
+        {
+            "id",
+            "type",
+            "command",
+            "aggregated_output",
+            "exit_code",
+            "status",
+        }
+    ),
+    "mcp_tool_call": frozenset(
+        {
+            "id",
+            "type",
+            "server",
+            "tool",
+            "arguments",
+            "result",
+            "error",
+            "status",
+            "duration_ms",
+        }
+    ),
+    "patch_apply": frozenset({"id", "type", "call_id", "changes", "patch", "status"}),
+    "reasoning": frozenset({"id", "type", "text"}),
+    "todo_list": frozenset({"id", "type", "items"}),
+    "web_search": frozenset({"id", "type", "query", "status"}),
+}
+_CODEX_SAFE_TOOL_ITEM_TYPES = frozenset(
+    {
+        "collab_tool_call",
+        "command_execution",
+        "custom_tool_call",
+        "file_change",
+        "function_call",
+        "local_shell_call",
+        "mcp_tool_call",
+        "patch_apply",
+        "web_search",
+    }
+)
 
 
 class EvalSafeEnvelopeError(ValueError):
@@ -454,52 +539,16 @@ def _project_transcript_record(
                 f"transcript rejected: wrong field type at index {index}"
             )
         item_type = item.get("type")
-        allowed_item_fields = {
-            "agent_message": {"id", "type", "text"},
-            "collab_tool_call": {
-                "id",
-                "type",
-                "tool",
-                "arguments",
-                "prompt",
-                "sender_thread_id",
-                "receiver_thread_ids",
-                "result",
-                "error",
-                "status",
-            },
-            "command_execution": {
-                "id",
-                "type",
-                "command",
-                "arguments",
-                "aggregated_output",
-                "exit_code",
-                "status",
-            },
-            "error": {"id", "type", "message"},
-            "file_change": {"id", "type", "changes", "status"},
-            "mcp_tool_call": {
-                "id",
-                "type",
-                "server",
-                "tool",
-                "arguments",
-                "result",
-                "error",
-                "status",
-                "duration_ms",
-            },
-            "reasoning": {"id", "type", "text"},
-            "todo_list": {"id", "type", "items"},
-            "web_search": {"id", "type", "query", "status"},
-        }
-        allowed = allowed_item_fields.get(item_type)
+        if not isinstance(item_type, str):
+            raise EvalSafeEnvelopeError(
+                f"transcript rejected: wrong field type at index {index}"
+            )
+        allowed = _CODEX_SAFE_ITEM_FIELDS.get(item_type)
         if allowed is None or set(item) - allowed:
             raise EvalSafeEnvelopeError(
                 f"transcript rejected: unknown field at index {index}"
             )
-        if item_type in {"collab_tool_call", "command_execution", "mcp_tool_call"}:
+        if item_type in _CODEX_SAFE_TOOL_ITEM_TYPES:
             kind = (
                 "command"
                 if raw_kind in {"item.started", "response.output_item.added"}
@@ -510,7 +559,7 @@ def _project_transcript_record(
         else:
             kind = "system"
         record = _transcript_record(kind)
-        if "exit_code" in item:
+        if item.get("exit_code") is not None:
             record["exit_code"] = bounded_integer(item["exit_code"])
         return [record]
     if raw_kind == "tool_progress":

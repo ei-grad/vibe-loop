@@ -46,6 +46,7 @@ class SkillEvalSchemaTests(unittest.TestCase):
             "{not-json\n",
             json.dumps({"type": "unknown", "text": "SECRET_CANARY"}),
             json.dumps({"type": "tool_call", "unknown": "SECRET_CANARY"}),
+            json.dumps({"type": "item.started", "item": {"type": ["SECRET_CANARY"]}}),
             "\n".join(
                 json.dumps({"type": "command", "command": "true"})
                 for _ in range(EVAL_MAX_TRANSCRIPT_RECORDS + 1)
@@ -110,6 +111,7 @@ class SkillEvalSchemaTests(unittest.TestCase):
                             "id": "item-1",
                             "type": "command_execution",
                             "command": f"printf {canary}",
+                            "exit_code": None,
                             "status": "in_progress",
                         },
                     }
@@ -149,6 +151,36 @@ class SkillEvalSchemaTests(unittest.TestCase):
             ["command", "tool_result", "assistant"],
         )
         self.assertNotIn(canary, encoded)
+
+    def test_transcript_projection_accepts_all_modeled_codex_tool_items(self) -> None:
+        item_types = (
+            "custom_tool_call",
+            "file_change",
+            "function_call",
+            "local_shell_call",
+            "patch_apply",
+            "web_search",
+        )
+        raw = "\n".join(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": f"item-{index}",
+                        "type": item_type,
+                        "status": "completed",
+                    },
+                }
+            )
+            for index, item_type in enumerate(item_types)
+        )
+
+        projected = project_transcript_jsonl(raw)
+
+        self.assertEqual(
+            [record["kind"] for record in projected],
+            ["tool_result"] * len(item_types),
+        )
 
     def test_structured_byte_budget_covers_shipped_case_output_budgets(self) -> None:
         cases_root = Path(__file__).parents[1] / "eval/examples/local-demo-v1/cases"
